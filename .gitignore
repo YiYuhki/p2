@@ -1,0 +1,6 @@
+/secmail
+/mock-analyzer
+/data/
+*.key
+*.eml
+config.yaml

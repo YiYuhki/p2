@@ -1,0 +1,83 @@
+# secmail example configuration.
+# ${VAR} references are expanded from the environment at load time.
+
+timezone: Asia/Seoul            # used for dates shown in banners / portal
+
+smtp:
+  listen: ":25"
+  hostname: secmail.example.com  # EHLO name and Received / Authentication-Results authserv-id
+  accepted_domains:              # recipients outside these domains are refused (no open relay)
+    - example.com
+    - .example.com               # leading dot = any subdomain
+  max_message_bytes: 52428800    # 50 MiB
+  max_recipients: 100
+  read_timeout: 60s
+  write_timeout: 60s
+  tls_cert_file: /etc/secmail/tls.crt   # enables inbound STARTTLS (recommended)
+  tls_key_file: /etc/secmail/tls.key
+
+upstream:                        # the real mail server (Exchange, Postfix, ...)
+  addr: mail.internal.example.com:25
+  helo_name: secmail.example.com
+  starttls: true
+  insecure_skip_verify: false
+  timeout: 60s
+
+rewrite:
+  gateway_id: secmail-01
+  keep_inline_images: true       # keep image/* parts with Content-ID (HTML-embedded images)
+  signed_policy: rewrite         # rewrite | passthrough  (rewrite removes the S/MIME/PGP signature)
+  encrypted_policy: passthrough  # passthrough | reject    (encrypted content cannot be inspected)
+
+dkim:
+  verify_inbound: true           # verify original signatures and record them in Authentication-Results
+  strip_original: true           # rename broken original DKIM-Signature headers on rewritten mail
+  sign: true                     # re-sign rewritten mail with the gateway key
+  domain: example.com
+  selector: secmail
+  private_key_file: /etc/secmail/dkim.key   # generate with: secmail dkim-keygen
+
+portal:
+  listen: ":8080"
+  public_base_url: https://sec-mail.example.com   # used in the links inserted into mail
+  link_ttl: 336h                 # 14 days; objects are deleted afterwards
+  ticket_ttl: 60s                # one-time download ticket lifetime
+  rate_limit_rps: 5
+  rate_limit_burst: 20
+  trust_proxy_headers: true      # behind a reverse proxy / load balancer
+
+internal_api:                    # used by the external analysis engine only
+  listen: "0.0.0.0:8081"
+  token: ${SECMAIL_INTERNAL_TOKEN}
+  advertise_url: http://secmail-internal.example.com:8081
+
+storage:
+  type: s3                       # s3 (AWS S3 / MinIO) | fs
+  s3:
+    endpoint: minio.internal.example.com:9000
+    region: us-east-1
+    bucket: secmail-attachments
+    access_key: ${SECMAIL_S3_ACCESS_KEY}
+    secret_key: ${SECMAIL_S3_SECRET_KEY}
+    use_ssl: true
+  fs:
+    dir: /var/lib/secmail/objects
+
+database:
+  type: postgres                 # postgres | memory
+  dsn: ${SECMAIL_DATABASE_DSN}   # postgres://user:pass@host:5432/secmail?sslmode=require
+
+redis:
+  addr: redis.internal.example.com:6379
+  password: ${SECMAIL_REDIS_PASSWORD}
+  db: 0
+
+queue:
+  type: redis                    # redis | memory
+  key_prefix: secmail
+
+analysis:
+  timeout: 2m                    # PENDING longer than this is re-queued
+  max_attempts: 3                # then marked ERROR (download blocked, fail-closed)
+  verdict_reuse_window: 24h      # reuse verdicts for identical SHA-256 (0 disables)
+  janitor_interval: 1m

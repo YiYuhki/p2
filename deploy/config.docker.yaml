@@ -1,0 +1,38 @@
+# Configuration used by deploy/docker-compose.yml (local demo only).
+timezone: Asia/Seoul
+smtp:
+  listen: ":2525"
+  hostname: secmail.local
+  accepted_domains: [example.com]
+upstream:
+  addr: mailpit:1025          # stand-in for the real mail server
+  timeout: 30s
+dkim:
+  verify_inbound: false
+  sign: false
+portal:
+  listen: ":8080"
+  public_base_url: http://localhost:8080
+internal_api:
+  listen: ":8081"
+  token: ${SECMAIL_INTERNAL_TOKEN}
+  advertise_url: http://secmail:8081
+storage:
+  type: s3
+  s3:
+    endpoint: minio:9000
+    region: us-east-1
+    bucket: secmail-attachments
+    access_key: ${MINIO_ROOT_USER}
+    secret_key: ${MINIO_ROOT_PASSWORD}
+    use_ssl: false
+database:
+  type: postgres
+  dsn: postgres://secmail:secmail@postgres:5432/secmail?sslmode=disable
+redis:
+  addr: redis:6379
+queue:
+  type: redis
+analysis:
+  timeout: 1m
+  janitor_interval: 10s

@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>보안 첨부파일 다운로드</title>
+<style nonce="{{.Nonce}}">
+  :root { --fg:#1f2937; --muted:#6b7280; --bg:#f3f4f6; --card:#fff; --line:#e5e7eb;
+          --ok:#059669; --warn:#d97706; --bad:#dc2626; --accent:#4f46e5; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e5e7eb; --muted:#9ca3af; --bg:#111827; --card:#1f2937; --line:#374151; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font-family:"Malgun Gothic","Apple SD Gothic Neo",system-ui,sans-serif; }
+  main { max-width:560px; margin:8vh auto; padding:0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:28px; }
+  h1 { font-size:20px; margin:0 0 8px; }
+  p { line-height:1.6; margin:8px 0; }
+  .file { margin:16px 0; padding:12px 14px; border:1px solid var(--line); border-radius:8px;
+          word-break:break-all; }
+  .file small { color:var(--muted); }
+  .badge { display:inline-block; font-size:12px; font-weight:bold; padding:2px 8px;
+           border-radius:999px; color:#fff; }
+  .PENDING .badge { background:var(--warn); } .CLEAN .badge { background:var(--ok); }
+  .MALICIOUS .badge, .ERROR .badge { background:var(--bad); }
+  .EXPIRED .badge, .NOTFOUND .badge, .FAILURE .badge { background:var(--muted); }
+  button { width:100%; padding:12px; border:0; border-radius:8px; background:var(--accent);
+           color:#fff; font-size:15px; font-weight:bold; cursor:pointer; }
+  button[disabled] { opacity:.45; cursor:not-allowed; }
+  .spinner { display:inline-block; width:14px; height:14px; border:2px solid var(--warn);
+             border-right-color:transparent; border-radius:50%; animation:spin 1s linear infinite;
+             vertical-align:-2px; margin-right:6px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .threat { color:var(--bad); font-weight:bold; }
+  footer { margin-top:16px; color:var(--muted); font-size:12px; text-align:center; }
+</style>
+</head>
+<body>
+<main class="{{.State}}">
+<div class="card">
+{{if eq .State "PENDING"}}
+  <span class="badge">검사 중</span>
+  <h1>보안 검사가 진행 중입니다</h1>
+  <p><span class="spinner"></span>현재 첨부파일의 악성코드 검사가 진행 중입니다. (예상 소요시간: 약 10초)</p>
+  <p>검사가 끝나면 이 페이지가 자동으로 갱신됩니다.</p>
+{{else if eq .State "CLEAN"}}
+  <span class="badge">안전</span>
+  <h1>검증이 완료된 안전한 파일입니다</h1>
+  <p>악성코드 검사에서 위협이 발견되지 않았습니다.</p>
+{{else if eq .State "MALICIOUS"}}
+  <span class="badge">위협 감지</span>
+  <h1>다운로드가 차단되었습니다</h1>
+  <p>해당 파일에서 악성코드가 감지되어 다운로드가 제한되었습니다.</p>
+  {{if .ThreatName}}<p>탐지명: <span class="threat">{{.ThreatName}}</span></p>{{end}}
+  <p>발신자를 확인할 수 없다면 이 메일에 회신하거나 링크를 열지 말고 보안 담당자에게 신고하세요.</p>
+{{else if eq .State "ERROR"}}
+  <span class="badge">검사 실패</span>
+  <h1>다운로드가 차단되었습니다</h1>
+  <p>보안 검사를 완료하지 못해 안전을 위해 다운로드를 차단했습니다. 필요한 경우 보안 담당자에게 문의하세요.</p>
+{{else if eq .State "EXPIRED"}}
+  <span class="badge">만료</span>
+  <h1>링크가 만료되었습니다</h1>
+  <p>보관 기간이 지나 파일이 삭제되었습니다. 발신자에게 파일을 다시 요청하세요.</p>
+{{else if eq .State "NOTFOUND"}}
+  <span class="badge">없음</span>
+  <h1>파일을 찾을 수 없습니다</h1>
+  <p>링크가 올바르지 않거나 존재하지 않는 파일입니다.</p>
+{{else}}
+  <span class="badge">오류</span>
+  <h1>요청을 처리하지 못했습니다</h1>
+  <p>{{.Message}}</p>
+{{end}}
+
+{{if .Filename}}
+  <div class="file"><strong>{{.Filename}}</strong><br><small>{{size .Size}} · 보관 기한 {{.Expires}}</small></div>
+{{end}}
+
+{{if or (eq .State "PENDING") (eq .State "CLEAN")}}
+  <form method="post" action="/d/{{.Token}}/download">
+    <button id="dl" type="submit" {{if ne .State "CLEAN"}}disabled{{end}}>다운로드</button>
+  </form>
+{{end}}
+</div>
+<footer>보안 메일 게이트웨이</footer>
+</main>
+{{if eq .State "PENDING"}}
+<script nonce="{{.Nonce}}">
+(function () {
+  var url = "/d/{{.Token}}/status";
+  var delay = 3000, tries = 0;
+  function poll() {
+    fetch(url, { cache: "no-store", credentials: "omit" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        if (j && j.status && j.status !== "PENDING") { location.reload(); return; }
+        schedule();
+      })
+      .catch(schedule);
+  }
+  function schedule() {
+    tries++;
+    if (tries > 20) delay = 10000; // back off after ~1 minute
+    setTimeout(poll, delay);
+  }
+  schedule();
+})();
+</script>
+{{end}}
+</body>
+</html>
