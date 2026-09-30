@@ -108,10 +108,10 @@ func TestPasswordPDFs(t *testing.T) {
 	if locs := rrnLocations(rep); len(locs) == 0 {
 		t.Errorf("owner-password PDF not scanned: %v", rep.Uninspectable)
 	}
-	// User password: cannot be opened, must be reported.
+	// User password: cannot be opened, must be reported as encrypted.
 	rep = s.ScanMessage(context.Background(), attachMsg("u.pdf", "application/pdf", fixture(t, "rrn-user-pw.pdf")))
-	if len(rrnLocations(rep)) != 0 || len(rep.Uninspectable) != 1 || !strings.Contains(rep.Uninspectable[0], "암호") {
-		t.Errorf("user-password PDF: findings=%v uninspectable=%v", rrnLocations(rep), rep.Uninspectable)
+	if len(rrnLocations(rep)) != 0 || len(rep.Encrypted) != 1 || !strings.Contains(rep.Encrypted[0], "암호") {
+		t.Errorf("user-password PDF: findings=%v encrypted=%v", rrnLocations(rep), rep.Encrypted)
 	}
 }
 

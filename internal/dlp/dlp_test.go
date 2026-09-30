@@ -195,12 +195,12 @@ func TestXlsxCellsSeparated(t *testing.T) {
 func TestNestedZipAndEncryptedEntry(t *testing.T) {
 	inner := zipOf(t, map[string]string{"keys.env": "GITHUB_TOKEN=ghp_" + strings.Repeat("Q", 36)})
 	outer := zipOf(t, map[string]string{"inner.zip": string(inner), "secret.txt": "x"}, "secret.txt")
-	texts, probs := ExtractText("첨부 outer.zip", "outer.zip", outer, DefaultLimits())
-	if len(texts) != 1 || texts[0].Location != "첨부 outer.zip > inner.zip > keys.env" {
-		t.Fatalf("nested location wrong: %+v", texts)
+	ex := Extract("첨부 outer.zip", "outer.zip", outer, DefaultLimits())
+	if len(ex.Texts) != 1 || ex.Texts[0].Location != "첨부 outer.zip > inner.zip > keys.env" {
+		t.Fatalf("nested location wrong: %+v", ex.Texts)
 	}
-	if len(probs) != 1 || !strings.Contains(probs[0], "암호화") {
-		t.Fatalf("encrypted entry not reported: %v", probs)
+	if len(ex.Encrypted) != 1 || !strings.Contains(ex.Encrypted[0], "암호") {
+		t.Fatalf("encrypted entry not reported: %v", ex.Encrypted)
 	}
 }
 

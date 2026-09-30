@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -301,7 +303,7 @@ func TestAttachmentsAndUninspectable(t *testing.T) {
 	}
 	e.box.waitFor(t, "kim@example.com", "첨부 list.csv")
 
-	// Encrypted zip entry -> uninspectable -> notify.
+	// Encrypted zip entry -> encrypted (falls back to uninspectable=notify).
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
 	w, _ := zw.CreateHeader(&zip.FileHeader{Name: "a.xlsx", Flags: 1})
@@ -310,7 +312,7 @@ func TestAttachmentsAndUninspectable(t *testing.T) {
 	if err := e.send("kim@example.com", []string{"partner@ext.org"}, withAttachment("secret.zip", buf.Bytes())); err != nil {
 		t.Fatal(err)
 	}
-	e.box.waitFor(t, "kim@example.com", "암호화된 압축파일")
+	e.box.waitFor(t, "kim@example.com", "암호가 걸린 첨부파일")
 	if e.next.count() != 2 {
 		t.Fatalf("notify-level mail must be delivered, got %d", e.next.count())
 	}
@@ -376,5 +378,37 @@ func TestInternalMailSkippedUnlessConfigured(t *testing.T) {
 	e2.send("kim@example.com", []string{"lee@example.com"}, mail("사내", "900101-1234567"))
 	if e2.next.count() != 0 {
 		t.Fatal("scan_internal should apply the policy to internal mail")
+	}
+}
+
+func TestEncryptedAttachmentPolicy(t *testing.T) {
+	if _, err := exec.LookPath("7z"); err != nil {
+		t.Skip("7z not installed")
+	}
+	dlp.SetArchiveTools("", 2)
+	enc, err := os.ReadFile("../dlp/testdata/rrn-enc.7z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Default (encrypted -> hold via setup's action set below).
+	e := setup(t, func(o *Options) { o.Actions.Encrypted = config.ActionHold })
+	if err := e.send("kim@example.com", []string{"partner@ext.org"}, withAttachment("secret.7z", enc)); err != nil {
+		t.Fatalf("held mail should be accepted: %v", err)
+	}
+	if e.next.count() != 0 {
+		t.Fatal("encrypted attachment must be held, not relayed")
+	}
+	holds, _ := e.store.ListHolds(context.Background(), model.HoldHeld, 10)
+	if len(holds) != 1 {
+		t.Fatalf("expected one hold, got %d", len(holds))
+	}
+	e.box.waitFor(t, "kim@example.com", "암호가 걸린 첨부파일")
+
+	// Block policy: sender is refused at SMTP time.
+	e2 := setup(t, func(o *Options) { o.Actions.Encrypted = config.ActionBlock })
+	err = e2.send("kim@example.com", []string{"partner@ext.org"}, withAttachment("secret.7z", enc))
+	var se *smtp.SMTPError
+	if !errors.As(err, &se) || se.Code != 550 || !strings.Contains(se.Message, "encrypted") {
+		t.Fatalf("want 550 with encrypted, got %v", err)
 	}
 }

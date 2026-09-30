@@ -39,11 +39,12 @@ func DefaultLimits() Limits {
 }
 
 type extractor struct {
-	lim      Limits
-	budget   int64
-	texts    []Text
-	images   []Image
-	problems []string
+	lim       Limits
+	budget    int64
+	texts     []Text
+	images    []Image
+	problems  []string
+	encrypted []string
 }
 
 // Extracted is everything pulled out of one attachment.
@@ -53,13 +54,17 @@ type Extracted struct {
 	// documents, scanned PDF pages).
 	Images   []Image
 	Problems []string
+	// Encrypted lists parts that need a password to open (encrypted
+	// archives, password-protected documents). They are separated from
+	// Problems so the policy can treat them differently.
+	Encrypted []string
 }
 
 // Extract walks an attachment (recursively for archives and documents).
 func Extract(location, filename string, data []byte, lim Limits) Extracted {
 	x := &extractor{lim: lim, budget: lim.MaxInflate}
 	x.file(location, filename, data, 0)
-	return Extracted{Texts: x.texts, Images: x.images, Problems: x.problems}
+	return Extracted{Texts: x.texts, Images: x.images, Problems: x.problems, Encrypted: x.encrypted}
 }
 
 // ExtractText returns the text found in an attachment and a list of parts
@@ -100,6 +105,11 @@ func (x *extractor) problem(loc, why string) {
 	x.problems = append(x.problems, loc+": "+why)
 }
 
+// locked records a part that requires a password to open.
+func (x *extractor) locked(loc, why string) {
+	x.encrypted = append(x.encrypted, loc+": "+why)
+}
+
 func (x *extractor) file(loc, name string, data []byte, depth int) {
 	defer func() {
 		if r := recover(); r != nil { // third-party parsers on hostile input
@@ -115,6 +125,17 @@ func (x *extractor) file(loc, name string, data []byte, depth int) {
 	case bytes.HasPrefix(data, []byte("%PDF")):
 		x.pdf(loc, data)
 		x.pdfImages(loc, data)
+	case bytes.HasPrefix(data, []byte{0x1f, 0x8b}):
+		x.gzip(loc, name, data, depth)
+	case bytes.HasPrefix(data, []byte("BZh")) && len(data) > 4 && data[3] >= '1' && data[3] <= '9':
+		x.bzip2(loc, name, data, depth)
+	case isTar(data):
+		x.tar(loc, data, depth)
+	case bytes.HasPrefix(data, []byte("7z\xbc\xaf\x27\x1c")),
+		bytes.HasPrefix(data, []byte("Rar!\x1a\x07")),
+		bytes.HasPrefix(data, []byte("\xfd7zXZ\x00")),
+		bytes.HasPrefix(data, []byte("\x28\xb5\x2f\xfd")):
+		x.sevenZip(loc, name, data, depth)
 	case isImage(data):
 		x.addImage(loc, data)
 	case isHEIF(data):
@@ -229,7 +250,7 @@ func (x *extractor) zip(loc string, data []byte, depth int) {
 		}
 		sub := loc + " > " + f.Name
 		if f.Flags&0x1 != 0 {
-			x.problem(sub, "암호화된 압축파일 (검사 불가)")
+			x.locked(sub, "암호가 설정된 압축파일")
 			continue
 		}
 		b, err := x.readZipEntry(f)
@@ -344,7 +365,7 @@ func (x *extractor) ole(loc string, data []byte) {
 		order = append(order, key)
 	}
 	if _, ok := streams["EncryptedPackage"]; ok {
-		x.problem(loc, "암호가 설정된 문서 (검사 불가)")
+		x.locked(loc, "암호가 설정된 문서")
 		return
 	}
 	if fh, ok := streams["FileHeader"]; ok && bytes.HasPrefix(fh, []byte("HWP Document File")) {
@@ -369,7 +390,7 @@ func (x *extractor) hwp(loc string, fh []byte, streams map[string][]byte, order 
 	props := binary.LittleEndian.Uint32(fh[36:40])
 	compressed, encrypted, distribution := props&1 != 0, props&2 != 0, props&4 != 0
 	if encrypted {
-		x.problem(loc, "암호가 설정된 HWP 문서 (검사 불가)")
+		x.locked(loc, "암호가 설정된 HWP 문서")
 		return
 	}
 	if distribution {
@@ -531,7 +552,7 @@ func (x *extractor) pdf(loc string, data []byte) bool {
 	r, err := pdf.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		if err == pdf.ErrInvalidPassword || bytes.Contains(data, []byte("/Encrypt")) {
-			return fallback("암호가 설정된 PDF (검사 불가)")
+			return fallback("암호가 설정된 PDF")
 		}
 		return fallback("PDF 해석 실패")
 	}

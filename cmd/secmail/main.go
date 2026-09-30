@@ -162,8 +162,10 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		o := cfg.DLP.OCR
 		conv := dlp.DetectConverter(o.HEIFCommand, o.PDFRenderCommand, o.PDFTextCommand,
 			o.PDFScaleTo, o.PDFMaxPages, o.MaxProcesses)
+		dlp.SetArchiveTools(cfg.DLP.SevenZipCommand, o.MaxProcesses)
+		archive := dlp.DetectArchiveTools(cfg.DLP.SevenZipCommand, 1)
 		log.Info("dlp converters", "heif", orNone(conv.HEIFCmd), "pdf_render", orNone(conv.PDFToPPMCmd),
-			"pdf_text", orNone(conv.PDFToTextCmd))
+			"pdf_text", orNone(conv.PDFToTextCmd), "archive_7z", orNone(archive.SevenZip))
 		scanner, err := dlp.NewScanner(dlp.Options{
 			Disabled: cfg.DLP.Disabled, MinCounts: cfg.DLP.MinCounts, Rules: rules,
 			ScanAttachments: cfg.DLP.ScanAttachments, Limits: dlp.DefaultLimits(), OCR: ocr,

@@ -57,7 +57,10 @@ type DLPActions struct {
 	High          string `yaml:"high"`
 	Medium        string `yaml:"medium"`
 	Low           string `yaml:"low"`
-	Uninspectable string `yaml:"uninspectable"` // encrypted archives/documents
+	Uninspectable string `yaml:"uninspectable"` // formats that cannot be inspected
+	// Encrypted applies to password-protected attachments. Empty falls back
+	// to Uninspectable.
+	Encrypted string `yaml:"encrypted"`
 }
 
 type DLPRule struct {
@@ -115,6 +118,10 @@ type DLPConfig struct {
 	// domains (off by default: only mail leaving the organisation).
 	ScanInternal           bool     `yaml:"scan_internal"`
 	ExemptRecipientDomains []string `yaml:"exempt_recipient_domains"`
+	// SevenZipCommand extracts 7z/RAR/xz/zstd archives ("" = auto-detect on
+	// PATH, "none" = disabled). Non-encrypted archives are unpacked and their
+	// contents scanned; encrypted ones follow actions.encrypted.
+	SevenZipCommand string `yaml:"sevenzip_command"`
 }
 
 type SMTPConfig struct {
@@ -305,7 +312,7 @@ func Default() Config {
 		DLP: DLPConfig{
 			ScanAttachments: true,
 			Actions: DLPActions{High: ActionHold, Medium: ActionNotify, Low: ActionAllow,
-				Uninspectable: ActionNotify},
+				Uninspectable: ActionNotify, Encrypted: ActionHold},
 			NotifySender: true,
 			HoldTTL:      72 * time.Hour,
 			OCR: DLPOCRConfig{Command: "tesseract", Languages: "kor+eng", PSM: 4, MaxImages: 20,
@@ -389,8 +396,12 @@ func (c *Config) Validate() error {
 		for i, d := range c.Outbound.SenderDomains {
 			c.Outbound.SenderDomains[i] = strings.ToLower(strings.TrimSpace(d))
 		}
+		if c.DLP.Actions.Encrypted == "" {
+			c.DLP.Actions.Encrypted = c.DLP.Actions.Uninspectable
+		}
 		a := c.DLP.Actions
-		for name, v := range map[string]string{"high": a.High, "medium": a.Medium, "low": a.Low, "uninspectable": a.Uninspectable} {
+		for name, v := range map[string]string{"high": a.High, "medium": a.Medium, "low": a.Low,
+			"uninspectable": a.Uninspectable, "encrypted": a.Encrypted} {
 			switch v {
 			case ActionAllow, ActionNotify, ActionHold, ActionBlock:
 			default:
@@ -400,7 +411,8 @@ func (c *Config) Validate() error {
 		if c.DLP.NotifyFrom == "" && (c.DLP.NotifySender || len(c.DLP.Admins) > 0) {
 			errs = append(errs, errors.New("dlp.notify_from is required for notifications"))
 		}
-		if (a.High == ActionHold || a.Medium == ActionHold || a.Low == ActionHold || a.Uninspectable == ActionHold) && len(c.DLP.Admins) == 0 {
+		if (a.High == ActionHold || a.Medium == ActionHold || a.Low == ActionHold ||
+			a.Uninspectable == ActionHold || a.Encrypted == ActionHold) && len(c.DLP.Admins) == 0 {
 			errs = append(errs, errors.New("dlp.admins is required when an action is \"hold\""))
 		}
 	}

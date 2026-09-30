@@ -107,13 +107,15 @@ outbound:
   max_message_bytes: 52428800
 
 dlp:
-  scan_attachments: true           # docx/xlsx/pptx, hwp/hwpx, pdf, zip (nested), csv/txt, legacy doc/xls
+  scan_attachments: true           # docx/xlsx/pptx, hwp/hwpx, pdf, zip/gzip/tar/7z/rar (nested), csv/txt, legacy doc/xls
+  # sevenzip_command: 7z           # 7z/rar/xz/zstd extraction (auto-detected on PATH; "none" disables)
   scan_internal: false             # true: also inspect mail between internal addresses
   actions:                         # allow | notify | hold | block
     high: hold                     # resident/alien reg. no., card no., API keys, private keys, DB credentials
     medium: notify                 # passport, driver licence, bulk phone numbers, JWT, passwords
     low: allow                     # bulk e-mail addresses (logged only)
-    uninspectable: notify          # encrypted zip/PDF/Office/HWP, distribution-protected HWP
+    uninspectable: notify          # formats that cannot be inspected (distribution-protected HWP, unknown)
+    encrypted: hold                # password-protected attachments (zip/7z/rar/PDF/Office); "" = same as uninspectable
   notify_sender: true
   admins: [security@example.com]   # receive notices; approve/reject holds on the portal
   notify_from: dlp-noreply@example.com

@@ -43,10 +43,27 @@ func TestValidation(t *testing.T) {
 		"header w/o name":   base + "portal: {auth: {mode: header}}\n",
 		"unknown auth mode": base + "portal: {auth: {mode: magic}}\n",
 		"weak api token":    "upstream: {addr: 'mx:25'}\nsmtp: {accepted_domains: [a.com]}\ninternal_api: {listen: ':8081', token: x}\n",
+		"bad encrypted action": base + "outbound: {enabled: true, allowed_clients: [10.0.0.1]}\n" +
+			"dlp: {notify_from: a@b.c, admins: [s@b.c], actions: {high: hold, medium: notify, low: allow, uninspectable: notify, encrypted: magic}}\n",
 	}
 	for name, body := range bad {
 		if _, err := Load(write(body)); err == nil {
 			t.Errorf("%s: expected validation error", name)
 		}
+	}
+}
+
+func TestEncryptedActionDefaultsToUninspectable(t *testing.T) {
+	body := "upstream: {addr: 'mx:25'}\nsmtp: {accepted_domains: [a.com]}\ninternal_api: {listen: ''}\n" +
+		"outbound: {enabled: true, allowed_clients: [10.0.0.1], next_hop: {addr: 'mx:26'}}\n" +
+		"dlp: {notify_from: a@b.c, actions: {high: notify, medium: notify, low: allow, uninspectable: block, encrypted: ''}}\n"
+	p := filepath.Join(t.TempDir(), "c.yaml")
+	os.WriteFile(p, []byte(body), 0o600)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DLP.Actions.Encrypted != ActionBlock {
+		t.Fatalf("encrypted should default to uninspectable (block), got %q", cfg.DLP.Actions.Encrypted)
 	}
 }

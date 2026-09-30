@@ -118,9 +118,25 @@ func (f Finding) Sev() Severity {
 
 type Report struct {
 	Findings []Finding `json:"findings"`
-	// Uninspectable lists parts that could not be scanned (encrypted
-	// archives or documents, parse failures).
+	// Uninspectable lists parts that could not be scanned (unsupported
+	// formats, parse failures).
 	Uninspectable []string `json:"uninspectable,omitempty"`
+	// Encrypted lists parts that need a password to open. They are separated
+	// so the policy can apply a distinct action (dlp.actions.encrypted).
+	Encrypted []string `json:"encrypted,omitempty"`
+}
+
+// HasEncrypted reports whether any part needed a password.
+func (r *Report) HasEncrypted() bool { return len(r.Encrypted) > 0 }
+
+// noteUnreadable records loc as encrypted when the reason mentions a
+// password (암호), otherwise as uninspectable.
+func noteUnreadable(rep *Report, loc, reason string) {
+	if strings.Contains(reason, "암호") {
+		rep.Encrypted = append(rep.Encrypted, loc+": "+reason)
+	} else {
+		rep.Uninspectable = append(rep.Uninspectable, loc+": "+reason)
+	}
 }
 
 func (r *Report) MaxSeverity() Severity {
@@ -393,6 +409,7 @@ func (s *Scanner) scanEntity(rep *Report, root *mimeproc.Part, prefix string, de
 				rep.Findings = append(rep.Findings, s.ScanText(t.Location, t.Content)...)
 			}
 			rep.Uninspectable = append(rep.Uninspectable, ex.Problems...)
+			rep.Encrypted = append(rep.Encrypted, ex.Encrypted...)
 			*images = append(*images, ex.Images...)
 		}
 	}
@@ -573,12 +590,12 @@ func (s *Scanner) convertImages(ctx context.Context, rep *Report, images []Image
 
 		case KindPDF:
 			if conv == nil || conv.PDFToPPMCmd == "" {
-				rep.Uninspectable = append(rep.Uninspectable, im.Location+": "+im.Reason)
+				noteUnreadable(rep, im.Location, im.Reason)
 				continue
 			}
 			if o.Engine == nil && !im.NeedText {
 				// Only images were unreadable and OCR is off: nothing to gain.
-				rep.Uninspectable = append(rep.Uninspectable, im.Location+": "+im.Reason)
+				noteUnreadable(rep, im.Location, im.Reason)
 				continue
 			}
 			cctx, cancel := context.WithTimeout(ctx, 2*o.Timeout)
@@ -591,9 +608,9 @@ func (s *Scanner) convertImages(ctx context.Context, rep *Report, images []Image
 				if text == "" {
 					reason := im.Reason
 					if strings.Contains(strings.ToLower(err.Error()), "password") {
-						reason = "암호가 설정된 PDF (검사 불가)"
+						reason = "암호가 설정된 PDF"
 					}
-					rep.Uninspectable = append(rep.Uninspectable, im.Location+": "+reason)
+					noteUnreadable(rep, im.Location, reason)
 				}
 				continue
 			}

@@ -31,8 +31,8 @@ func TestHWPSamples(t *testing.T) {
 		texts, probs := ex.Texts, ex.Problems
 		totalImages += len(ex.Images)
 		if strings.HasPrefix(name, "password") {
-			if len(probs) == 0 || !strings.Contains(probs[0], "암호") {
-				t.Errorf("%s: encrypted HWP not reported: %v", name, probs)
+			if len(ex.Encrypted) == 0 || !strings.Contains(ex.Encrypted[0], "암호") {
+				t.Errorf("%s: encrypted HWP not reported: %v", name, ex.Encrypted)
 			}
 			continue
 		}

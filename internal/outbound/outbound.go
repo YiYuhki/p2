@@ -94,6 +94,13 @@ func (s *Service) Decide(rep *dlp.Report) string {
 	if len(rep.Uninspectable) > 0 {
 		act = stricter(act, s.opts.Actions.Uninspectable)
 	}
+	if rep.HasEncrypted() {
+		enc := s.opts.Actions.Encrypted
+		if enc == "" {
+			enc = s.opts.Actions.Uninspectable
+		}
+		act = stricter(act, enc)
+	}
 	return act
 }
 
@@ -134,6 +141,9 @@ var errBlocked = func(rep *dlp.Report) error {
 	if len(rep.Uninspectable) > 0 {
 		ids = append(ids, "uninspectable")
 	}
+	if rep.HasEncrypted() {
+		ids = append(ids, "encrypted")
+	}
 	return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 7, 1},
 		Message: "Message blocked by data loss prevention policy (" + strings.Join(ids, ", ") + ")"}
 }
@@ -156,7 +166,7 @@ func (s *Service) Process(ctx context.Context, env gateway.Envelope, raw []byte)
 		}
 	}
 	rep := s.scanner.ScanMessage(ctx, raw)
-	if len(rep.Findings) == 0 && len(rep.Uninspectable) == 0 {
+	if len(rep.Findings) == 0 && len(rep.Uninspectable) == 0 && !rep.HasEncrypted() {
 		return raw, nil
 	}
 	action := s.Decide(rep)

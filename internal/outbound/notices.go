@@ -38,6 +38,9 @@ func FindingsText(rep *dlp.Report) string {
 		}
 		b.WriteString("\n")
 	}
+	for _, e := range rep.Encrypted {
+		fmt.Fprintf(&b, "  - 암호 잠김(내용 확인 불가): %s\n", e)
+	}
 	for _, u := range rep.Uninspectable {
 		fmt.Fprintf(&b, "  - 검사 불가: %s\n", u)
 	}
@@ -70,6 +73,9 @@ func (s *Service) sendNotices(ctx context.Context, n notice) {
 		status = "보안 정책에 따라 메일 발송이 차단되었습니다. 수신자에게 전달되지 않았습니다."
 	}
 	advice := "개인정보는 꼭 필요한 경우에만 마스킹·암호화하여 승인된 방법으로 전달하세요.\n"
+	if n.rep.HasEncrypted() {
+		advice += "암호가 걸린 첨부파일은 내용을 검사할 수 없습니다. 파일 대신 회사가 승인한 보안 전송 수단(사내 파일공유 등)을 이용하세요.\n"
+	}
 	if hasSecrets(n.rep) {
 		if n.action == config.ActionNotify {
 			advice += "API 키·비밀번호·개인키 등 인증정보가 외부로 전달되었습니다. 즉시 폐기(재발급)하세요.\n"
@@ -79,8 +85,12 @@ func (s *Service) sendNotices(ctx context.Context, n notice) {
 	}
 	findings := FindingsText(n.rep)
 
+	opening := "보낸 메일에서 민감정보가 발견되었습니다."
+	if len(n.rep.Findings) == 0 && n.rep.HasEncrypted() {
+		opening = "보낸 메일에 내용을 검사할 수 없는 암호 파일이 있습니다."
+	}
 	if s.opts.NotifySender && n.env.MailFrom != "" && domainMatch(n.env.MailFrom, s.opts.OwnDomains) {
-		body := "보낸 메일에서 민감정보가 발견되었습니다.\n\n" + s.header(n) + "\n조치: " + status +
+		body := opening + "\n\n" + s.header(n) + "\n조치: " + status +
 			"\n\n발견 내역:\n" + findings + "\n" + advice +
 			"\n오탐이라고 판단되면 보안 담당자에게 문의하세요.\n"
 		s.send(ctx, []string{n.env.MailFrom}, "[보안 알림] 발송 메일 민감정보 탐지: "+n.subject, body)
