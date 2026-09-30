@@ -496,7 +496,11 @@ func serveHTTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, name, a
 		Addr:              addr,
 		Handler:           h,
 		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		// ReadTimeout bounds a slow request body (e.g. a slow-POST attack)
+		// without limiting response streaming, so large file downloads are
+		// unaffected. WriteTimeout is deliberately unset for that reason.
+		ReadTimeout: 30 * time.Second,
+		IdleTimeout: 120 * time.Second,
 	}
 	wg.Add(1)
 	go func() {
