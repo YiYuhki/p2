@@ -155,6 +155,70 @@ func luhn(d string) bool {
 	return sum%10 == 0
 }
 
+// validBizReg checks a Korean business registration number (사업자등록번호,
+// 10 digits, DDD-DD-DDDDD) via its official check digit.
+func validBizReg(v string) bool {
+	d := digits(v)
+	if len(d) != 10 || d == "0000000000" {
+		return false
+	}
+	w := []int{1, 3, 7, 1, 3, 7, 1, 3, 5}
+	sum := 0
+	for i := 0; i < 9; i++ {
+		sum += int(d[i]-'0') * w[i]
+	}
+	sum += int(d[8]-'0') * 5 / 10
+	check := (10 - sum%10) % 10
+	return check == int(d[9]-'0')
+}
+
+// validCorpReg checks a Korean corporate registration number (법인등록번호,
+// 13 digits, DDDDDD-DDDDDDD) via its check digit.
+func validCorpReg(v string) bool {
+	d := digits(v)
+	if len(d) != 13 {
+		return false
+	}
+	sum := 0
+	for i := 0; i < 12; i++ {
+		w := 1
+		if i%2 == 1 {
+			w = 2
+		}
+		sum += int(d[i]-'0') * w
+	}
+	check := (10 - sum%10) % 10
+	return check == int(d[12]-'0')
+}
+
+// validIBAN checks an International Bank Account Number via the ISO 7064
+// mod-97 rule.
+func validIBAN(v string) bool {
+	s := strings.ToUpper(strings.ReplaceAll(v, " ", ""))
+	if len(s) < 15 || len(s) > 34 {
+		return false
+	}
+	rearranged := s[4:] + s[:4]
+	rem := 0
+	for _, c := range rearranged {
+		var n int
+		switch {
+		case c >= '0' && c <= '9':
+			n = int(c - '0')
+		case c >= 'A' && c <= 'Z':
+			n = int(c-'A') + 10
+		default:
+			return false
+		}
+		if n < 10 {
+			rem = (rem*10 + n) % 97
+		} else {
+			rem = (rem*100 + n) % 97
+		}
+	}
+	return rem == 1
+}
+
 func validCard(v string) bool {
 	d := digits(v)
 	// 14+ digits: a 13-digit number is far more likely a resident number.
@@ -298,6 +362,21 @@ func Builtin() []*Detector {
 		{ID: "kr_driver_license", Name: "운전면허번호", Category: CategoryPII, Severity: SeverityMedium, Digits: true,
 			Re:   regexp.MustCompile(nd + `((?:1[1-9]|2[0-8])-\d{2}-\d{6}-\d{2})` + ndE),
 			Mask: maskMiddle(5, 2)},
+		{ID: "kr_biz_reg", Name: "사업자등록번호", Category: CategoryPII, Severity: SeverityMedium, Digits: true,
+			Re:       regexp.MustCompile(nd + `(\d{3}-\d{2}-\d{5})` + ndE),
+			Validate: validBizReg, Mask: maskMiddle(3, 2)},
+		{ID: "kr_corp_reg", Name: "법인등록번호", Category: CategoryPII, Severity: SeverityMedium, Digits: true,
+			Re:       regexp.MustCompile(nd + `(\d{6}-\d{7})` + ndE),
+			Validate: validCorpReg, Mask: maskMiddle(6, 2)},
+		{ID: "bank_account", Name: "계좌번호", Category: CategoryPII, Severity: SeverityMedium, Digits: true,
+			Re: regexp.MustCompile(nd + `(\d{2,6}-\d{2,6}-\d{2,7}(?:-\d{1,7})?)` + ndE),
+			Context: []string{"계좌", "예금주", "입금", "송금", "account", "은행", "bank", "농협", "국민",
+				"신한", "우리", "하나", "기업", "카카오뱅크", "토스", "새마을", "우체국", "수협", "대출"},
+			Validate: func(v string) bool { d := digits(v); return len(d) >= 10 && len(d) <= 16 },
+			Mask:     maskMiddle(3, 3)},
+		{ID: "iban", Name: "IBAN(해외계좌)", Category: CategoryPII, Severity: SeverityMedium,
+			Re:       regexp.MustCompile(na + `([A-Z]{2}\d{2}[A-Z0-9]{11,30})` + naE),
+			Validate: validIBAN, Mask: maskMiddle(4, 2)},
 		{ID: "kr_mobile", Name: "휴대전화번호(대량)", Category: CategoryPII, Severity: SeverityMedium, MinCount: 5, Digits: true,
 			Re:   regexp.MustCompile(nd + `(01[016789][- .]?\d{3,4}[- .]?\d{4})` + ndE),
 			Mask: maskPhone},

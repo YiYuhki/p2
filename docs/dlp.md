@@ -18,6 +18,10 @@
 | `credit_card` | 신용카드번호 | high | Luhn 체크섬, 발급사 BIN(Visa/Master/Amex/JCB/UnionPay/국내). 구분자 없는 숫자열은 주변에 '카드·결제·card' 같은 단어가 있어야 인정 |
 | `kr_passport` | 여권번호 | medium | 주변 60자 안에 '여권/passport'가 있어야 인정 |
 | `kr_driver_license` | 운전면허번호 | medium | 지역코드 11~28 |
+| `kr_biz_reg` | 사업자등록번호 | medium | 10자리 검증 숫자(체크섬) 일치 |
+| `kr_corp_reg` | 법인등록번호 | medium | 13자리 검증 숫자(체크섬) 일치 |
+| `bank_account` | 계좌번호 | medium | 주변에 '계좌·예금주·은행·송금' 또는 은행명이 있어야 인정, 10~16자리 |
+| `iban` | IBAN(해외계좌) | medium | ISO 7064 mod-97 체크섬 일치 |
 | `kr_mobile` | 휴대전화번호 **대량** | medium | 한 위치에 서로 다른 번호 5개 이상 (서명의 연락처는 제외됨) |
 | `email_address` | 이메일 주소 **대량** | low | 20개 이상 |
 | `private_key` | 개인키 (RSA/EC/OpenSSH/PGP) | high | PEM 헤더 |

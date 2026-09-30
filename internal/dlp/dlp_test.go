@@ -361,3 +361,38 @@ func TestPrefilterEdgeCases(t *testing.T) {
 		t.Error("rrn inside longer number")
 	}
 }
+
+func TestBizAndCorpAndBankDetectors(t *testing.T) {
+	s := newScanner(t)
+	text := strings.Join([]string{
+		"사업자등록번호: 123-45-67891",
+		"법인등록번호 110111-1234569",
+		"입금 계좌 국민은행 123-45-678901 예금주 홍길동",
+		"해외 송금 IBAN DE89370400440532013000",
+	}, "\n")
+	got := ids(s.ScanText("본문", text))
+	for _, id := range []string{"kr_biz_reg", "kr_corp_reg", "bank_account", "iban"} {
+		if _, ok := got[id]; !ok {
+			t.Errorf("missing %s", id)
+		}
+	}
+	if got["kr_biz_reg"].Samples[0] != "123*******91" {
+		t.Errorf("biz mask %q", got["kr_biz_reg"].Samples[0])
+	}
+}
+
+func TestBizCorpBankNegative(t *testing.T) {
+	s := newScanner(t)
+	text := strings.Join([]string{
+		"주문번호 123-45-67890",         // biz-reg format, bad checksum
+		"코드 110111-1234560",         // corp-reg format, bad checksum
+		"상품 코드 12-345-678901",       // account format but no bank context
+		"IBAN XX00ABCDEFGHIJKLMNOP", // bad IBAN checksum
+	}, "\n")
+	got := ids(s.ScanText("본문", text))
+	for _, bad := range []string{"kr_biz_reg", "kr_corp_reg", "bank_account", "iban"} {
+		if f, ok := got[bad]; ok {
+			t.Errorf("false positive %s: %+v", bad, f)
+		}
+	}
+}
