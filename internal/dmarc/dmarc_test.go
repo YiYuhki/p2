@@ -92,3 +92,22 @@ type errResolver struct{}
 func (errResolver) LookupTXT(context.Context, string) ([]string, error) {
 	return nil, &net.DNSError{Err: "server misbehaving", IsTemporary: true}
 }
+
+func TestDMARCMultipleRecordsIsNone(t *testing.T) {
+	txt := map[string][]string{"_dmarc.example.com": {
+		"v=DMARC1; p=reject", "v=DMARC1; p=none",
+	}}
+	got := eval(t, txt, "example.com", "pass", "example.com", nil)
+	if got != "dmarc=none header.from=example.com" {
+		t.Fatalf("multiple DMARC records must be treated as none, got %q", got)
+	}
+}
+
+func TestDMARCTempErrorFromUnderlying(t *testing.T) {
+	txt := map[string][]string{"_dmarc.example.com": {"v=DMARC1; p=reject"}}
+	// No pass; DKIM had a transient temperror -> DMARC temperror, not fail.
+	got := eval(t, txt, "example.com", "none", "", []Signature{{Result: "temperror", Domain: "example.com"}})
+	if got != "dmarc=temperror header.from=example.com" {
+		t.Fatalf("got %q", got)
+	}
+}

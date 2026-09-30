@@ -77,7 +77,24 @@ func (e *Evaluator) Evaluate(ctx context.Context, fromDomain, spfResult, spfDoma
 	if strings.EqualFold(spfResult, "pass") && aligned(spfDomain, fromDomain, aspf) {
 		return "dmarc=pass header.from=" + fromDomain
 	}
+	// Nothing aligned as a pass. If an underlying mechanism could not complete
+	// (transient DNS), report temperror so the receiver retries instead of
+	// hard-failing legitimate mail.
+	if isTemp(spfResult) || anyTemp(dkim) {
+		return "dmarc=temperror header.from=" + fromDomain
+	}
 	return "dmarc=fail header.from=" + fromDomain
+}
+
+func isTemp(result string) bool { return strings.EqualFold(result, "temperror") }
+
+func anyTemp(sigs []Signature) bool {
+	for _, s := range sigs {
+		if isTemp(s.Result) {
+			return true
+		}
+	}
+	return false
 }
 
 // lookupPolicy fetches the DMARC record for the domain, falling back to its
@@ -102,12 +119,19 @@ func (e *Evaluator) fetch(ctx context.Context, domain string) (string, bool, boo
 		}
 		return "", true, false // temporary DNS failure
 	}
+	var found string
+	n := 0
 	for _, t := range txts {
 		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(t)), "v=dmarc1") {
-			return t, false, true
+			found = t
+			n++
 		}
 	}
-	return "", false, false
+	// RFC 7489 §6.6.3: more than one DMARC record means no discoverable policy.
+	if n != 1 {
+		return "", false, false
+	}
+	return found, false, true
 }
 
 // alignmentModes parses adkim/aspf tags; both default to relaxed ("r").

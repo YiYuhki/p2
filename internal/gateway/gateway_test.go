@@ -438,3 +438,20 @@ func TestDMARCResultInAuthResults(t *testing.T) {
 		t.Fatalf("dmarc result missing/wrong: %q", ar)
 	}
 }
+
+func TestFromHeaderDomain(t *testing.T) {
+	cases := map[string]string{
+		"user@example.com":             "example.com",
+		"Name <user@example.com>":      "example.com",
+		"\"Display, Name\" <a@ex.org>": "ex.org",
+		"a@ex.org, b@ex.org":           "ex.org", // same domain
+		"ceo@bank.com, x@attacker.com": "",       // ambiguous multi-domain -> none
+		"":                             "",
+		"garbage-no-at":                "",
+	}
+	for in, want := range cases {
+		if got := fromHeaderDomain(in); got != want {
+			t.Errorf("fromHeaderDomain(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

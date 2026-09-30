@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/mail"
 	"strings"
 	"time"
 
@@ -85,11 +86,11 @@ func (p *Processor) Process(ctx context.Context, env Envelope, raw []byte) ([]by
 	queueID := newQueueID()
 	log := p.log.With("queue_id", queueID, "from", env.MailFrom, "rcpt", env.RcptTo)
 
-	// Authenticate (SPF/DKIM) concurrently with parsing: both only read raw,
-	// and the DNS lookups overlap with the CPU-bound MIME parse instead of
+	// Authenticate (SPF/DKIM/DMARC) concurrently with parsing: all only read
+	// raw, and the DNS lookups overlap with the CPU-bound MIME parse instead of
 	// adding to it. The buffered channel means the goroutine never leaks even on
 	// the early-return paths that do not consume the result.
-	authCh := make(chan inboundAuth, 1)
+	authCh := make(chan string, 1)
 	go func() { authCh <- p.authenticate(ctx, env, raw) }()
 
 	root, err := mimeproc.Parse(raw)
@@ -129,16 +130,12 @@ func (p *Processor) Process(ctx context.Context, env Envelope, raw []byte) ([]by
 }
 
 func (p *Processor) finish(ctx context.Context, log *slog.Logger, env Envelope, queueID string, root *mimeproc.Part,
-	atts []*mimeproc.Extracted, notice string, auth inboundAuth, modified bool) ([]byte, error) {
+	atts []*mimeproc.Extracted, notice, authResults string, modified bool) ([]byte, error) {
 
 	// RFC 8601 §5: strip any inbound Authentication-Results that claim this
 	// gateway's identity, so a sender cannot forge results downstream filters
 	// would trust as ours. Done unconditionally, even when we do not verify.
 	stripSpoofedAuthResults(&root.Header, p.opts.Hostname)
-
-	// DMARC is evaluated here (not in the concurrent authenticate) because it
-	// needs the parsed From-header domain to check alignment.
-	authResults := p.authResultsHeader(ctx, root, auth)
 
 	msgID := ""
 	if len(atts) > 0 {
@@ -189,66 +186,81 @@ func (p *Processor) finish(ctx context.Context, log *slog.Logger, env Envelope, 
 	return out, nil
 }
 
-// inboundAuth carries the SPF and DKIM outcomes computed off the original
-// message, both as rendered Authentication-Results fragments and structured for
-// DMARC alignment.
-type inboundAuth struct {
-	methods []string       // rendered spf/dkim fragments, in order
-	spf     spfutil.Result // zero value when SPF is disabled
-	spfOn   bool
-	dkim    []dkimutil.Result // nil when DKIM is disabled
-	dkimOn  bool
-}
+// authenticate runs the enabled inbound checks (SPF, DKIM, then DMARC) against
+// the original message and returns the combined RFC 8601 method list. It reads
+// the From header straight from raw so DMARC can run here, concurrently with the
+// caller's MIME parse, rather than after it.
+func (p *Processor) authenticate(ctx context.Context, env Envelope, raw []byte) string {
+	var methods []string
+	var spf spfutil.Result
+	var spfOn bool
+	var dkim []dkimutil.Result
 
-// authenticate runs the enabled SPF and DKIM checks against the original
-// message. DMARC is computed later (it needs the parsed From domain).
-func (p *Processor) authenticate(ctx context.Context, env Envelope, raw []byte) inboundAuth {
-	var a inboundAuth
 	if p.opts.VerifySPF && p.opts.SPF != nil {
-		a.spf = p.opts.SPF.CheckResult(ctx, env.RemoteAddr, env.Helo, env.MailFrom)
-		a.spfOn = true
-		a.methods = append(a.methods, a.spf.AuthResults())
+		spf = p.opts.SPF.CheckResult(ctx, env.RemoteAddr, env.Helo, env.MailFrom)
+		spfOn = true
+		methods = append(methods, spf.AuthResults())
 	}
 	if p.opts.VerifyDKIM {
-		a.dkim = dkimutil.VerifyResults(raw, p.opts.LookupTXT)
-		a.dkimOn = true
-		a.methods = append(a.methods, dkimutil.AuthResults(a.dkim))
+		dkim = dkimutil.VerifyResults(raw, p.opts.LookupTXT)
+		methods = append(methods, dkimutil.AuthResults(dkim))
 	}
-	return a
-}
-
-// authResultsHeader finishes the Authentication-Results value: it appends the
-// DMARC verdict (which needs the From domain from the parsed message), records
-// per-method metrics, and returns the combined method list ("" if nothing ran).
-func (p *Processor) authResultsHeader(ctx context.Context, root *mimeproc.Part, a inboundAuth) string {
-	methods := a.methods
-	if p.opts.VerifyDMARC && p.opts.DMARC != nil && (a.spfOn || a.dkimOn) {
-		from := fromHeaderDomain(root.Header.Get("From"))
-		sigs := make([]dmarc.Signature, len(a.dkim))
-		for i, r := range a.dkim {
+	if p.opts.VerifyDMARC && p.opts.DMARC != nil && (spfOn || p.opts.VerifyDKIM) {
+		from := fromHeaderDomain(headerFrom(raw))
+		sigs := make([]dmarc.Signature, len(dkim))
+		for i, r := range dkim {
 			sigs[i] = dmarc.Signature{Result: r.Value, Domain: r.Domain}
 		}
-		methods = append(methods, p.opts.DMARC.Evaluate(ctx, from, a.spf.Value, a.spf.Domain, sigs))
+		methods = append(methods, p.opts.DMARC.Evaluate(ctx, from, spf.Value, spf.Domain, sigs))
 	}
+
 	joined := strings.Join(methods, "; ")
 	recordAuthMetrics(joined)
 	return joined
 }
 
-// fromHeaderDomain extracts the domain of the (first) From-header address.
+// headerFrom reads just the From header from a raw message.
+func headerFrom(raw []byte) string {
+	h, err := textproto.ReadHeader(bufio.NewReader(bytes.NewReader(raw)))
+	if err != nil {
+		return ""
+	}
+	return h.Get("From")
+}
+
+// fromHeaderDomain extracts the domain of the FIRST From-header address (the
+// identity DMARC aligns against). A From with multiple distinct domains is
+// ambiguous and yields "" so DMARC reports "none" rather than trusting an
+// attacker-chosen second address.
 func fromHeaderDomain(from string) string {
 	from = mimeproc.DecodeHeader(from)
-	if i := strings.LastIndexByte(from, '@'); i >= 0 {
+	addrs, err := mail.ParseAddressList(from)
+	if err == nil && len(addrs) > 0 {
+		first := domainPart(addrs[0].Address)
+		for _, a := range addrs[1:] {
+			if domainPart(a.Address) != first {
+				return "" // ambiguous multi-domain From
+			}
+		}
+		return first
+	}
+	// Fallback for a malformed header: take the first '@'.
+	if i := strings.IndexByte(from, '@'); i >= 0 {
 		rest := from[i+1:]
-		// Trim address trailing '>' and any following display text / comments.
-		rest = strings.TrimSpace(rest)
 		for j, r := range rest {
 			if r == '>' || r == ' ' || r == '\t' || r == ')' || r == ',' || r == ';' {
 				rest = rest[:j]
 				break
 			}
 		}
-		return strings.ToLower(strings.Trim(rest, ".<>"))
+		return strings.ToLower(strings.Trim(strings.TrimSpace(rest), ".<>"))
+	}
+	return ""
+}
+
+func domainPart(addr string) string {
+	if i := strings.LastIndexByte(addr, '@'); i >= 0 {
+		return strings.ToLower(strings.TrimSpace(addr[i+1:]))
 	}
 	return ""
 }
