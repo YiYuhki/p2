@@ -396,3 +396,66 @@ func TestBizCorpBankNegative(t *testing.T) {
 		}
 	}
 }
+
+func combineScanner(t *testing.T) *Scanner {
+	s, err := NewScanner(Options{ScanAttachments: true, CombinePII: true, CombineMinPII: 2, CombineBulk: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func TestCombinePIIEscalation(t *testing.T) {
+	s := combineScanner(t)
+	// Two distinct identity types in one location -> escalate to high.
+	rep := s.ScanMessage(context.Background(), []byte(
+		"From: a@example.com\r\nSubject: t\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n"+
+			"여권번호 M12345678\n계좌 국민은행 123-45-678901 예금주 홍길동\n"))
+	if rep.MaxSeverity() != SeverityHigh {
+		t.Fatalf("combination should escalate to high, got %v", rep.MaxSeverity())
+	}
+	got := ids(rep.Findings)
+	if _, ok := got["pii_combination"]; !ok {
+		t.Fatalf("no pii_combination finding: %+v", rep.Findings)
+	}
+}
+
+func TestBulkEscalation(t *testing.T) {
+	s := combineScanner(t)
+	var rows []string
+	for i := 0; i < 25; i++ {
+		rows = append(rows, fmt.Sprintf("고객%d 010-%04d-%04d", i, 1000+i, 2000+i))
+	}
+	// A single medium type (phones) but 25 of them -> bulk -> high.
+	found := s.ScanText("첨부 list.csv", strings.Join(rows, "\n"))
+	rep := &Report{Findings: found}
+	s.escalate(rep)
+	if rep.MaxSeverity() != SeverityHigh {
+		t.Fatalf("bulk list should escalate to high, got %v (%+v)", rep.MaxSeverity(), rep.Findings)
+	}
+}
+
+func TestNoEscalationForSingleType(t *testing.T) {
+	s := combineScanner(t)
+	// One passport alone (medium, below bulk) -> stays medium.
+	found := s.ScanText("본문", "여권번호 M12345678")
+	rep := &Report{Findings: found}
+	s.escalate(rep)
+	for _, f := range rep.Findings {
+		if f.Detector == "pii_combination" {
+			t.Fatal("single medium item must not escalate")
+		}
+	}
+}
+
+func TestCombineDisabled(t *testing.T) {
+	s, _ := NewScanner(Options{CombinePII: false})
+	found := s.ScanText("본문", "여권번호 M12345678\n계좌 신한은행 111-22-333444 예금주 김철수")
+	rep := &Report{Findings: found}
+	s.escalate(rep)
+	for _, f := range rep.Findings {
+		if f.Detector == "pii_combination" {
+			t.Fatal("escalation should be off")
+		}
+	}
+}

@@ -167,10 +167,14 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		archive := dlp.DetectArchiveTools(cfg.DLP.SevenZipCommand, 1)
 		log.Info("dlp converters", "heif", orNone(conv.HEIFCmd), "pdf_render", orNone(conv.PDFToPPMCmd),
 			"pdf_text", orNone(conv.PDFToTextCmd), "archive_7z", orNone(archive.SevenZip))
+		combine := cfg.DLP.CombinePII == nil || *cfg.DLP.CombinePII
 		scanner, err := dlp.NewScanner(dlp.Options{
 			Disabled: cfg.DLP.Disabled, MinCounts: cfg.DLP.MinCounts, Rules: rules,
 			ScanAttachments: cfg.DLP.ScanAttachments, Limits: dlp.DefaultLimits(), OCR: ocr,
-			Converter: conv,
+			Converter:     conv,
+			CombinePII:    combine,
+			CombineMinPII: cfg.DLP.CombineMinPII,
+			CombineBulk:   cfg.DLP.CombineBulk,
 		})
 		if err != nil {
 			return err

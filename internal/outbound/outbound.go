@@ -174,6 +174,9 @@ func (s *Service) Process(ctx context.Context, env gateway.Envelope, raw []byte)
 		return raw, nil
 	}
 	for _, f := range rep.Findings {
+		if f.Detector == "pii_combination" {
+			continue // derived escalation, not newly matched values
+		}
 		metrics.DLPFindings.WithLabelValues(f.Sev().String()).Add(float64(f.Count))
 	}
 	action := s.Decide(rep)

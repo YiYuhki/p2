@@ -118,6 +118,12 @@ type DLPConfig struct {
 	// domains (off by default: only mail leaving the organisation).
 	ScanInternal           bool     `yaml:"scan_internal"`
 	ExemptRecipientDomains []string `yaml:"exempt_recipient_domains"`
+	// CombinePII escalates a location that holds several distinct personal-data
+	// types, or a bulk list, to high severity (an identity-revealing dataset
+	// is riskier than an isolated value).
+	CombinePII    *bool `yaml:"combine_pii"`     // default true
+	CombineMinPII int   `yaml:"combine_min_pii"` // distinct PII types, default 2
+	CombineBulk   int   `yaml:"combine_bulk"`    // records of one type that alone count as bulk, default 20
 	// SevenZipCommand extracts 7z/RAR/xz/zstd archives ("" = auto-detect on
 	// PATH, "none" = disabled). Non-encrypted archives are unpacked and their
 	// contents scanned; encrypted ones follow actions.encrypted.
@@ -324,8 +330,10 @@ func Default() Config {
 			ScanAttachments: true,
 			Actions: DLPActions{High: ActionHold, Medium: ActionNotify, Low: ActionAllow,
 				Uninspectable: ActionNotify, Encrypted: ActionHold},
-			NotifySender: true,
-			HoldTTL:      72 * time.Hour,
+			NotifySender:  true,
+			HoldTTL:       72 * time.Hour,
+			CombineMinPII: 2,
+			CombineBulk:   20,
 			OCR: DLPOCRConfig{Command: "tesseract", Languages: "kor+eng", PSM: 4, MaxImages: 20,
 				MinPixels: 150 * 60, Timeout: 20 * time.Second, TotalTimeout: 60 * time.Second,
 				Concurrency: 2, MaxProcesses: 4, PDFMaxPages: 10, PDFScaleTo: 2400},

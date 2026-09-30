@@ -121,6 +121,9 @@ dlp:
     low: allow                     # bulk e-mail addresses (logged only)
     uninspectable: notify          # formats that cannot be inspected (distribution-protected HWP, unknown)
     encrypted: hold                # password-protected attachments (zip/7z/rar/PDF/Office); "" = same as uninspectable
+  combine_pii: true                # escalate an identity-revealing dataset to high (see below)
+  combine_min_pii: 2               # >= this many distinct PII types in one place -> high
+  combine_bulk: 20                 # >= this many records of a single type in one place -> high
   notify_sender: true
   admins: [security@example.com]   # receive notices; approve/reject holds on the portal
   notify_from: dlp-noreply@example.com

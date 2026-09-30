@@ -34,6 +34,10 @@ type Options struct {
 	// ScanAttachments enables attachment text extraction.
 	ScanAttachments bool
 	Limits          Limits
+	// CombinePII escalates identity-revealing datasets (see escalate).
+	CombinePII    bool
+	CombineMinPII int // distinct PII types in one location (default 2)
+	CombineBulk   int // count of one PII type that alone counts as bulk (default 20)
 	// OCR, when OCR.Engine is set, reads text in images (image
 	// attachments, inline images, pictures in documents, scanned PDFs).
 	OCR OCROptions
@@ -341,8 +345,74 @@ func (s *Scanner) ScanMessage(ctx context.Context, raw []byte) *Report {
 	var images []Image
 	s.scanEntity(rep, root, "", 0, &images)
 	s.ocrImages(ctx, rep, images)
+	s.escalate(rep)
 	sort.SliceStable(rep.Findings, func(i, j int) bool { return rep.Findings[i].Sev() > rep.Findings[j].Sev() })
 	return rep
+}
+
+// identityDetectors are PII types that on their own identify a person; a
+// location combining several of these (or a bulk list of one) is an
+// identity-revealing dataset and is escalated to high severity.
+var identityDetectors = map[string]bool{
+	"kr_rrn": true, "kr_passport": true, "kr_driver_license": true, "credit_card": true,
+	"kr_biz_reg": true, "kr_corp_reg": true, "bank_account": true, "iban": true,
+	"kr_mobile": true, "email_address": true,
+}
+
+// escalate adds a synthetic high-severity "pii_combination" finding for each
+// location that holds several distinct personal-data types, or a bulk list of
+// one. A spreadsheet of names+resident numbers+phones is far riskier than an
+// isolated match, so it should trigger the high-severity action.
+func (s *Scanner) escalate(rep *Report) {
+	if !s.opts.CombinePII {
+		return
+	}
+	minPII := s.opts.CombineMinPII
+	if minPII <= 0 {
+		minPII = 2
+	}
+	bulk := s.opts.CombineBulk
+	if bulk <= 0 {
+		bulk = 20
+	}
+	type agg struct {
+		types map[string]bool
+		max   int
+	}
+	byLoc := map[string]*agg{}
+	var order []string
+	for _, f := range rep.Findings {
+		if !identityDetectors[f.Detector] {
+			continue
+		}
+		a := byLoc[f.Location]
+		if a == nil {
+			a = &agg{types: map[string]bool{}}
+			byLoc[f.Location] = a
+			order = append(order, f.Location)
+		}
+		a.types[f.Detector] = true
+		if f.Count > a.max {
+			a.max = f.Count
+		}
+	}
+	for _, loc := range order {
+		a := byLoc[loc]
+		var reason string
+		switch {
+		case len(a.types) >= minPII:
+			reason = fmt.Sprintf("서로 다른 개인정보 %d종이 함께 있음", len(a.types))
+		case a.max >= bulk:
+			reason = fmt.Sprintf("동일 개인정보 %d건 이상 대량", a.max)
+		default:
+			continue
+		}
+		rep.Findings = append(rep.Findings, Finding{
+			Detector: "pii_combination", Name: "개인정보 결합·대량(신원 식별 가능)",
+			Category: CategoryPII, Severity: SeverityHigh.String(), sev: SeverityHigh,
+			Location: loc, Count: len(a.types), Samples: []string{reason},
+		})
+	}
 }
 
 func (s *Scanner) scanEntity(rep *Report, root *mimeproc.Part, prefix string, depth int, images *[]Image) {
