@@ -52,8 +52,14 @@ type Store interface {
 	// ListExpiredHolds returns HELD holds whose ExpiresAt < now.
 	ListExpiredHolds(ctx context.Context, now time.Time, limit int) ([]*model.Hold, error)
 	RecordDLPEvent(ctx context.Context, ev *model.DLPEvent) error
-	ListDLPEvents(ctx context.Context, limit int, page Page) ([]*model.DLPEvent, error)
+	ListDLPEvents(ctx context.Context, filter EventFilter, limit int, page Page) ([]*model.DLPEvent, error)
 	Close()
+}
+
+// EventFilter narrows a DLP event listing. Empty fields match anything.
+type EventFilter struct {
+	Action   string // allow | notify | hold | block | exempt
+	Severity string // high | medium | low | uninspectable | encrypted
 }
 
 // Page is a keyset pagination cursor for the admin list endpoints. Rows are

@@ -235,7 +235,7 @@ func TestHighFindingHeldThenReleased(t *testing.T) {
 		t.Fatalf("double release: %v", err)
 	}
 	e.box.waitFor(t, "kim@example.com", "승인하여 메일이 발송")
-	evs, _ := e.store.ListDLPEvents(context.Background(), 10, store.Page{})
+	evs, _ := e.store.ListDLPEvents(context.Background(), store.EventFilter{}, 10, store.Page{})
 	if len(evs) != 1 || evs[0].Action != "hold" || evs[0].HoldID != holds[0].ID {
 		t.Fatalf("audit event: %+v", evs)
 	}
@@ -332,7 +332,7 @@ func TestExemptions(t *testing.T) {
 	if e.next.count() != 2 {
 		t.Fatalf("exempt mail should be delivered: %d", e.next.count())
 	}
-	evs, _ := e.store.ListDLPEvents(context.Background(), 10, store.Page{})
+	evs, _ := e.store.ListDLPEvents(context.Background(), store.EventFilter{}, 10, store.Page{})
 	if len(evs) != 1 || evs[0].Action != "allow" {
 		t.Fatalf("exempt recipient should be logged as allow: %+v", evs)
 	}

@@ -148,7 +148,7 @@ func holdConformance(t *testing.T, s Store) {
 	if err := s.RecordDLPEvent(ctx, ev); err != nil {
 		t.Fatal(err)
 	}
-	evs, err := s.ListDLPEvents(ctx, 10, Page{})
+	evs, err := s.ListDLPEvents(ctx, EventFilter{}, 10, Page{})
 	if err != nil || len(evs) == 0 || evs[0].ID != ev.ID || evs[0].HoldID != h1.ID {
 		t.Fatalf("events: %+v %v", evs, err)
 	}
@@ -265,7 +265,7 @@ func paginationConformance(t *testing.T, s Store) {
 	assertAllPresent(t, "holds", got, mine)
 
 	got = walk(func(p Page) ([]string, []time.Time, bool) {
-		evs, err := s.ListDLPEvents(ctx, 2, p)
+		evs, err := s.ListDLPEvents(ctx, EventFilter{}, 2, p)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -276,6 +276,34 @@ func paginationConformance(t *testing.T, s Store) {
 		return ids, ts, len(evs) == 2
 	})
 	assertAllPresent(t, "events", got, mine)
+
+	// Filter check (also exercises the dynamic WHERE against a real DB). My
+	// events were all recorded with action "notify".
+	notify, err := s.ListDLPEvents(ctx, EventFilter{Action: "notify"}, 500, Page{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range notify {
+		if mine[e.ID] {
+			n++
+			if e.Action != "notify" {
+				t.Fatalf("action filter returned %q", e.Action)
+			}
+		}
+	}
+	if n != 5 {
+		t.Fatalf("action filter dropped my rows: got %d of 5", n)
+	}
+	blocked, err := s.ListDLPEvents(ctx, EventFilter{Action: "block"}, 500, Page{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range blocked {
+		if mine[e.ID] {
+			t.Fatal("block filter returned a notify row")
+		}
+	}
 }
 
 func assertAllPresent(t *testing.T, what string, got []string, mine map[string]bool) {
@@ -288,5 +316,35 @@ func assertAllPresent(t *testing.T, what string, got []string, mine map[string]b
 	}
 	if n != 5 {
 		t.Fatalf("%s: paged %d of my 5 marked rows", what, n)
+	}
+}
+
+func TestListDLPEventsFilter(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemory()
+	now := time.Now().UTC()
+	mk := func(action, sev string) {
+		s.RecordDLPEvent(ctx, &model.DLPEvent{ID: uuid.NewString(), MailFrom: "a@ex.org",
+			RcptTo: []string{"x@ext.org"}, Action: action, Severity: sev, Findings: json.RawMessage(`{}`), At: now})
+	}
+	mk("block", "high")
+	mk("notify", "medium")
+	mk("hold", "high")
+
+	byAction, _ := s.ListDLPEvents(ctx, EventFilter{Action: "block"}, 100, Page{})
+	if len(byAction) != 1 || byAction[0].Action != "block" {
+		t.Fatalf("action filter: %+v", byAction)
+	}
+	bySev, _ := s.ListDLPEvents(ctx, EventFilter{Severity: "high"}, 100, Page{})
+	if len(bySev) != 2 {
+		t.Fatalf("severity filter: want 2 high, got %d", len(bySev))
+	}
+	both, _ := s.ListDLPEvents(ctx, EventFilter{Action: "hold", Severity: "high"}, 100, Page{})
+	if len(both) != 1 || both[0].Action != "hold" {
+		t.Fatalf("combined filter: %+v", both)
+	}
+	none, _ := s.ListDLPEvents(ctx, EventFilter{Action: "allow"}, 100, Page{})
+	if len(none) != 0 {
+		t.Fatalf("no-match filter should be empty, got %d", len(none))
 	}
 }

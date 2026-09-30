@@ -115,12 +115,13 @@ func (s *Memory) RecordDLPEvent(_ context.Context, ev *model.DLPEvent) error {
 	return nil
 }
 
-func (s *Memory) ListDLPEvents(_ context.Context, limit int, page Page) ([]*model.DLPEvent, error) {
+func (s *Memory) ListDLPEvents(_ context.Context, f EventFilter, limit int, page Page) ([]*model.DLPEvent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var all []*model.DLPEvent
 	for _, e := range s.dlpEvents {
-		if afterCursor(e.At, e.ID, page) {
+		if (f.Action == "" || e.Action == f.Action) && (f.Severity == "" || e.Severity == f.Severity) &&
+			afterCursor(e.At, e.ID, page) {
 			c := *e
 			all = append(all, &c)
 		}

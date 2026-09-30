@@ -164,7 +164,7 @@ curl -H "Authorization: Bearer $ADMIN" -d '{"by":"sec@example.com","reason":"마
 curl -H "Authorization: Bearer $ADMIN" http://secmail:8081/internal/v1/dlp/events?limit=100
 ```
 
-`holds`·`events` 목록은 `limit`(최대 500)과 **커서 페이지네이션**을 지원합니다. 응답이 `limit`만큼 가득 차면 `X-Next-Cursor` 헤더에 다음 페이지 커서가 담기며, 이를 `?cursor=` 로 넘겨 이어서 조회합니다(시각·id 복합 키 기준이라 같은 시각의 항목도 누락·중복 없이 페이징됩니다).
+`events` 목록은 `action`(allow/notify/hold/block/exempt)·`severity`(high/medium/low/…)로 서버측 필터링할 수 있습니다(예: `?action=block&severity=high`). `holds`·`events` 목록은 `limit`(최대 500)과 **커서 페이지네이션**을 지원합니다. 응답이 `limit`만큼 가득 차면 `X-Next-Cursor` 헤더에 다음 페이지 커서가 담기며, 이를 `?cursor=` 로 넘겨 이어서 조회합니다(시각·id 복합 키 기준이라 같은 시각의 항목도 누락·중복 없이 페이징됩니다).
 ```bash
 next=$(curl -sD - -H "Authorization: Bearer $ADMIN" \
        "http://secmail:8081/internal/v1/dlp/events?limit=100" | grep -i x-next-cursor | cut -d' ' -f2 | tr -d '\r')

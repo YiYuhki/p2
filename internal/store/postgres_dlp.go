@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"errors"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -105,18 +107,27 @@ func (p *Postgres) RecordDLPEvent(ctx context.Context, ev *model.DLPEvent) error
 	return err
 }
 
-func (p *Postgres) ListDLPEvents(ctx context.Context, limit int, page Page) ([]*model.DLPEvent, error) {
+func (p *Postgres) ListDLPEvents(ctx context.Context, f EventFilter, limit int, page Page) ([]*model.DLPEvent, error) {
 	const cols = `id, mail_from, rcpt_to, subject, action, severity, findings, COALESCE(hold_id::text, ''), at`
-	var rows pgx.Rows
-	var err error
-	if page.Set() {
-		rows, err = p.pool.Query(ctx, `SELECT `+cols+` FROM dlp_events
-			WHERE (at < $2 OR (at = $2 AND id < $3))
-			ORDER BY at DESC, id DESC LIMIT $1`, limit, page.Before, page.BeforeID)
-	} else {
-		rows, err = p.pool.Query(ctx, `SELECT `+cols+` FROM dlp_events
-			ORDER BY at DESC, id DESC LIMIT $1`, limit)
+	var args []any
+	arg := func(v any) string { args = append(args, v); return "$" + strconv.Itoa(len(args)) }
+	var conds []string
+	if f.Action != "" {
+		conds = append(conds, "action="+arg(f.Action))
 	}
+	if f.Severity != "" {
+		conds = append(conds, "severity="+arg(f.Severity))
+	}
+	if page.Set() {
+		bt, bid := arg(page.Before), arg(page.BeforeID)
+		conds = append(conds, "(at < "+bt+" OR (at = "+bt+" AND id < "+bid+"))")
+	}
+	q := `SELECT ` + cols + ` FROM dlp_events`
+	if len(conds) > 0 {
+		q += " WHERE " + strings.Join(conds, " AND ")
+	}
+	q += " ORDER BY at DESC, id DESC LIMIT " + arg(limit)
+	rows, err := p.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}

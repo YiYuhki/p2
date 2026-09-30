@@ -183,7 +183,11 @@ func (a *API) decide(release bool) http.HandlerFunc {
 
 func (a *API) listEvents(w http.ResponseWriter, r *http.Request) {
 	limit := limitParam(r, 100)
-	evs, err := a.store.ListDLPEvents(r.Context(), limit, decodeCursor(r.URL.Query().Get("cursor")))
+	filter := store.EventFilter{
+		Action:   strings.ToLower(strings.TrimSpace(r.URL.Query().Get("action"))),
+		Severity: strings.ToLower(strings.TrimSpace(r.URL.Query().Get("severity"))),
+	}
+	evs, err := a.store.ListDLPEvents(r.Context(), filter, limit, decodeCursor(r.URL.Query().Get("cursor")))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errBody("internal error"))
 		return
