@@ -80,7 +80,8 @@ func (a *API) ready(w http.ResponseWriter, r *http.Request) {
 func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if !ok || subtle.ConstantTimeCompare([]byte(got), a.token) != 1 {
+		// A misconfigured empty token must never authenticate anyone.
+		if len(a.token) == 0 || !ok || subtle.ConstantTimeCompare([]byte(got), a.token) != 1 {
 			writeJSON(w, http.StatusUnauthorized, errBody("unauthorized"))
 			return
 		}

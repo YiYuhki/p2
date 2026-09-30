@@ -32,9 +32,21 @@ const (
 	PriorityNormal
 )
 
-// ResultHandler applies a verdict. Returning an error only logs; the verdict
-// is not re-delivered (the stale-job sweep will re-queue if needed).
+// ResultHandler applies a verdict. A nil error consumes the verdict; a
+// PermanentError dead-letters it; any other error is treated as transient and
+// the consumer retries a few times before falling back to the stale-job sweep.
 type ResultHandler func(ctx context.Context, v model.Verdict) error
+
+// PermanentError marks a verdict that must not be retried (malformed payload,
+// unknown attachment, or a duplicate for an already-decided attachment).
+type PermanentError struct{ Err error }
+
+func (e *PermanentError) Error() string { return "permanent: " + e.Err.Error() }
+func (e *PermanentError) Unwrap() error { return e.Err }
+
+// Permanent wraps err so the results consumer dead-letters it instead of
+// retrying.
+func Permanent(err error) error { return &PermanentError{Err: err} }
 
 type Queue interface {
 	Enqueue(ctx context.Context, job model.Job, p Priority) error
@@ -100,8 +112,58 @@ func (q *Redis) ConsumeResults(ctx context.Context, h ResultHandler) error {
 			q.rdb.LPush(ctx, key+":dead", payload)
 			continue
 		}
-		if err := h(ctx, v); err != nil {
-			q.log.Warn("results: apply verdict failed", "attachment", v.AttachmentID, "err", err)
+		q.deliver(ctx, h, v, payload, key)
+	}
+}
+
+// deliver applies one verdict, dead-lettering permanent failures.
+func (q *Redis) deliver(ctx context.Context, h ResultHandler, v model.Verdict, payload, key string) {
+	deliverWithRetry(ctx, h, v, q.log, func() { q.rdb.LPush(ctx, key+":dead", payload) })
+}
+
+// maxDeliverTries bounds transient retries of a consumed verdict.
+const maxDeliverTries = 4
+
+// retryBackoff is the delay before the next transient retry; a package variable
+// so tests can shrink it. Exponential, capped at 4s (1s, 2s, 4s, ...).
+var retryBackoff = func(attempt int) time.Duration {
+	d := time.Second << (attempt - 1)
+	if d > 4*time.Second {
+		d = 4 * time.Second
+	}
+	return d
+}
+
+// deliverWithRetry applies a verdict, retrying transient failures with backoff
+// so a brief database/storage blip does not discard a finished verdict (which
+// would otherwise force a full re-analysis via the stale-job sweep). Permanent
+// failures invoke deadLetter; if transient failures persist past
+// maxDeliverTries the verdict is dropped and the stale-job sweep re-queues the
+// job.
+func deliverWithRetry(ctx context.Context, h ResultHandler, v model.Verdict, log *slog.Logger, deadLetter func()) {
+	for attempt := 1; ; attempt++ {
+		err := h(ctx, v)
+		if err == nil {
+			return
+		}
+		var perm *PermanentError
+		if errors.As(err, &perm) {
+			log.Warn("results: permanent verdict error, dead-lettering",
+				"attachment", v.AttachmentID, "err", perm.Err)
+			deadLetter()
+			return
+		}
+		if attempt >= maxDeliverTries {
+			log.Error("results: apply verdict failed after retries; stale-job sweep will re-queue",
+				"attachment", v.AttachmentID, "attempts", attempt, "err", err)
+			return
+		}
+		log.Warn("results: apply verdict failed, retrying",
+			"attachment", v.AttachmentID, "attempt", attempt, "err", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(retryBackoff(attempt)):
 		}
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -173,6 +174,10 @@ func (s *Service) job(a *model.Attachment) model.Job {
 
 var ErrInvalidVerdict = errors.New("invalid verdict")
 
+// maxDetailBytes bounds the analyzer-supplied detail blob so a buggy or hostile
+// analyzer cannot bloat the database with one verdict.
+const maxDetailBytes = 64 << 10
+
 // ApplyVerdict records an analyzer result. Duplicate results for an already
 // decided attachment return store.ErrConflict.
 func (s *Service) ApplyVerdict(ctx context.Context, v model.Verdict) error {
@@ -182,18 +187,61 @@ func (s *Service) ApplyVerdict(ctx context.Context, v model.Verdict) error {
 	if !v.Status.Final() {
 		return fmt.Errorf("%w: status must be CLEAN, MALICIOUS or ERROR", ErrInvalidVerdict)
 	}
+	if len(v.Detail) > maxDetailBytes {
+		return fmt.Errorf("%w: detail exceeds %d bytes", ErrInvalidVerdict, maxDetailBytes)
+	}
 	if len(v.Detail) > 0 && !json.Valid(v.Detail) {
 		return fmt.Errorf("%w: detail is not valid JSON", ErrInvalidVerdict)
 	}
-	if len(v.ThreatName) > 256 {
-		v.ThreatName = v.ThreatName[:256]
-	}
+	v.ThreatName = sanitizeThreatName(v.ThreatName)
 	err := s.store.SetVerdict(ctx, v.AttachmentID, v.Status, v.ThreatName, v.Detail, s.now().UTC())
 	if err == nil {
 		metrics.Verdicts.WithLabelValues(strings.ToLower(string(v.Status))).Inc()
 		s.log.Info("verdict applied", "attachment", v.AttachmentID, "status", v.Status, "threat", v.ThreatName)
 	}
 	return err
+}
+
+// sanitizeThreatName strips control characters (the name is surfaced in the
+// download page and logs) and truncates to 256 bytes on a UTF-8 boundary so a
+// multi-byte rune is never cut in half.
+func sanitizeThreatName(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+	if len(s) > 256 {
+		s = s[:256]
+		for len(s) > 0 && !utf8.ValidString(s) {
+			s = s[:len(s)-1]
+		}
+	}
+	return s
+}
+
+// ResultHandler adapts ApplyVerdict for the queue consumer. It classifies
+// permanent failures — a malformed payload, an unknown attachment, or a
+// duplicate for an already-decided attachment — so the consumer dead-letters or
+// drops them instead of re-delivering, while transient (database/storage)
+// failures are returned for retry.
+func (s *Service) ResultHandler() queue.ResultHandler {
+	return func(ctx context.Context, v model.Verdict) error {
+		err := s.ApplyVerdict(ctx, v)
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, store.ErrConflict):
+			// Idempotent duplicate: the attachment already has a final verdict.
+			s.log.Info("verdict ignored (already decided)", "attachment", v.AttachmentID)
+			return nil
+		case errors.Is(err, ErrInvalidVerdict), errors.Is(err, store.ErrNotFound):
+			return queue.Permanent(err)
+		default:
+			return err // transient — let the consumer retry
+		}
+	}
 }
 
 // Janitor re-queues stalled analyses and removes expired attachments.

@@ -62,6 +62,10 @@ Authorization: Bearer <internal_api.token>
 
 `status` 는 `CLEAN` | `MALICIOUS` | `ERROR` 중 하나. `detail` 은 임의의 JSON(보고서, YARA 룰 목록 등)으로 DB에 그대로 저장됩니다.
 
+- `detail` 은 최대 **64 KiB**입니다. 초과 시 400(HTTP) 또는 dead-list(Redis)로 처리되므로, 대용량 보고서는 오브젝트 스토리지에 두고 링크만 넣으세요.
+- `threat_name` 은 최대 256바이트로 잘리고(잘림은 UTF-8 문자 경계에서), 제어문자는 제거됩니다(다운로드 페이지·로그에 노출되므로).
+- HTTP 본문은 1 MiB로 제한됩니다.
+
 **① HTTP**
 
 ```
@@ -80,7 +84,10 @@ Content-Type: application/json
 | 409 | 이미 최종 판정됨 (중복 회신 — 무시해도 됨) |
 
 **② Redis**: `LPUSH secmail:results '{"attachment_id":"...","status":"CLEAN","detail":{...}}'`
-(디코딩 불가 메시지는 `secmail:results:dead` 로 이동)
+
+- 디코딩 불가 메시지, 그리고 반영이 **영구 실패**한 판정(잘못된 payload·없는 첨부·중복)은 `secmail:results:dead` 로 이동합니다. 운영 중 이 리스트가 쌓이면 분석기 payload 오류를 점검하세요.
+- 반영이 **일시 실패**(DB·스토리지 순단)한 경우 게이트웨이가 지수 백오프로 몇 차례 재시도하며, 그래도 실패하면 판정을 버리고 stale-job 스윕이 작업을 재발행합니다(분석이 다시 수행됨). 즉 완료된 판정이 순간 장애로 유실되지 않습니다.
+- 중복 회신(이미 최종 판정)은 조용히 무시됩니다(멱등).
 
 ## 4. 상태 전이
 

@@ -2,11 +2,14 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/yiyuhki/p2/internal/mimeproc"
 	"github.com/yiyuhki/p2/internal/model"
@@ -132,5 +135,66 @@ func TestJanitorExpiry(t *testing.T) {
 	}
 	if _, err := obj.Get(ctx, a.StorageKey); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatal("object should be deleted")
+	}
+}
+
+func TestApplyVerdictDetailAndThreatNameHardening(t *testing.T) {
+	s, st, _, _, _ := newSvc(t)
+	ctx := context.Background()
+
+	// Oversized detail is rejected.
+	l := quarantine(t, s, "d1")
+	big := make([]byte, maxDetailBytes+1)
+	for i := range big {
+		big[i] = 'a'
+	}
+	detail, _ := json.Marshal(map[string]string{"x": string(big)})
+	if err := s.ApplyVerdict(ctx, model.Verdict{AttachmentID: l.AttachmentID, Status: model.StatusClean, Detail: detail}); !errors.Is(err, ErrInvalidVerdict) {
+		t.Fatalf("oversized detail must be rejected: %v", err)
+	}
+
+	// Control chars stripped, long UTF-8 name truncated on a rune boundary.
+	l2 := quarantine(t, s, "d2")
+	name := "Trojan\x00\n한글" + strings.Repeat("가", 300)
+	if err := s.ApplyVerdict(ctx, model.Verdict{AttachmentID: l2.AttachmentID, Status: model.StatusMalicious, ThreatName: name}); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := st.GetAttachment(ctx, l2.AttachmentID)
+	if strings.ContainsAny(a.ThreatName, "\x00\n") {
+		t.Fatalf("control chars not stripped: %q", a.ThreatName)
+	}
+	if len(a.ThreatName) > 256 {
+		t.Fatalf("threat name too long: %d bytes", len(a.ThreatName))
+	}
+	if !utf8.ValidString(a.ThreatName) {
+		t.Fatalf("threat name not valid UTF-8 after truncation: %q", a.ThreatName)
+	}
+}
+
+func TestResultHandlerClassification(t *testing.T) {
+	s, _, _, _, _ := newSvc(t)
+	ctx := context.Background()
+	h := s.ResultHandler()
+
+	// Duplicate (conflict) is treated as success (idempotent), not an error.
+	l := quarantine(t, s, "r1")
+	if err := h(ctx, model.Verdict{AttachmentID: l.AttachmentID, Status: model.StatusClean}); err != nil {
+		t.Fatalf("first verdict: %v", err)
+	}
+	if err := h(ctx, model.Verdict{AttachmentID: l.AttachmentID, Status: model.StatusMalicious}); err != nil {
+		t.Fatalf("duplicate verdict should be swallowed, got %v", err)
+	}
+
+	// Invalid payload -> permanent (dead-letter).
+	err := h(ctx, model.Verdict{AttachmentID: "not-a-uuid", Status: model.StatusClean})
+	var perm *queue.PermanentError
+	if !errors.As(err, &perm) {
+		t.Fatalf("invalid verdict should be permanent, got %v", err)
+	}
+
+	// Unknown attachment -> permanent.
+	err = h(ctx, model.Verdict{AttachmentID: "00000000-0000-0000-0000-0000000000ff", Status: model.StatusClean})
+	if !errors.As(err, &perm) {
+		t.Fatalf("unknown attachment should be permanent, got %v", err)
 	}
 }

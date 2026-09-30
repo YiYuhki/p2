@@ -315,7 +315,7 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		go func() {
 			defer wg.Done()
 			log.Info("verdict consumer started")
-			q.ConsumeResults(ctx, svc.ApplyVerdict)
+			q.ConsumeResults(ctx, svc.ResultHandler())
 		}()
 		go func() {
 			defer wg.Done()
