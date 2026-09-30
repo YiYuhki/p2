@@ -127,6 +127,7 @@ portal:
 - 리스너마다 동시 연결 수(`smtp.max_connections`, 기본 1024)와 수신 리스너의 IP별 동시 연결 수(`smtp.max_connections_per_ip`, 기본 50)를 제한합니다. 초과 연결은 `421`을 받고 즉시 종료됩니다.
 - 발신(outbound) 리스너는 IP별 제한을 적용하지 않습니다(허용된 내부 메일 서버가 다수 연결을 열 수 있으므로). 대신 `outbound.allowed_clients` IP 목록으로 접근을 통제합니다.
 - 과도하게 긴 SMTP 라인(`smtp.max_line_length`), 메시지 크기(`smtp.max_message_bytes`, SIZE로 광고), 읽기/쓰기 타임아웃(slow-loris 방지)을 적용합니다.
+- MIME 구조 자체도 제한합니다: 중첩 깊이 32단계, 전체 파트 수 10,000개를 넘으면 파싱을 거부하고 메일 전체를 통째로 격리합니다(작은 파트 수백만 개로 메모리를 소진시키는 증폭 공격 방어). 메일은 유실되지 않고 그대로 배달됩니다.
 - 부하가 큰 환경에서는 `smtp.max_connections`를 파일 디스크립터 한도(`ulimit -n`)와 함께 조정하세요.
 
 ## 7. 발신 메일 DLP 연동

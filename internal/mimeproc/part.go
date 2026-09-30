@@ -20,9 +20,20 @@ import (
 	"github.com/emersion/go-message/textproto"
 )
 
-const maxDepth = 32
+const (
+	maxDepth = 32
+	// maxParts caps the total number of MIME parts across the whole tree. A
+	// legitimate message has at most a few dozen; a much larger count is a
+	// crafted amplification attack (millions of tiny parts fit in a few MB, each
+	// forcing an allocation). Hitting the cap fails the parse, so the processor
+	// quarantines the whole message instead — mail is still delivered.
+	maxParts = 10000
+)
 
-var ErrTooDeep = errors.New("mimeproc: MIME nesting too deep")
+var (
+	ErrTooDeep      = errors.New("mimeproc: MIME nesting too deep")
+	ErrTooManyParts = errors.New("mimeproc: too many MIME parts")
+)
 
 // Part is one node of the MIME tree.
 type Part struct {
@@ -69,10 +80,11 @@ func Parse(raw []byte) (*Part, error) {
 	if err != nil {
 		return nil, err
 	}
-	return parseEntity(h, body, 0)
+	count := 1 // the root entity itself
+	return parseEntity(h, body, 0, &count)
 }
 
-func parseEntity(h textproto.Header, body []byte, depth int) (*Part, error) {
+func parseEntity(h textproto.Header, body []byte, depth int, count *int) (*Part, error) {
 	if depth > maxDepth {
 		return nil, ErrTooDeep
 	}
@@ -102,7 +114,10 @@ func parseEntity(h textproto.Header, body []byte, depth int) (*Part, error) {
 		if err != nil {
 			return nil, fmt.Errorf("mimeproc: multipart body: %w", err)
 		}
-		child, err := parseEntity(part.Header, pb, depth+1)
+		if *count++; *count > maxParts {
+			return nil, ErrTooManyParts
+		}
+		child, err := parseEntity(part.Header, pb, depth+1, count)
 		if err != nil {
 			return nil, err
 		}

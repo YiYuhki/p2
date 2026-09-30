@@ -2,6 +2,7 @@ package mimeproc
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -412,5 +413,29 @@ func TestDeepNestingRejected(t *testing.T) {
 	b.WriteString("Content-Type: text/plain\r\n\r\nx\r\n")
 	if _, err := Parse([]byte(b.String())); err == nil {
 		t.Fatal("expected error for deep nesting")
+	}
+}
+
+func TestParseRejectsTooManyParts(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n")
+	for i := 0; i < maxParts+5; i++ {
+		b.WriteString("--x\r\nContent-Type: text/plain\r\n\r\na\r\n")
+	}
+	b.WriteString("--x--\r\n")
+	if _, err := Parse([]byte(b.String())); !errors.Is(err, ErrTooManyParts) {
+		t.Fatalf("want ErrTooManyParts, got %v", err)
+	}
+}
+
+func TestParseAllowsNormalPartCount(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n")
+	for i := 0; i < 20; i++ {
+		b.WriteString("--x\r\nContent-Type: text/plain\r\n\r\na\r\n")
+	}
+	b.WriteString("--x--\r\n")
+	if _, err := Parse([]byte(b.String())); err != nil {
+		t.Fatalf("normal multipart rejected: %v", err)
 	}
 }
