@@ -167,6 +167,7 @@ func TestMemoryConformance(t *testing.T) {
 	m := NewMemory()
 	conformance(t, m)
 	holdConformance(t, m)
+	paginationConformance(t, m)
 }
 
 // TestPostgresConformance runs against a real database when
@@ -191,6 +192,7 @@ func TestPostgresConformance(t *testing.T) {
 	defer p.Close()
 	conformance(t, p)
 	holdConformance(t, p)
+	paginationConformance(t, p)
 
 	var n int
 	if err := p.pool.QueryRow(ctx, `SELECT count(*) FROM download_events WHERE username='u1@example.com'`).Scan(&n); err != nil || n == 0 {
@@ -198,83 +200,93 @@ func TestPostgresConformance(t *testing.T) {
 	}
 }
 
-func TestHoldAndEventPagination(t *testing.T) {
+func TestHoldAndEventPagination(t *testing.T) { paginationConformance(t, NewMemory()) }
+
+func paginationConformance(t *testing.T, s Store) {
 	ctx := context.Background()
-	s := NewMemory()
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	// 5 holds and 5 events at distinct, increasing times.
+	// Insert 5 holds and 5 events with a unique marker so the assertions are
+	// robust to rows a prior conformance step left in a shared store.
+	mine := map[string]bool{}
 	for i := 0; i < 5; i++ {
 		at := base.Add(time.Duration(i) * time.Minute)
-		h := &model.Hold{ID: uuid.NewString(), Status: model.HoldHeld, MailFrom: "a@ex.org",
-			RcptTo: []string{"x@ext.org"}, Findings: json.RawMessage(`{}`), CreatedAt: at, ExpiresAt: at.Add(time.Hour)}
-		if err := s.CreateHold(ctx, h); err != nil {
+		hid, eid := uuid.NewString(), uuid.NewString()
+		mine[hid], mine[eid] = true, true
+		if err := s.CreateHold(ctx, &model.Hold{ID: hid, TokenHash: "page-" + hid, Status: model.HoldHeld, MailFrom: "a@ex.org",
+			RcptTo: []string{"x@ext.org"}, Findings: json.RawMessage(`{}`), CreatedAt: at, ExpiresAt: at.Add(time.Hour)}); err != nil {
 			t.Fatal(err)
 		}
-		ev := &model.DLPEvent{ID: uuid.NewString(), MailFrom: "a@ex.org", Action: "notify",
-			Severity: "low", Findings: json.RawMessage(`{}`), At: at}
-		if err := s.RecordDLPEvent(ctx, ev); err != nil {
+		if err := s.RecordDLPEvent(ctx, &model.DLPEvent{ID: eid, MailFrom: "a@ex.org", RcptTo: []string{"x@ext.org"},
+			Action: "notify", Severity: "low", Findings: json.RawMessage(`{}`), At: at}); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	// Page holds 2 at a time; expect newest-first, no gaps or repeats.
-	var seen []string
-	page := Page{}
-	for {
-		hs, err := s.ListHolds(ctx, model.HoldHeld, 2, page)
+	// walk pages the full list and returns every id seen; it fails on any
+	// cross-page repeat or non-monotonic (time DESC) ordering.
+	walk := func(next func(Page) (ids []string, times []time.Time, more bool)) []string {
+		var all []string
+		var last time.Time
+		first := true
+		seen := map[string]bool{}
+		page := Page{}
+		for {
+			ids, times, ok := next(page)
+			for i, id := range ids {
+				if seen[id] {
+					t.Fatalf("id %s repeated across pages", id)
+				}
+				seen[id] = true
+				if !first && times[i].After(last) {
+					t.Fatal("pagination not monotonically newest-first")
+				}
+				first, last = false, times[i]
+				all = append(all, id)
+			}
+			if !ok {
+				return all
+			}
+			li := len(ids) - 1
+			page = Page{Before: times[li], BeforeID: ids[li]}
+		}
+	}
+
+	got := walk(func(p Page) ([]string, []time.Time, bool) {
+		hs, err := s.ListHolds(ctx, model.HoldHeld, 2, p)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(hs) == 0 {
-			break
+		ids, ts := make([]string, len(hs)), make([]time.Time, len(hs))
+		for i, h := range hs {
+			ids[i], ts[i] = h.ID, h.CreatedAt
 		}
-		for i := 1; i < len(hs); i++ {
-			if hs[i].CreatedAt.After(hs[i-1].CreatedAt) {
-				t.Fatal("not sorted newest-first")
-			}
-		}
-		for _, h := range hs {
-			seen = append(seen, h.ID)
-		}
-		if len(hs) < 2 {
-			break
-		}
-		last := hs[len(hs)-1]
-		page = Page{Before: last.CreatedAt, BeforeID: last.ID}
-	}
-	if len(seen) != 5 || !distinct(seen) {
-		t.Fatalf("paged holds = %v (want 5 distinct)", seen)
-	}
+		return ids, ts, len(hs) == 2
+	})
+	assertAllPresent(t, "holds", got, mine)
 
-	// Events: same walk.
-	seen = nil
-	page = Page{}
-	for {
-		evs, _ := s.ListDLPEvents(ctx, 2, page)
-		if len(evs) == 0 {
-			break
+	got = walk(func(p Page) ([]string, []time.Time, bool) {
+		evs, err := s.ListDLPEvents(ctx, 2, p)
+		if err != nil {
+			t.Fatal(err)
 		}
-		for _, e := range evs {
-			seen = append(seen, e.ID)
+		ids, ts := make([]string, len(evs)), make([]time.Time, len(evs))
+		for i, e := range evs {
+			ids[i], ts[i] = e.ID, e.At
 		}
-		if len(evs) < 2 {
-			break
-		}
-		last := evs[len(evs)-1]
-		page = Page{Before: last.At, BeforeID: last.ID}
-	}
-	if len(seen) != 5 || !distinct(seen) {
-		t.Fatalf("paged events = %v (want 5 distinct)", seen)
-	}
+		return ids, ts, len(evs) == 2
+	})
+	assertAllPresent(t, "events", got, mine)
 }
 
-func distinct(ids []string) bool {
-	m := map[string]bool{}
-	for _, id := range ids {
-		if m[id] {
-			return false
+func assertAllPresent(t *testing.T, what string, got []string, mine map[string]bool) {
+	t.Helper()
+	n := 0
+	for _, id := range got {
+		if mine[id] {
+			n++
 		}
-		m[id] = true
 	}
-	return true
+	if n != 5 {
+		t.Fatalf("%s: paged %d of my 5 marked rows", what, n)
+	}
 }
