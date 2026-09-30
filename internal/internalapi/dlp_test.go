@@ -61,3 +61,36 @@ func TestDLPAdminAPI(t *testing.T) {
 		t.Fatalf("bad id: %d", code)
 	}
 }
+
+func TestMetricsAndReadyz(t *testing.T) {
+	st := store.NewMemory()
+	obj, _ := storage.NewFS(t.TempDir())
+	api := New(st, obj, nil, secret, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := httptest.NewServer(api.Handler())
+	defer srv.Close()
+
+	// /metrics and /readyz are unauthenticated (probed by orchestrators).
+	code, body := do(t, "GET", srv.URL+"/metrics", "", "")
+	if code != 200 || !strings.Contains(body, "secmail_dlp_scan_seconds") {
+		t.Fatalf("metrics: %d, body has secmail_=%v", code, strings.Contains(body, "secmail_"))
+	}
+	code, body = do(t, "GET", srv.URL+"/readyz", "", "")
+	if code != 200 || !strings.Contains(body, `"database":"ok"`) || !strings.Contains(body, `"storage":"ok"`) {
+		t.Fatalf("readyz healthy: %d %s", code, body)
+	}
+}
+
+func TestReadyzReportsFailure(t *testing.T) {
+	obj, _ := storage.NewFS(t.TempDir())
+	api := New(failingStore{store.NewMemory()}, obj, nil, secret, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := httptest.NewServer(api.Handler())
+	defer srv.Close()
+	code, body := do(t, "GET", srv.URL+"/readyz", "", "")
+	if code != 503 || !strings.Contains(body, `"database":"fail"`) {
+		t.Fatalf("readyz should report db failure: %d %s", code, body)
+	}
+}
+
+type failingStore struct{ store.Store }
+
+func (failingStore) Ping(context.Context) error { return context.DeadlineExceeded }

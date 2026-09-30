@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"github.com/yiyuhki/p2/internal/metrics"
 	"image"
 	"image/color"
 	_ "image/gif" // register decoders
@@ -190,6 +191,7 @@ func (t *Tesseract) Recognize(ctx context.Context, img []byte) (string, error) {
 	}
 	// One thread per process (OMP_THREAD_LIMIT set by sandboxCmd): we
 	// parallelise across images instead.
+	defer metrics.Time("ocr")()
 	cmd := sandboxCmd(ctx, DefaultProcLimits, nil, cmdName, "stdin", "stdout", "-l", lang, "--psm", fmt.Sprint(psm))
 	cmd.Stdin = bytes.NewReader(pngData)
 	var stdout, stderr bytes.Buffer

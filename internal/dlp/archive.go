@@ -6,6 +6,7 @@ import (
 	"compress/bzip2"
 	"compress/gzip"
 	"context"
+	"github.com/yiyuhki/p2/internal/metrics"
 	"io"
 	"os"
 	"os/exec"
@@ -187,6 +188,7 @@ func (x *extractor) sevenZip(loc, name string, data []byte, depth int) {
 	}
 	out := filepath.Join(dir, "out")
 	// -p (empty password), stdin from /dev/null: never wait for a prompt.
+	defer metrics.Time("archive")()
 	cmd := sandboxCmd(ctx, DefaultProcLimits, nil, at.SevenZip, "x", "-p", "-y", "-bd", "-snl-", "-o"+out, in)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, io.Discard, io.Discard
 	if err := cmd.Run(); err != nil && ctx.Err() != nil {

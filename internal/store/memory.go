@@ -183,3 +183,5 @@ func (s *Memory) MarkExpired(_ context.Context, id string, at time.Time) error {
 }
 
 func (s *Memory) Close() {}
+
+func (s *Memory) Ping(context.Context) error { return nil }

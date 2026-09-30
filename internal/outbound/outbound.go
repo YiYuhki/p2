@@ -19,6 +19,7 @@ import (
 	"github.com/yiyuhki/p2/internal/config"
 	"github.com/yiyuhki/p2/internal/dlp"
 	"github.com/yiyuhki/p2/internal/gateway"
+	"github.com/yiyuhki/p2/internal/metrics"
 	"github.com/yiyuhki/p2/internal/mimeproc"
 	"github.com/yiyuhki/p2/internal/model"
 	"github.com/yiyuhki/p2/internal/notify"
@@ -165,9 +166,15 @@ func (s *Service) Process(ctx context.Context, env gateway.Envelope, raw []byte)
 			return raw, nil
 		}
 	}
+	scanStart := s.now()
 	rep := s.scanner.ScanMessage(ctx, raw)
+	metrics.DLPScanSeconds.Observe(s.now().Sub(scanStart).Seconds())
 	if len(rep.Findings) == 0 && len(rep.Uninspectable) == 0 && !rep.HasEncrypted() {
+		metrics.OutboundMessages.WithLabelValues("allow").Inc()
 		return raw, nil
+	}
+	for _, f := range rep.Findings {
+		metrics.DLPFindings.WithLabelValues(f.Sev().String()).Add(float64(f.Count))
 	}
 	action := s.Decide(rep)
 	exempt := len(s.opts.ExemptRecipientDomains) > 0
@@ -176,6 +183,9 @@ func (s *Service) Process(ctx context.Context, env gateway.Envelope, raw []byte)
 	}
 	if exempt {
 		action = config.ActionAllow
+		metrics.OutboundMessages.WithLabelValues("exempt").Inc()
+	} else {
+		metrics.OutboundMessages.WithLabelValues(action).Inc()
 	}
 
 	subject := subjectOf(raw)
@@ -240,6 +250,7 @@ func (s *Service) createHold(ctx context.Context, env gateway.Envelope, subject 
 		s.storage.Delete(context.WithoutCancel(ctx), h.StorageKey)
 		return nil, "", err
 	}
+	metrics.Holds.WithLabelValues("created").Inc()
 	return h, s.opts.PublicBaseURL + "/dlp/" + tok, nil
 }
 
@@ -273,6 +284,7 @@ func (s *Service) Release(ctx context.Context, id, by string) error {
 		return fmt.Errorf("relay held message: %w", err)
 	}
 	s.storage.Delete(ctx, h.StorageKey) // keep only masked findings after delivery
+	metrics.Holds.WithLabelValues("released").Inc()
 	s.log.Info("hold released", "hold", id, "by", by)
 	go s.sendDecisionNotice(context.WithoutCancel(ctx), h, model.HoldReleased, by, "")
 	return nil
@@ -295,6 +307,7 @@ func (s *Service) finish(ctx context.Context, id string, st model.HoldStatus, by
 		return err
 	}
 	s.storage.Delete(ctx, h.StorageKey)
+	metrics.Holds.WithLabelValues(strings.ToLower(string(st))).Inc()
 	s.log.Info("hold closed", "hold", id, "status", st, "by", by)
 	go s.sendDecisionNotice(context.WithoutCancel(ctx), h, st, by, reason)
 	return nil

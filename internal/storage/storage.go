@@ -26,6 +26,8 @@ type Storage interface {
 	// the object directly instead of going through the internal API.
 	Type() string
 	Bucket() string
+	// Ping is a cheap readiness check.
+	Ping(ctx context.Context) error
 }
 
 func New(ctx context.Context, cfg config.StorageConfig) (Storage, error) {
@@ -104,6 +106,11 @@ func (f *FS) Delete(_ context.Context, key string) error {
 	return nil
 }
 
+func (f *FS) Ping(context.Context) error {
+	_, err := os.Stat(f.dir)
+	return err
+}
+
 func (f *FS) Type() string   { return "fs" }
 func (f *FS) Bucket() string { return "" }
 
@@ -162,6 +169,11 @@ func (s *S3) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 
 func (s *S3) Delete(ctx context.Context, key string) error {
 	return s.client.RemoveObject(ctx, s.bucket, key, minio.RemoveObjectOptions{})
+}
+
+func (s *S3) Ping(ctx context.Context) error {
+	_, err := s.client.BucketExists(ctx, s.bucket)
+	return err
 }
 
 func (s *S3) Type() string   { return "s3" }

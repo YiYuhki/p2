@@ -20,6 +20,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/yiyuhki/p2/internal/metrics"
 	"github.com/yiyuhki/p2/internal/model"
 	"github.com/yiyuhki/p2/internal/service"
 	"github.com/yiyuhki/p2/internal/storage"
@@ -51,8 +52,29 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /internal/v1/attachments/{id}/content", a.auth(a.content))
 	mux.HandleFunc("POST /internal/v1/attachments/{id}/verdict", a.auth(a.verdict))
 	a.mountDLP(mux)
+	mux.Handle("GET /metrics", metrics.Handler())
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
+	mux.HandleFunc("GET /readyz", a.ready)
 	return mux
+}
+
+// ready checks the critical dependencies (database, object storage). It is
+// unauthenticated so orchestrators can probe it, but reveals only pass/fail
+// per dependency.
+func (a *API) ready(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	checks := map[string]string{"database": "ok", "storage": "ok"}
+	code := http.StatusOK
+	if err := a.store.Ping(ctx); err != nil {
+		checks["database"] = "fail"
+		code = http.StatusServiceUnavailable
+	}
+	if err := a.storage.Ping(ctx); err != nil {
+		checks["storage"] = "fail"
+		code = http.StatusServiceUnavailable
+	}
+	writeJSON(w, code, checks)
 }
 
 func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {

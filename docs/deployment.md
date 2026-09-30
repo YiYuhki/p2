@@ -163,3 +163,28 @@ secmail의 `next_hop`에는 인터넷으로 배달하는 릴레이 MTA를 지정
 - [ ] 주민번호가 든 xlsx 첨부 → 보류, 보안담당자 메일에 검토 링크
 - [ ] 검토 화면 승인 → 수신자 도착, 반려 → 발신자에게 사유 안내
 - [ ] `dlp_events` 테이블 기록 확인
+
+## 8. 관측(Observability)과 헬스체크
+
+Internal API 리스너(`internal_api.listen`, 기본 8081)에서 다음을 인증 없이 제공합니다. 이 포트는 반드시 내부망 전용으로 두세요.
+
+| 경로 | 용도 |
+|---|---|
+| `/metrics` | Prometheus 텍스트 형식 메트릭 |
+| `/healthz` | liveness (프로세스 생존) |
+| `/readyz` | readiness — DB·오브젝트 스토리지 ping, 실패 시 503 |
+
+주요 메트릭:
+
+| 메트릭 | 설명 |
+|---|---|
+| `secmail_inbound_messages_total{result}` | 수신 릴레이 건수 |
+| `secmail_attachments_total{status}` | 격리 첨부(pending/reused-*) |
+| `secmail_verdicts_total{status}` | 분석 판정 반영(clean/malicious/error) |
+| `secmail_outbound_messages_total{action}` | 발신 DLP 동작(allow/notify/hold/block/exempt) |
+| `secmail_dlp_findings_total{severity}` | DLP 탐지 건수(high/medium/low) |
+| `secmail_dlp_scan_seconds` | 발신 메일 검사 소요시간 히스토그램 |
+| `secmail_external_tool_seconds{tool}` | OCR/변환/압축해제 소요시간(ocr/pdf/heif/archive) |
+| `secmail_holds_total{event}` | 보류 생성/승인/반려/만료 |
+
+Kubernetes 예: livenessProbe → `/healthz`, readinessProbe → `/readyz`. Prometheus scrape 대상은 `<secmail>:8081/metrics`.

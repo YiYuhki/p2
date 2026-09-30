@@ -60,6 +60,8 @@ internal_api:                    # used by the external analysis engine only
   listen: "0.0.0.0:8081"
   token: ${SECMAIL_INTERNAL_TOKEN}
   advertise_url: http://secmail-internal.example.com:8081
+  # /metrics (Prometheus), /healthz (liveness), /readyz (DB+storage readiness)
+  # are served on this internal listener with no auth — keep it internal-only.
   admin_token: ${SECMAIL_ADMIN_TOKEN}   # DLP admin endpoints (/internal/v1/dlp/*); must differ from token
 
 storage:

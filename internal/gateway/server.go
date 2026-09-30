@@ -21,6 +21,7 @@ import (
 
 	"github.com/emersion/go-smtp"
 
+	"github.com/yiyuhki/p2/internal/metrics"
 	"github.com/yiyuhki/p2/internal/smtpclient"
 )
 
@@ -236,6 +237,9 @@ func (s *session) Data(r io.Reader) error {
 	}
 	if err := w.Close(); err != nil {
 		return s.upstreamErr(err)
+	}
+	if s.b.opts.Name == "inbound" {
+		metrics.InboundMessages.WithLabelValues("relayed").Inc()
 	}
 	s.b.log.Info("relayed", "from", s.from, "rcpt", s.rcpt, "in_bytes", len(raw), "out_bytes", len(out))
 	s.resetState()

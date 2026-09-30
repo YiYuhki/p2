@@ -20,6 +20,7 @@ var (
 type Store interface {
 	// CreateMessage atomically inserts a message and its attachments.
 	CreateMessage(ctx context.Context, m *model.Message, atts []*model.Attachment) error
+	Ping(ctx context.Context) error
 	GetMessage(ctx context.Context, id string) (*model.Message, error)
 	GetAttachment(ctx context.Context, id string) (*model.Attachment, error)
 	GetAttachmentByTokenHash(ctx context.Context, tokenHash string) (*model.Attachment, error)

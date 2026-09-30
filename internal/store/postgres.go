@@ -96,6 +96,8 @@ func (p *Postgres) migrate(ctx context.Context) error {
 
 func (p *Postgres) Close() { p.pool.Close() }
 
+func (p *Postgres) Ping(ctx context.Context) error { return p.pool.Ping(ctx) }
+
 func (p *Postgres) CreateMessage(ctx context.Context, m *model.Message, atts []*model.Attachment) error {
 	return pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `INSERT INTO mail_messages

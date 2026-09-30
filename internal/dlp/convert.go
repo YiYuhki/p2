@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/yiyuhki/p2/internal/metrics"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -74,6 +75,7 @@ func (c *Converter) acquire(ctx context.Context) (func(), error) {
 }
 
 func run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	defer metrics.Time(toolLabel(name))()
 	cmd := sandboxCmd(ctx, DefaultProcLimits, nil, name, args...)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
@@ -196,3 +198,13 @@ func (c *Converter) maxPages() int {
 }
 
 var errNoConverter = fmt.Errorf("converter not installed")
+
+func toolLabel(cmd string) string {
+	switch {
+	case strings.Contains(cmd, "heif"):
+		return "heif"
+	case strings.Contains(cmd, "pdftoppm"), strings.Contains(cmd, "pdftotext"):
+		return "pdf"
+	}
+	return "convert"
+}

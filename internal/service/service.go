@@ -11,10 +11,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/yiyuhki/p2/internal/metrics"
 	"github.com/yiyuhki/p2/internal/mimeproc"
 	"github.com/yiyuhki/p2/internal/model"
 	"github.com/yiyuhki/p2/internal/queue"
@@ -129,9 +131,11 @@ func (s *Service) Quarantine(ctx context.Context, msg *model.Message, extracted 
 
 	for _, a := range atts {
 		if a.Status != model.StatusPending {
+			metrics.Attachments.WithLabelValues("reused-" + strings.ToLower(string(a.Status))).Inc()
 			s.log.Info("verdict reused", "attachment", a.ID, "sha256", a.SHA256, "status", a.Status)
 			continue
 		}
+		metrics.Attachments.WithLabelValues("pending").Inc()
 		if err := s.queue.Enqueue(ctx, s.job(a), queue.PriorityHigh); err != nil {
 			s.log.Error("enqueue failed; janitor will retry", "attachment", a.ID, "err", err)
 		}
@@ -186,6 +190,7 @@ func (s *Service) ApplyVerdict(ctx context.Context, v model.Verdict) error {
 	}
 	err := s.store.SetVerdict(ctx, v.AttachmentID, v.Status, v.ThreatName, v.Detail, s.now().UTC())
 	if err == nil {
+		metrics.Verdicts.WithLabelValues(strings.ToLower(string(v.Status))).Inc()
 		s.log.Info("verdict applied", "attachment", v.AttachmentID, "status", v.Status, "threat", v.ThreatName)
 	}
 	return err
