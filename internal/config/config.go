@@ -20,6 +20,7 @@ type Config struct {
 	Upstream    UpstreamConfig    `yaml:"upstream"`
 	Rewrite     RewriteConfig     `yaml:"rewrite"`
 	DKIM        DKIMConfig        `yaml:"dkim"`
+	SPF         SPFConfig         `yaml:"spf"`
 	Portal      PortalConfig      `yaml:"portal"`
 	InternalAPI InternalAPIConfig `yaml:"internal_api"`
 	Storage     StorageConfig     `yaml:"storage"`
@@ -177,6 +178,13 @@ type RewriteConfig struct {
 	GatewayID string `yaml:"gateway_id"`
 }
 
+// SPFConfig controls inbound SPF verification. The result is added to
+// Authentication-Results alongside DKIM so downstream DMARC has both inputs.
+type SPFConfig struct {
+	VerifyInbound bool          `yaml:"verify_inbound"`
+	Timeout       time.Duration `yaml:"timeout"` // per-message DNS budget (default 10s)
+}
+
 type DKIMConfig struct {
 	VerifyInbound  bool   `yaml:"verify_inbound"`
 	StripOriginal  bool   `yaml:"strip_original"`
@@ -315,6 +323,7 @@ func Default() Config {
 			GatewayID:        "secmail",
 		},
 		DKIM: DKIMConfig{StripOriginal: true},
+		SPF:  SPFConfig{Timeout: 10 * time.Second},
 		Portal: PortalConfig{
 			Listen:         ":8080",
 			PublicBaseURL:  "http://localhost:8080",

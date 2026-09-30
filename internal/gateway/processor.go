@@ -17,6 +17,7 @@ import (
 	"github.com/yiyuhki/p2/internal/mimeproc"
 	"github.com/yiyuhki/p2/internal/model"
 	"github.com/yiyuhki/p2/internal/service"
+	"github.com/yiyuhki/p2/internal/spfutil"
 )
 
 // Quarantiner is implemented by service.Service.
@@ -31,10 +32,13 @@ type ProcessorOptions struct {
 	LinkTTL       time.Duration
 	Location      *time.Location
 	VerifyDKIM    bool
+	VerifySPF     bool
 	StripOrigDKIM bool
 	Signer        *dkimutil.Signer // nil disables re-signing
 	// LookupTXT overrides DNS for DKIM verification (tests).
 	LookupTXT func(string) ([]string, error)
+	// SPF is the SPF checker; nil disables SPF even when VerifySPF is set.
+	SPF *spfutil.Checker
 }
 
 // Processor turns an inbound message into the message relayed upstream.
@@ -75,10 +79,7 @@ func (p *Processor) Process(ctx context.Context, env Envelope, raw []byte) ([]by
 	queueID := newQueueID()
 	log := p.log.With("queue_id", queueID, "from", env.MailFrom, "rcpt", env.RcptTo)
 
-	authResults := ""
-	if p.opts.VerifyDKIM {
-		authResults = dkimutil.Verify(raw, p.opts.LookupTXT)
-	}
+	authResults := p.authenticate(ctx, env, raw)
 
 	root, err := mimeproc.Parse(raw)
 	if err != nil {
@@ -171,6 +172,20 @@ func (p *Processor) finish(ctx context.Context, log *slog.Logger, env Envelope, 
 		out = signed
 	}
 	return out, nil
+}
+
+// authenticate runs the enabled inbound checks against the original message and
+// returns their combined RFC 8601 method list (e.g. "spf=pass smtp.mailfrom=…;
+// dkim=pass header.d=…"), or "" when nothing is enabled.
+func (p *Processor) authenticate(ctx context.Context, env Envelope, raw []byte) string {
+	var methods []string
+	if p.opts.VerifySPF && p.opts.SPF != nil {
+		methods = append(methods, p.opts.SPF.Check(ctx, env.RemoteAddr, env.Helo, env.MailFrom))
+	}
+	if p.opts.VerifyDKIM {
+		methods = append(methods, dkimutil.Verify(raw, p.opts.LookupTXT))
+	}
+	return strings.Join(methods, "; ")
 }
 
 func (p *Processor) received(env Envelope, queueID string) string {

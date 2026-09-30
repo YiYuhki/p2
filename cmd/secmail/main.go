@@ -43,6 +43,7 @@ import (
 	"github.com/yiyuhki/p2/internal/queue"
 	"github.com/yiyuhki/p2/internal/service"
 	"github.com/yiyuhki/p2/internal/smtpclient"
+	"github.com/yiyuhki/p2/internal/spfutil"
 	"github.com/yiyuhki/p2/internal/storage"
 	"github.com/yiyuhki/p2/internal/store"
 )
@@ -266,6 +267,10 @@ func run(cfgPath, components string, log *slog.Logger) error {
 				return err
 			}
 		}
+		var spfChecker *spfutil.Checker
+		if cfg.SPF.VerifyInbound {
+			spfChecker = spfutil.New(nil, cfg.SPF.Timeout) // nil = system resolver
+		}
 		proc := gateway.NewProcessor(svc, gateway.ProcessorOptions{
 			Hostname:  cfg.SMTP.Hostname,
 			GatewayID: cfg.Rewrite.GatewayID,
@@ -277,8 +282,10 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			LinkTTL:       cfg.Portal.LinkTTL,
 			Location:      loc,
 			VerifyDKIM:    cfg.DKIM.VerifyInbound,
+			VerifySPF:     cfg.SPF.VerifyInbound,
 			StripOrigDKIM: cfg.DKIM.StripOriginal,
 			Signer:        signer,
+			SPF:           spfChecker,
 		}, log)
 		be := gateway.NewBackend(proc, gateway.BackendOptions{
 			RecipientDomains: cfg.SMTP.AcceptedDomains,

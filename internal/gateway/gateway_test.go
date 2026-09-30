@@ -24,6 +24,7 @@ import (
 	"github.com/yiyuhki/p2/internal/model"
 	"github.com/yiyuhki/p2/internal/queue"
 	"github.com/yiyuhki/p2/internal/service"
+	"github.com/yiyuhki/p2/internal/spfutil"
 	"github.com/yiyuhki/p2/internal/storage"
 	"github.com/yiyuhki/p2/internal/store"
 )
@@ -357,5 +358,44 @@ func TestAuthResultsID(t *testing.T) {
 		if got := authResultsID(in); got != want {
 			t.Errorf("authResultsID(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// spfResolver implements spfutil.Resolver for the processor SPF test.
+type spfResolver struct{ txt map[string][]string }
+
+func (r spfResolver) LookupTXT(_ context.Context, name string) ([]string, error) {
+	if v, ok := r.txt[strings.TrimSuffix(name, ".")]; ok {
+		return v, nil
+	}
+	return nil, &net.DNSError{Err: "nx", Name: name, IsNotFound: true}
+}
+func (spfResolver) LookupMX(context.Context, string) ([]*net.MX, error)        { return nil, nil }
+func (spfResolver) LookupIPAddr(context.Context, string) ([]net.IPAddr, error) { return nil, nil }
+func (spfResolver) LookupAddr(context.Context, string) ([]string, error)       { return nil, nil }
+
+func TestSPFResultInAuthResults(t *testing.T) {
+	res := spfResolver{txt: map[string][]string{"ext.org": {"v=spf1 ip4:203.0.113.0/24 -all"}}}
+	proc := NewProcessor(stubQ{}, ProcessorOptions{
+		Hostname: "gw.example.com", GatewayID: "test-gw", LinkTTL: time.Hour,
+		VerifyDKIM: true, VerifySPF: true,
+		LookupTXT: func(string) ([]string, error) { return nil, errors.New("no key") },
+		SPF:       spfutil.New(res, 0),
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	raw := "From: sender@ext.org\r\nTo: user@example.com\r\nSubject: hi\r\n\r\nbody\r\n"
+	out, err := proc.Process(context.Background(), Envelope{
+		MailFrom: "sender@ext.org", RcptTo: []string{"user@example.com"}, RemoteAddr: "203.0.113.9:2500", Helo: "mail.ext.org",
+	}, []byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, _ := mimeproc.Parse(out)
+	ar := parsed.Header.Get("Authentication-Results")
+	if !strings.Contains(ar, "spf=pass smtp.mailfrom=ext.org") {
+		t.Fatalf("SPF result missing: %q", ar)
+	}
+	if !strings.Contains(ar, "dkim=") {
+		t.Fatalf("DKIM result missing: %q", ar)
 	}
 }

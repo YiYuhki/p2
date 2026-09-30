@@ -40,6 +40,12 @@ dkim:
   selector: secmail
   private_key_file: /etc/secmail/dkim.key   # generate with: secmail dkim-keygen
 
+spf:
+  verify_inbound: true           # check the sending IP against the MAIL FROM domain's SPF record
+  timeout: 10s                   # per-message DNS budget (SPF may do several lookups)
+  # Result is added to Authentication-Results next to dkim= (e.g. "spf=pass smtp.mailfrom=..."),
+  # giving the internal server both inputs for DMARC. Requires outbound DNS from the gateway.
+
 portal:
   listen: ":8080"
   public_base_url: https://sec-mail.example.com   # used in the links inserted into mail
