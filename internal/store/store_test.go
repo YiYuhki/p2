@@ -99,6 +99,61 @@ func conformance(t *testing.T, s Store) {
 	}
 }
 
+func holdConformance(t *testing.T, s Store) {
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	mk := func(exp time.Time) *model.Hold {
+		return &model.Hold{ID: uuid.NewString(), TokenHash: uuid.NewString() + uuid.NewString()[:28],
+			MailFrom: "a@example.com", RcptTo: []string{"x@ext.org"}, Subject: "s", StorageKey: "holds/k",
+			Size: 10, Findings: json.RawMessage(`{"findings":[]}`), Status: model.HoldHeld,
+			CreatedAt: now, ExpiresAt: exp}
+	}
+	h1, h2 := mk(now.Add(time.Hour)), mk(now.Add(-time.Minute))
+	for _, h := range []*model.Hold{h1, h2} {
+		if err := s.CreateHold(ctx, h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	g, err := s.GetHoldByTokenHash(ctx, h1.TokenHash)
+	if err != nil || g.ID != h1.ID || g.RcptTo[0] != "x@ext.org" || g.Status != model.HoldHeld {
+		t.Fatalf("hold by token: %+v %v", g, err)
+	}
+	held, _ := s.ListHolds(ctx, model.HoldHeld, 100)
+	if len(held) < 2 {
+		t.Fatalf("list held: %d", len(held))
+	}
+	exp, _ := s.ListExpiredHolds(ctx, now, 100)
+	found := false
+	for _, h := range exp {
+		found = found || h.ID == h2.ID
+		if h.ID == h1.ID {
+			t.Fatal("unexpired hold listed")
+		}
+	}
+	if !found {
+		t.Fatal("expired hold not listed")
+	}
+	if err := s.DecideHold(ctx, h1.ID, model.HoldReleased, "sec@example.com", "ok", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DecideHold(ctx, h1.ID, model.HoldRejected, "x", "", now); !errors.Is(err, ErrConflict) {
+		t.Fatalf("double decision: %v", err)
+	}
+	g, _ = s.GetHold(ctx, h1.ID)
+	if g.Status != model.HoldReleased || g.DecidedBy != "sec@example.com" || g.DecidedAt == nil {
+		t.Fatalf("decided: %+v", g)
+	}
+	ev := &model.DLPEvent{ID: uuid.NewString(), MailFrom: "a@example.com", RcptTo: []string{"x@ext.org"},
+		Action: "hold", Severity: "high", Findings: json.RawMessage(`{}`), HoldID: h1.ID, At: now}
+	if err := s.RecordDLPEvent(ctx, ev); err != nil {
+		t.Fatal(err)
+	}
+	evs, err := s.ListDLPEvents(ctx, 10)
+	if err != nil || len(evs) == 0 || evs[0].ID != ev.ID || evs[0].HoldID != h1.ID {
+		t.Fatalf("events: %+v %v", evs, err)
+	}
+}
+
 func containsID(list []*model.Attachment, id string) bool {
 	for _, a := range list {
 		if a.ID == id {
@@ -108,7 +163,11 @@ func containsID(list []*model.Attachment, id string) bool {
 	return false
 }
 
-func TestMemoryConformance(t *testing.T) { conformance(t, NewMemory()) }
+func TestMemoryConformance(t *testing.T) {
+	m := NewMemory()
+	conformance(t, m)
+	holdConformance(t, m)
+}
 
 // TestPostgresConformance runs against a real database when
 // SECMAIL_TEST_PG_DSN is set, e.g.
@@ -131,6 +190,7 @@ func TestPostgresConformance(t *testing.T) {
 	}
 	defer p.Close()
 	conformance(t, p)
+	holdConformance(t, p)
 
 	var n int
 	if err := p.pool.QueryRow(ctx, `SELECT count(*) FROM download_events WHERE username='u1@example.com'`).Scan(&n); err != nil || n == 0 {

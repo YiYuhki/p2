@@ -146,14 +146,32 @@ func (s *Server) eligible(ctx context.Context, user string, a *model.Attachment)
 	return false, nil
 }
 
+// guard describes a protected resource: its URL base and who may see it.
+type guard struct {
+	base     string // "/d/<token>" or "/dlp/<token>"
+	eligible func(ctx context.Context, user string) (bool, error)
+	logID    string
+}
+
+func (s *Server) attachmentGuard(r *http.Request, a *model.Attachment) guard {
+	return guard{
+		base:     "/d/" + r.PathValue("token"),
+		eligible: func(ctx context.Context, u string) (bool, error) { return s.eligible(ctx, u, a) },
+		logID:    a.ID,
+	}
+}
+
 // authorize enforces recipient authentication for a resolved attachment and
 // writes the challenge / denial response itself when access is not granted.
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request, a *model.Attachment, asJSON bool) (string, bool) {
+	return s.authorizeGuard(w, r, s.attachmentGuard(r, a), asJSON)
+}
+
+func (s *Server) authorizeGuard(w http.ResponseWriter, r *http.Request, g guard, asJSON bool) (string, bool) {
 	if s.opts.Auth.Mode == config.AuthNone || s.opts.Auth.Mode == "" {
 		return "", true
 	}
 	user := s.currentUser(r)
-	tok := r.PathValue("token")
 	if user == "" {
 		if asJSON {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
@@ -162,22 +180,22 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request, a *model.Atta
 		if s.opts.Auth.Mode == config.AuthHeader {
 			s.render(w, http.StatusUnauthorized, pageData{State: "AUTHREQ"})
 		} else {
-			s.render(w, http.StatusOK, pageData{State: "LOGIN", Token: tok})
+			s.render(w, http.StatusOK, pageData{State: "LOGIN", Base: g.base})
 		}
 		return "", false
 	}
-	ok, err := s.eligible(r.Context(), user, a)
+	ok, err := g.eligible(r.Context(), user)
 	if err != nil {
-		s.log.Error("portal: recipient check", "err", err)
+		s.log.Error("portal: access check", "err", err)
 		s.fail(w, r, http.StatusInternalServerError, asJSON, "일시적인 오류가 발생했습니다.")
 		return "", false
 	}
 	if !ok {
-		s.log.Warn("portal: access denied for non-recipient", "user", user, "attachment", a.ID)
+		s.log.Warn("portal: access denied", "user", user, "resource", g.logID)
 		if asJSON {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
 		} else {
-			s.render(w, http.StatusForbidden, pageData{State: "FORBIDDEN", Token: tok, User: user,
+			s.render(w, http.StatusForbidden, pageData{State: "FORBIDDEN", Base: g.base, User: user,
 				CanLogout: s.opts.Auth.Mode == config.AuthOTP})
 		}
 		return "", false
@@ -185,8 +203,7 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request, a *model.Atta
 	return user, true
 }
 
-// authPost handles both steps of the OTP login:
-// email only -> send code; email + code -> verify and start a session.
+// authPost handles the OTP login for attachment links.
 func (s *Server) authPost(w http.ResponseWriter, r *http.Request) {
 	if s.opts.Auth.Mode != config.AuthOTP {
 		http.NotFound(w, r)
@@ -196,27 +213,31 @@ func (s *Server) authPost(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	tok := r.PathValue("token")
+	s.otpLogin(w, r, s.attachmentGuard(r, a))
+}
+
+// otpLogin handles both steps of the OTP login:
+// email only -> send code; email + code -> verify and start a session.
+func (s *Server) otpLogin(w http.ResponseWriter, r *http.Request, g guard) {
 	email := NormalizeEmail(r.PostFormValue("email"))
 	code := strings.TrimSpace(r.PostFormValue("code"))
-	page := pageData{State: "CODE", Token: tok, Email: email}
+	page := pageData{State: "CODE", Base: g.base, Email: email}
 
 	if !validEmail(email) {
-		s.render(w, http.StatusOK, pageData{State: "LOGIN", Token: tok,
-			Error: "올바른 이메일 주소를 입력하세요."})
+		s.render(w, http.StatusOK, pageData{State: "LOGIN", Base: g.base, Error: "올바른 이메일 주소를 입력하세요."})
 		return
 	}
-	eligible, err := s.eligible(r.Context(), email, a)
+	eligible, err := g.eligible(r.Context(), email)
 	if err != nil {
-		s.log.Error("portal: recipient check", "err", err)
+		s.log.Error("portal: access check", "err", err)
 		s.fail(w, r, http.StatusInternalServerError, false, "일시적인 오류가 발생했습니다.")
 		return
 	}
 
 	if code == "" {
-		// Same answer whether or not the address is a recipient, so the
-		// page does not reveal who received the mail.
-		page.Notice = fmt.Sprintf("입력한 주소가 이 메일의 수신자라면 인증 코드가 발송되었습니다. (유효시간 %d분)",
+		// Same answer whether or not the address is eligible, so the page
+		// does not reveal who received the mail.
+		page.Notice = fmt.Sprintf("입력한 주소가 이 메일의 수신자(또는 담당자)라면 인증 코드가 발송되었습니다. (유효시간 %d분)",
 			int(s.opts.Auth.OTPTTL.Minutes()))
 		if eligible {
 			c := newCode()
@@ -230,11 +251,11 @@ func (s *Server) authPost(w http.ResponseWriter, r *http.Request) {
 				if err := s.mailer.SendCode(r.Context(), email, c, s.opts.Auth.OTPTTL); err != nil {
 					s.log.Error("portal: send otp mail", "err", err)
 				} else {
-					s.log.Info("portal: otp sent", "user", email, "attachment", a.ID)
+					s.log.Info("portal: otp sent", "user", email, "resource", g.logID)
 				}
 			}
 		} else {
-			s.log.Warn("portal: otp requested for non-recipient", "user", email, "attachment", a.ID)
+			s.log.Warn("portal: otp requested by ineligible address", "user", email, "resource", g.logID)
 		}
 		s.render(w, http.StatusOK, page)
 		return
@@ -251,12 +272,16 @@ func (s *Server) authPost(w http.ResponseWriter, r *http.Request) {
 	}
 	s.setSession(w, email)
 	s.log.Info("portal: login", "user", email)
-	http.Redirect(w, r, "/d/"+tok, http.StatusSeeOther)
+	http.Redirect(w, r, g.base, http.StatusSeeOther)
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	s.clearSession(w)
-	http.Redirect(w, r, "/d/"+r.PathValue("token"), http.StatusSeeOther)
+	base := "/d/"
+	if strings.HasPrefix(r.URL.Path, "/dlp/") {
+		base = "/dlp/"
+	}
+	http.Redirect(w, r, base+r.PathValue("token"), http.StatusSeeOther)
 }
 
 func newCode() string {

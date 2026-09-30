@@ -18,6 +18,8 @@ type Memory struct {
 	byToken  map[string]string
 	// Downloads is the audit log (exported for tests).
 	Downloads []model.DownloadEvent
+	holds     map[string]*model.Hold
+	dlpEvents []*model.DLPEvent
 }
 
 func NewMemory() *Memory {

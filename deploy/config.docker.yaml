@@ -20,6 +20,7 @@ portal:
 internal_api:
   listen: ":8081"
   token: ${SECMAIL_INTERNAL_TOKEN}
+  admin_token: ${SECMAIL_ADMIN_TOKEN}
   advertise_url: http://secmail:8081
 storage:
   type: s3
@@ -40,3 +41,23 @@ queue:
 analysis:
   timeout: 1m
   janitor_interval: 10s
+
+# Outgoing mail inspection (DLP). In the demo, mail submitted to :10025 is
+# scanned and relayed to mailpit, which stands in for the Internet.
+outbound:
+  enabled: true
+  listen: ":10025"
+  allowed_clients: ["127.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "10.0.0.0/8"]
+  next_hop:
+    addr: mailpit:1025
+dlp:
+  scan_attachments: true
+  actions:
+    high: hold          # resident numbers, cards, API keys, private keys
+    medium: notify      # passports, licences, bulk phone lists, JWTs, passwords
+    low: allow
+    uninspectable: notify
+  notify_sender: true
+  admins: [security@example.com]
+  notify_from: dlp-noreply@example.com
+  hold_ttl: 72h

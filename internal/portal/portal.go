@@ -31,9 +31,20 @@ import (
 //go:embed templates/*.html
 var templateFS embed.FS
 
-var pageTmpl = template.Must(template.New("page.html").Funcs(template.FuncMap{
+var tmpl = template.Must(template.New("page.html").Funcs(template.FuncMap{
 	"size": humanSize,
-}).ParseFS(templateFS, "templates/page.html"))
+	"sevko": func(s string) string {
+		switch s {
+		case "high":
+			return "높음"
+		case "medium":
+			return "중간"
+		case "low":
+			return "낮음"
+		}
+		return s
+	},
+}).ParseFS(templateFS, "templates/*.html"))
 
 type Options struct {
 	TicketTTL         time.Duration
@@ -47,6 +58,10 @@ type Options struct {
 	// Codes and Mailer are required when Auth.Mode is "otp".
 	Codes  CodeStore
 	Mailer Mailer
+	// Holds enables the DLP review pages (/dlp/{token}); DLPAdmins may use
+	// them when Auth is enabled.
+	Holds     HoldReviewer
+	DLPAdmins []string
 }
 
 type Server struct {
@@ -80,6 +95,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /d/{token}/file", s.file)
 	mux.HandleFunc("POST /d/{token}/auth", s.authPost)
 	mux.HandleFunc("POST /d/{token}/logout", s.logout)
+	if s.opts.Holds != nil {
+		mux.HandleFunc("GET /dlp/{token}", s.holdPage)
+		mux.HandleFunc("POST /dlp/{token}/auth", s.holdAuth)
+		mux.HandleFunc("POST /dlp/{token}/logout", s.logout)
+		mux.HandleFunc("POST /dlp/{token}/release", s.holdRelease)
+		mux.HandleFunc("POST /dlp/{token}/reject", s.holdReject)
+	}
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	return securityHeaders(s.checkOrigin(mux))
 }
@@ -167,6 +189,7 @@ func (s *Server) lookup(w http.ResponseWriter, r *http.Request, asJSON bool) (*m
 
 type pageData struct {
 	State      string
+	Base       string // URL of the protected resource, e.g. /d/<token>
 	Token      string
 	Filename   string
 	Size       int64
@@ -202,6 +225,7 @@ func (s *Server) page(w http.ResponseWriter, r *http.Request) {
 	s.render(w, code, pageData{
 		State:      string(st),
 		Token:      r.PathValue("token"),
+		Base:       "/d/" + r.PathValue("token"),
 		Filename:   a.Filename,
 		Size:       a.Size,
 		ThreatName: a.ThreatName,
@@ -320,7 +344,7 @@ func (s *Server) render(w http.ResponseWriter, code int, d pageData) {
 		"default-src 'none'; style-src 'nonce-"+d.Nonce+"'; script-src 'nonce-"+d.Nonce+"'; "+
 			"connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 	w.WriteHeader(code)
-	if err := pageTmpl.Execute(w, d); err != nil {
+	if err := tmpl.ExecuteTemplate(w, "page.html", d); err != nil {
 		s.log.Error("portal: render", "err", err)
 	}
 }

@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>발송 보류 메일 검토</title>
+{{template "style" .}}
+</head>
+<body>
+<main class="{{.Status}}">
+<div class="card">
+  {{if eq .Status "HELD"}}<span class="badge">검토 대기</span>
+  {{else if eq .Status "RELEASED"}}<span class="badge">발송 승인됨</span>
+  {{else if eq .Status "REJECTED"}}<span class="badge">반려됨</span>
+  {{else}}<span class="badge">기한 만료</span>{{end}}
+  <h1>발송 보류 메일 검토</h1>
+  <p>외부로 발송하려던 메일에서 민감정보가 탐지되어 발송이 보류되었습니다. 내용을 확인한 뒤 승인하거나 반려하세요.</p>
+
+  <dl class="kv">
+    <dt>제목</dt><dd>{{.Subject}}</dd>
+    <dt>발신</dt><dd>{{.From}}</dd>
+    <dt>수신</dt><dd>{{range $i, $r := .To}}{{if $i}}, {{end}}{{$r}}{{end}}</dd>
+    <dt>접수</dt><dd>{{.Created}}</dd>
+    {{if eq .Status "HELD"}}<dt>기한</dt><dd>{{.Expires}} (이후 자동 폐기)</dd>
+    {{else}}<dt>처리</dt><dd>{{.Decided}} · {{.DecidedBy}}{{if .Reason}} · {{.Reason}}{{end}}</dd>{{end}}
+  </dl>
+
+  <table class="f">
+    <tr><th>등급</th><th>항목</th><th>위치</th><th>예시(마스킹)</th></tr>
+    {{range .Findings}}
+    <tr><td><span class="sev {{.Severity}}">{{sevko .Severity}}</span></td><td>{{.Name}} {{.Count}}건</td>
+        <td>{{.Location}}</td><td>{{range $i, $s := .Samples}}{{if $i}}, {{end}}{{$s}}{{end}}</td></tr>
+    {{end}}
+    {{range .Uninspectable}}
+    <tr><td><span class="sev medium">검사불가</span></td><td colspan="3">{{.}}</td></tr>
+    {{end}}
+  </table>
+
+  {{if .Error}}<div class="msg err">{{.Error}}</div>{{end}}
+  {{if .Notice}}<div class="msg info">{{.Notice}}</div>{{end}}
+
+  {{if eq .Status "HELD"}}
+  <form method="post" action="{{.Base}}/release"><button type="submit">승인 후 발송</button></form>
+  <form method="post" action="{{.Base}}/reject">
+    <label for="reason">반려 사유 (선택, 발신자에게 전달됨)</label>
+    <input id="reason" name="reason" maxlength="300" placeholder="예: 고객 주민번호를 마스킹한 뒤 다시 보내주세요">
+    <button class="danger" type="submit">반려</button>
+  </form>
+  {{end}}
+
+  {{if .User}}
+  <div class="userbar"><span>{{.User}}</span>
+  {{if .CanLogout}}<form method="post" action="{{.Base}}/logout"><button class="link" type="submit">다른 주소로 로그인</button></form>{{end}}
+  </div>
+  {{end}}
+</div>
+<footer>보안 메일 게이트웨이 · DLP</footer>
+</main>
+</body>
+</html>

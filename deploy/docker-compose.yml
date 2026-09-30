@@ -1,12 +1,15 @@
 # Local demo stack:
 #   docker compose -f deploy/docker-compose.yml up --build
-#   send mail to localhost:2525 (rcpt @example.com), read it at http://localhost:8025
+#   inbound:  send mail to localhost:2525 (rcpt @example.com)
+#   outbound: send mail from @example.com to localhost:10025 (DLP)
+#   everything that gets delivered, plus notices, shows up at http://localhost:8025
 name: secmail
 x-env: &env
   SECMAIL_INTERNAL_TOKEN: demo-internal-token-change-me
   S3_ACCESS_KEY: secmail
   S3_SECRET_KEY: secmail-s3-secret
   SECMAIL_SESSION_SECRET: demo-session-secret-change-me-0123456789
+  SECMAIL_ADMIN_TOKEN: demo-admin-token-change-me
 
 services:
   secmail:
@@ -15,8 +18,10 @@ services:
     volumes:
       - ./config.docker.yaml:/etc/secmail/config.yaml:ro
     ports:
-      - "2525:2525"   # SMTP in
-      - "8080:8080"   # download portal
+      - "2525:2525"   # SMTP in (from the Internet)
+      - "10025:10025" # SMTP out (from the internal mail server, DLP-inspected)
+      - "8080:8080"   # download portal (+ DLP review pages)
+      - "127.0.0.1:8081:8081"  # internal/admin API — demo only; keep private in production
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_started}

@@ -27,6 +27,69 @@ type Config struct {
 	Redis       RedisConfig       `yaml:"redis"`
 	Queue       QueueConfig       `yaml:"queue"`
 	Analysis    AnalysisConfig    `yaml:"analysis"`
+	Outbound    OutboundConfig    `yaml:"outbound"`
+	DLP         DLPConfig         `yaml:"dlp"`
+}
+
+// OutboundConfig enables the second SMTP listener that receives mail the
+// internal server sends to the Internet, inspects it (DLP) and relays it to
+// NextHop.
+type OutboundConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Listen  string `yaml:"listen"`
+	// AllowedClients restricts who may relay (the internal mail servers).
+	AllowedClients []string `yaml:"allowed_clients"`
+	// SenderDomains restricts MAIL FROM; defaults to smtp.accepted_domains.
+	SenderDomains   []string       `yaml:"sender_domains"`
+	NextHop         UpstreamConfig `yaml:"next_hop"`
+	MaxMessageBytes int64          `yaml:"max_message_bytes"`
+}
+
+// DLP actions, from least to most strict.
+const (
+	ActionAllow  = "allow"  // deliver, record the event
+	ActionNotify = "notify" // deliver, notify sender / admins
+	ActionHold   = "hold"   // keep until an administrator releases it
+	ActionBlock  = "block"  // reject; the sender receives a bounce + notice
+)
+
+type DLPActions struct {
+	High          string `yaml:"high"`
+	Medium        string `yaml:"medium"`
+	Low           string `yaml:"low"`
+	Uninspectable string `yaml:"uninspectable"` // encrypted archives/documents
+}
+
+type DLPRule struct {
+	ID       string   `yaml:"id"`
+	Name     string   `yaml:"name"`
+	Pattern  string   `yaml:"pattern"`
+	Severity string   `yaml:"severity"`
+	Category string   `yaml:"category"`
+	MinCount int      `yaml:"min_count"`
+	Context  []string `yaml:"context"`
+}
+
+type DLPConfig struct {
+	ScanAttachments bool       `yaml:"scan_attachments"`
+	Actions         DLPActions `yaml:"actions"`
+	NotifySender    bool       `yaml:"notify_sender"`
+	// Admins receive notices and review holds (and must be the logged-in
+	// user on the review page when portal.auth is enabled).
+	Admins     []string      `yaml:"admins"`
+	NotifyFrom string        `yaml:"notify_from"`
+	HoldTTL    time.Duration `yaml:"hold_ttl"`
+	// Disabled built-in detector IDs; MinCounts overrides bulk thresholds.
+	Disabled  []string       `yaml:"disabled"`
+	MinCounts map[string]int `yaml:"min_counts"`
+	Rules     []DLPRule      `yaml:"rules"`
+	// ExemptSenders skip DLP entirely; ExemptRecipientDomains are trusted
+	// partners (findings are recorded but the action is "allow").
+	ExemptSenders []string `yaml:"exempt_senders"`
+	// ScanInternal also inspects mail whose recipients are all in our own
+	// domains (off by default: only mail leaving the organisation).
+	ScanInternal           bool     `yaml:"scan_internal"`
+	ExemptRecipientDomains []string `yaml:"exempt_recipient_domains"`
 }
 
 type SMTPConfig struct {
@@ -121,6 +184,9 @@ type InternalAPIConfig struct {
 	// AdvertiseURL is the base URL analyzers use to reach this API; it is
 	// embedded in every job (content_url / verdict_url). Optional.
 	AdvertiseURL string `yaml:"advertise_url"`
+	// AdminToken protects the DLP administration endpoints
+	// (/internal/v1/dlp/*). Empty disables them.
+	AdminToken string `yaml:"admin_token"`
 }
 
 type StorageConfig struct {
@@ -209,6 +275,15 @@ func Default() Config {
 		Database:    DatabaseConfig{Type: "memory"},
 		Redis:       RedisConfig{Addr: "localhost:6379"},
 		Queue:       QueueConfig{Type: "memory", KeyPrefix: "secmail"},
+		Outbound: OutboundConfig{Listen: ":10025", MaxMessageBytes: 50 << 20,
+			NextHop: UpstreamConfig{Timeout: 60 * time.Second}},
+		DLP: DLPConfig{
+			ScanAttachments: true,
+			Actions: DLPActions{High: ActionHold, Medium: ActionNotify, Low: ActionAllow,
+				Uninspectable: ActionNotify},
+			NotifySender: true,
+			HoldTTL:      72 * time.Hour,
+		},
 		Analysis: AnalysisConfig{
 			Timeout:            5 * time.Minute,
 			MaxAttempts:        3,
@@ -273,11 +348,45 @@ func (c *Config) Validate() error {
 	default:
 		errs = append(errs, fmt.Errorf("portal.auth.mode: unknown value %q", a.Mode))
 	}
+	if c.Outbound.Enabled {
+		if c.Outbound.NextHop.Addr == "" {
+			errs = append(errs, errors.New("outbound.next_hop.addr is required"))
+		}
+		if len(c.Outbound.AllowedClients) == 0 {
+			errs = append(errs, errors.New("outbound.allowed_clients must list the internal mail servers (open relay protection)"))
+		}
+		if len(c.Outbound.SenderDomains) == 0 {
+			c.Outbound.SenderDomains = append([]string(nil), c.SMTP.AcceptedDomains...)
+		}
+		for i, d := range c.Outbound.SenderDomains {
+			c.Outbound.SenderDomains[i] = strings.ToLower(strings.TrimSpace(d))
+		}
+		a := c.DLP.Actions
+		for name, v := range map[string]string{"high": a.High, "medium": a.Medium, "low": a.Low, "uninspectable": a.Uninspectable} {
+			switch v {
+			case ActionAllow, ActionNotify, ActionHold, ActionBlock:
+			default:
+				errs = append(errs, fmt.Errorf("dlp.actions.%s: unknown action %q", name, v))
+			}
+		}
+		if c.DLP.NotifyFrom == "" && (c.DLP.NotifySender || len(c.DLP.Admins) > 0) {
+			errs = append(errs, errors.New("dlp.notify_from is required for notifications"))
+		}
+		if (a.High == ActionHold || a.Medium == ActionHold || a.Low == ActionHold || a.Uninspectable == ActionHold) && len(c.DLP.Admins) == 0 {
+			errs = append(errs, errors.New("dlp.admins is required when an action is \"hold\""))
+		}
+	}
 	if c.DKIM.Sign && (c.DKIM.Domain == "" || c.DKIM.Selector == "" || c.DKIM.PrivateKeyFile == "") {
 		errs = append(errs, errors.New("dkim.sign requires domain, selector and private_key_file"))
 	}
 	if c.InternalAPI.Listen != "" && len(c.InternalAPI.Token) < 16 {
 		errs = append(errs, errors.New("internal_api.token must be at least 16 characters"))
+	}
+	if c.InternalAPI.AdminToken != "" && len(c.InternalAPI.AdminToken) < 16 {
+		errs = append(errs, errors.New("internal_api.admin_token must be at least 16 characters"))
+	}
+	if c.InternalAPI.AdminToken != "" && c.InternalAPI.AdminToken == c.InternalAPI.Token {
+		errs = append(errs, errors.New("internal_api.admin_token must differ from internal_api.token"))
 	}
 	if c.Analysis.MaxAttempts < 1 {
 		c.Analysis.MaxAttempts = 1

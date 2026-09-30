@@ -15,6 +15,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -26,27 +27,90 @@ import (
 // UpstreamOptions configures the connection to the real mail server.
 type UpstreamOptions = smtpclient.Options
 
+// MessageProcessor transforms (inbound) or inspects (outbound) a message
+// before it is relayed. Returning ErrHeld accepts the message without
+// relaying it; returning an *smtp.SMTPError sends that reply to the client.
+type MessageProcessor interface {
+	Process(ctx context.Context, env Envelope, raw []byte) ([]byte, error)
+}
+
+// ErrHeld means the processor kept the message (e.g. DLP hold): the client
+// gets 250 but nothing is relayed now.
+var ErrHeld = errors.New("message held")
+
 type BackendOptions struct {
-	AcceptedDomains []string
-	Upstream        UpstreamOptions
+	// RecipientDomains restricts RCPT TO (inbound: our domains). Empty = any.
+	RecipientDomains []string
+	// SenderDomains restricts MAIL FROM (outbound: our domains). Empty = any.
+	SenderDomains []string
+	// AllowedClients restricts connecting IPs (outbound: internal servers).
+	AllowedClients []netip.Prefix
+	Upstream       UpstreamOptions
+	// Name labels log lines ("inbound" / "outbound").
+	Name string
 }
 
 type Backend struct {
-	proc *Processor
+	proc MessageProcessor
 	opts BackendOptions
 	log  *slog.Logger
 }
 
-func NewBackend(proc *Processor, opts BackendOptions, log *slog.Logger) *Backend {
-	return &Backend{proc: proc, opts: opts, log: log}
+func NewBackend(proc MessageProcessor, opts BackendOptions, log *slog.Logger) *Backend {
+	if opts.Name == "" {
+		opts.Name = "inbound"
+	}
+	return &Backend{proc: proc, opts: opts, log: log.With("direction", opts.Name)}
 }
+
+var errClientDenied = &smtp.SMTPError{Code: 554, EnhancedCode: smtp.EnhancedCode{5, 7, 1},
+	Message: "Access denied"}
 
 func (b *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	s := &session{b: b, conn: c}
 	if c != nil && c.Conn() != nil {
 		s.remote = c.Conn().RemoteAddr().String()
 	}
+	if len(b.opts.AllowedClients) > 0 && !b.clientAllowed(s.remote) {
+		b.log.Warn("connection from unauthorised client refused", "remote", s.remote)
+		return nil, errClientDenied
+	}
 	return s, nil
+}
+
+func (b *Backend) clientAllowed(remote string) bool {
+	ap, err := netip.ParseAddrPort(remote)
+	if err != nil {
+		return false
+	}
+	ip := ap.Addr().Unmap()
+	for _, p := range b.opts.AllowedClients {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// ParsePrefixes accepts CIDRs or single IPs.
+func ParsePrefixes(list []string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for _, v := range list {
+		if !strings.Contains(v, "/") {
+			a, err := netip.ParseAddr(v)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, netip.PrefixFrom(a, a.BitLen()))
+			continue
+		}
+		p, err := netip.ParsePrefix(v)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p.Masked())
+	}
+	return out, nil
 }
 
 type session struct {
@@ -69,15 +133,18 @@ var (
 )
 
 func (s *session) dialUpstream() (*smtp.Client, error) {
-	o := s.b.opts.Upstream
-	if o.HeloName == "" {
-		o.HeloName = s.b.proc.opts.Hostname
-	}
-	return smtpclient.Dial(o)
+	return smtpclient.Dial(s.b.opts.Upstream)
 }
+
+var errSenderDenied = &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 7, 1},
+	Message: "Sender domain not allowed"}
 
 func (s *session) Mail(from string, opts *smtp.MailOptions) error {
 	s.resetState()
+	// Null sender (bounces) is allowed; otherwise enforce SenderDomains.
+	if from != "" && len(s.b.opts.SenderDomains) > 0 && !domainIn(from, s.b.opts.SenderDomains) {
+		return errSenderDenied
+	}
 	if s.up == nil {
 		up, err := s.dialUpstream()
 		if err != nil {
@@ -104,7 +171,7 @@ func (s *session) Rcpt(to string, _ *smtp.RcptOptions) error {
 	if s.up == nil {
 		return errNoMail
 	}
-	if !s.accepted(to) {
+	if len(s.b.opts.RecipientDomains) > 0 && !domainIn(to, s.b.opts.RecipientDomains) {
 		return errRelayDenied
 	}
 	if err := s.up.Rcpt(to, nil); err != nil {
@@ -114,13 +181,13 @@ func (s *session) Rcpt(to string, _ *smtp.RcptOptions) error {
 	return nil
 }
 
-func (s *session) accepted(addr string) bool {
+func domainIn(addr string, domains []string) bool {
 	at := strings.LastIndexByte(addr, '@')
 	if at < 0 {
 		return false
 	}
 	domain := strings.ToLower(addr[at+1:])
-	for _, d := range s.b.opts.AcceptedDomains {
+	for _, d := range domains {
 		if domain == d || (strings.HasPrefix(d, ".") && strings.HasSuffix(domain, d)) {
 			return true
 		}
@@ -148,6 +215,12 @@ func (s *session) Data(r io.Reader) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	out, err := s.b.proc.Process(ctx, env, raw)
+	if errors.Is(err, ErrHeld) {
+		s.abortUpstream()
+		s.b.log.Info("message held, not relayed", "from", s.from, "rcpt", s.rcpt)
+		s.resetState()
+		return nil
+	}
 	if err != nil {
 		s.abortUpstream()
 		return err

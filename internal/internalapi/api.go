@@ -36,6 +36,9 @@ type API struct {
 	verdicts VerdictApplier
 	token    []byte
 	log      *slog.Logger
+
+	adminToken []byte
+	holds      HoldReviewer
 }
 
 func New(st store.Store, obj storage.Storage, v VerdictApplier, token string, log *slog.Logger) *API {
@@ -47,6 +50,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /internal/v1/attachments/{id}", a.auth(a.meta))
 	mux.HandleFunc("GET /internal/v1/attachments/{id}/content", a.auth(a.content))
 	mux.HandleFunc("POST /internal/v1/attachments/{id}/verdict", a.auth(a.verdict))
+	a.mountDLP(mux)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	return mux
 }

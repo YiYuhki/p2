@@ -124,8 +124,8 @@ func newHarness(t *testing.T) *harness {
 		Signer: dkimutil.NewSigner("example.com", "sel", key),
 	}, log)
 	be := NewBackend(proc, BackendOptions{
-		AcceptedDomains: []string{"example.com"},
-		Upstream:        UpstreamOptions{Addr: upAddr, Timeout: 5 * time.Second},
+		RecipientDomains: []string{"example.com"},
+		Upstream:         UpstreamOptions{Addr: upAddr, Timeout: 5 * time.Second},
 	}, log)
 	return &harness{addr: serve(t, be), up: up, store: st, queue: q, pub: &key.PublicKey}
 }

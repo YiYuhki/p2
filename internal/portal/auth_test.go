@@ -161,7 +161,7 @@ func TestOTPNonRecipientGetsNoCode(t *testing.T) {
 	f := newAuthFixture(t, AuthOptions{Mode: "otp"})
 	c := browser(t)
 	_, body := fetch(t, c, "POST", f.base+"/auth", url.Values{"email": {"mallory@evil.com"}})
-	if !strings.Contains(body, "수신자라면 인증 코드가 발송") {
+	if !strings.Contains(body, "라면 인증 코드가 발송되었습니다") {
 		t.Fatal("response must not reveal recipient list")
 	}
 	if f.mailer.code("mallory@evil.com") != "" {

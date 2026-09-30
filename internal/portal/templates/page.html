@@ -5,52 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>보안 첨부파일 다운로드</title>
-<style nonce="{{.Nonce}}">
-  :root { --fg:#1f2937; --muted:#6b7280; --bg:#f3f4f6; --card:#fff; --line:#e5e7eb;
-          --ok:#059669; --warn:#d97706; --bad:#dc2626; --accent:#4f46e5; }
-  @media (prefers-color-scheme: dark) {
-    :root { --fg:#e5e7eb; --muted:#9ca3af; --bg:#111827; --card:#1f2937; --line:#374151; }
-  }
-  * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg);
-         font-family:"Malgun Gothic","Apple SD Gothic Neo",system-ui,sans-serif; }
-  main { max-width:560px; margin:8vh auto; padding:0 16px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:28px; }
-  h1 { font-size:20px; margin:0 0 8px; }
-  p { line-height:1.6; margin:8px 0; word-break:keep-all; overflow-wrap:anywhere; }
-  h1 { word-break:keep-all; }
-  .file { margin:16px 0; padding:12px 14px; border:1px solid var(--line); border-radius:8px;
-          word-break:break-all; }
-  .file small { color:var(--muted); }
-  .badge { display:inline-block; font-size:12px; font-weight:bold; padding:2px 8px;
-           border-radius:999px; color:#fff; }
-  .PENDING .badge { background:var(--warn); } .CLEAN .badge { background:var(--ok); }
-  .MALICIOUS .badge, .ERROR .badge { background:var(--bad); }
-  .EXPIRED .badge, .NOTFOUND .badge, .FAILURE .badge { background:var(--muted); }
-  button { width:100%; padding:12px; border:0; border-radius:8px; background:var(--accent);
-           color:#fff; font-size:15px; font-weight:bold; cursor:pointer; }
-  button[disabled] { opacity:.45; cursor:not-allowed; }
-  .spinner { display:inline-block; width:14px; height:14px; border:2px solid var(--warn);
-             border-right-color:transparent; border-radius:50%; animation:spin 1s linear infinite;
-             vertical-align:-2px; margin-right:6px; }
-  @keyframes spin { to { transform:rotate(360deg); } }
-  .threat { color:var(--bad); font-weight:bold; }
-  .LOGIN .badge, .CODE .badge, .AUTHREQ .badge { background:var(--accent); }
-  .FORBIDDEN .badge { background:var(--bad); }
-  label { display:block; font-size:13px; color:var(--muted); margin:12px 0 4px; }
-  input { width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:8px;
-          background:var(--bg); color:var(--fg); font-size:15px; margin-bottom:12px; }
-  input.code { letter-spacing:6px; font-size:20px; text-align:center; }
-  .msg { padding:10px 12px; border-radius:8px; font-size:14px; margin:12px 0; }
-  .msg.err { background:rgba(220,38,38,.1); color:var(--bad); }
-  .msg.info { background:rgba(79,70,229,.1); }
-  .userbar { display:flex; justify-content:space-between; align-items:center; gap:8px;
-             margin-top:16px; font-size:12px; color:var(--muted); }
-  .link { background:none; border:0; padding:0; width:auto; color:var(--accent);
-          font-size:12px; font-weight:normal; text-decoration:underline; }
-  .secondary { margin-top:8px; background:transparent; color:var(--accent); border:1px solid var(--line); }
-  footer { margin-top:16px; color:var(--muted); font-size:12px; text-align:center; }
-</style>
+{{template "style" .}}
 </head>
 <body>
 <main class="{{.State}}">
@@ -112,33 +67,33 @@
 {{if .Notice}}<div class="msg info">{{.Notice}}</div>{{end}}
 
 {{if eq .State "LOGIN"}}
-  <form method="post" action="/d/{{.Token}}/auth">
+  <form method="post" action="{{.Base}}/auth">
     <label for="email">수신 이메일 주소</label>
     <input id="email" name="email" type="email" autocomplete="email" required autofocus>
     <button type="submit">인증 코드 받기</button>
   </form>
 {{else if eq .State "CODE"}}
-  <form method="post" action="/d/{{.Token}}/auth">
+  <form method="post" action="{{.Base}}/auth">
     <input type="hidden" name="email" value="{{.Email}}">
     <label for="code">인증 코드</label>
     <input id="code" class="code" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6"
            autocomplete="one-time-code" required autofocus>
     <button type="submit">확인</button>
   </form>
-  <form method="post" action="/d/{{.Token}}/auth">
+  <form method="post" action="{{.Base}}/auth">
     <input type="hidden" name="email" value="{{.Email}}">
     <button class="secondary" type="submit">코드 다시 받기</button>
   </form>
 {{end}}
 
 {{if or (eq .State "PENDING") (eq .State "CLEAN")}}
-  <form method="post" action="/d/{{.Token}}/download">
+  <form method="post" action="{{.Base}}/download">
     <button id="dl" type="submit" {{if ne .State "CLEAN"}}disabled{{end}}>다운로드</button>
   </form>
 {{end}}
 {{if .User}}
   <div class="userbar"><span>{{.User}}</span>
-  {{if .CanLogout}}<form method="post" action="/d/{{.Token}}/logout"><button class="link" type="submit">다른 주소로 로그인</button></form>{{end}}
+  {{if .CanLogout}}<form method="post" action="{{.Base}}/logout"><button class="link" type="submit">다른 주소로 로그인</button></form>{{end}}
   </div>
 {{end}}
 </div>
@@ -147,7 +102,7 @@
 {{if eq .State "PENDING"}}
 <script nonce="{{.Nonce}}">
 (function () {
-  var url = "/d/{{.Token}}/status";
+  var url = "{{.Base}}/status";
   var delay = 3000, tries = 0;
   function poll() {
     fetch(url, { cache: "no-store", credentials: "same-origin" })

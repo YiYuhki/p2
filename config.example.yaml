@@ -60,6 +60,7 @@ internal_api:                    # used by the external analysis engine only
   listen: "0.0.0.0:8081"
   token: ${SECMAIL_INTERNAL_TOKEN}
   advertise_url: http://secmail-internal.example.com:8081
+  admin_token: ${SECMAIL_ADMIN_TOKEN}   # DLP admin endpoints (/internal/v1/dlp/*); must differ from token
 
 storage:
   type: s3                       # s3 (AWS S3 / MinIO / RustFS / Ceph RGW) | fs
@@ -91,3 +92,39 @@ analysis:
   max_attempts: 3                # then marked ERROR (download blocked, fail-closed)
   verdict_reuse_window: 24h      # reuse verdicts for identical SHA-256 (0 disables)
   janitor_interval: 1m
+
+# ---- Outgoing mail inspection (DLP) — see docs/dlp.md ----
+outbound:
+  enabled: true
+  listen: ":10025"                 # the internal mail server relays Internet-bound mail here
+  allowed_clients:                 # only these hosts may relay (internal mail servers)
+    - 10.0.5.10/32
+  # sender_domains: [example.com]  # default: smtp.accepted_domains
+  next_hop:                        # where inspected mail goes: Postfix re-injection port / smart host
+    addr: 10.0.5.10:10026
+    starttls: false
+    timeout: 60s
+  max_message_bytes: 52428800
+
+dlp:
+  scan_attachments: true           # docx/xlsx/pptx, hwp/hwpx, pdf, zip (nested), csv/txt, legacy doc/xls
+  scan_internal: false             # true: also inspect mail between internal addresses
+  actions:                         # allow | notify | hold | block
+    high: hold                     # resident/alien reg. no., card no., API keys, private keys, DB credentials
+    medium: notify                 # passport, driver licence, bulk phone numbers, JWT, passwords
+    low: allow                     # bulk e-mail addresses (logged only)
+    uninspectable: notify          # encrypted zip/PDF/Office/HWP, distribution-protected HWP
+  notify_sender: true
+  admins: [security@example.com]   # receive notices; approve/reject holds on the portal
+  notify_from: dlp-noreply@example.com
+  hold_ttl: 72h                    # undecided holds are discarded (not sent) after this
+  # disabled: [jwt, email_address]         # built-in detector IDs to turn off
+  # min_counts: {kr_mobile: 10}            # bulk thresholds per location
+  # exempt_senders: [payroll-bot@example.com]
+  # exempt_recipient_domains: [payroll-partner.co.kr]   # trusted partners: logged, not held
+  # rules:                                 # organisation-specific patterns
+  #   - id: project_codename
+  #     name: 프로젝트 코드명
+  #     pattern: 'PRJ-(ORION-\d{3})'
+  #     severity: high
+  #     category: confidential

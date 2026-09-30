@@ -32,9 +32,12 @@ import (
 
 	"github.com/yiyuhki/p2/internal/config"
 	"github.com/yiyuhki/p2/internal/dkimutil"
+	"github.com/yiyuhki/p2/internal/dlp"
 	"github.com/yiyuhki/p2/internal/gateway"
 	"github.com/yiyuhki/p2/internal/internalapi"
 	"github.com/yiyuhki/p2/internal/mimeproc"
+	"github.com/yiyuhki/p2/internal/notify"
+	"github.com/yiyuhki/p2/internal/outbound"
 	"github.com/yiyuhki/p2/internal/portal"
 	"github.com/yiyuhki/p2/internal/queue"
 	"github.com/yiyuhki/p2/internal/service"
@@ -137,6 +140,36 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		VerdictReuseWindow: cfg.Analysis.VerdictReuseWindow,
 	}, log)
 
+	// ---- outbound DLP ----
+	var outSvc *outbound.Service
+	if cfg.Outbound.Enabled {
+		rules := make([]dlp.Rule, 0, len(cfg.DLP.Rules))
+		for _, r := range cfg.DLP.Rules {
+			rules = append(rules, dlp.Rule(r))
+		}
+		scanner, err := dlp.NewScanner(dlp.Options{
+			Disabled: cfg.DLP.Disabled, MinCounts: cfg.DLP.MinCounts, Rules: rules,
+			ScanAttachments: cfg.DLP.ScanAttachments, Limits: dlp.DefaultLimits(),
+		})
+		if err != nil {
+			return err
+		}
+		outSvc = outbound.New(scanner, st, obj, notify.NewSMTPSender(upstreamOpts(cfg)), outbound.Options{
+			Actions:                cfg.DLP.Actions,
+			NotifySender:           cfg.DLP.NotifySender,
+			Admins:                 cfg.DLP.Admins,
+			NotifyFrom:             cfg.DLP.NotifyFrom,
+			HoldTTL:                cfg.DLP.HoldTTL,
+			PublicBaseURL:          cfg.Portal.PublicBaseURL,
+			OwnDomains:             cfg.Outbound.SenderDomains,
+			ExemptSenders:          cfg.DLP.ExemptSenders,
+			ExemptRecipientDomains: cfg.DLP.ExemptRecipientDomains,
+			ScanInternal:           cfg.DLP.ScanInternal,
+			NextHop:                nextHopOpts(cfg),
+			Location:               loc,
+		}, log)
+	}
+
 	var wg sync.WaitGroup
 	errCh := make(chan error, 4)
 	var shutdowns []func(context.Context) error
@@ -165,8 +198,8 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			Signer:        signer,
 		}, log)
 		be := gateway.NewBackend(proc, gateway.BackendOptions{
-			AcceptedDomains: cfg.SMTP.AcceptedDomains,
-			Upstream:        upstreamOpts(cfg),
+			RecipientDomains: cfg.SMTP.AcceptedDomains,
+			Upstream:         upstreamOpts(cfg),
 		}, log)
 		srv := smtp.NewServer(be)
 		srv.Addr = cfg.SMTP.Listen
@@ -192,6 +225,37 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			}
 		}()
 		shutdowns = append(shutdowns, srv.Shutdown)
+
+		if outSvc != nil {
+			clients, err := gateway.ParsePrefixes(cfg.Outbound.AllowedClients)
+			if err != nil {
+				return fmt.Errorf("outbound.allowed_clients: %w", err)
+			}
+			obe := gateway.NewBackend(outSvc, gateway.BackendOptions{
+				Name:           "outbound",
+				SenderDomains:  cfg.Outbound.SenderDomains,
+				AllowedClients: clients,
+				Upstream:       nextHopOpts(cfg),
+			}, log)
+			osrv := smtp.NewServer(obe)
+			osrv.Addr = cfg.Outbound.Listen
+			osrv.Domain = cfg.SMTP.Hostname
+			osrv.MaxMessageBytes = cfg.Outbound.MaxMessageBytes
+			osrv.MaxRecipients = cfg.SMTP.MaxRecipients
+			osrv.ReadTimeout = cfg.SMTP.ReadTimeout
+			osrv.WriteTimeout = cfg.SMTP.WriteTimeout
+			osrv.EnableSMTPUTF8 = true
+			osrv.TLSConfig = srv.TLSConfig
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				log.Info("outbound DLP listener", "addr", osrv.Addr, "next_hop", cfg.Outbound.NextHop.Addr)
+				if err := osrv.ListenAndServe(); err != nil && !errors.Is(err, smtp.ErrServerClosed) {
+					errCh <- fmt.Errorf("outbound smtp: %w", err)
+				}
+			}()
+			shutdowns = append(shutdowns, osrv.Shutdown)
+		}
 	}
 
 	// ---- public portal ----
@@ -215,8 +279,10 @@ func run(cfgPath, components string, log *slog.Logger) error {
 				OTPResendAfter:   cfg.Portal.Auth.OTPResendAfter,
 				SecureCookie:     strings.HasPrefix(cfg.Portal.PublicBaseURL, "https://"),
 			},
-			Codes:  codes,
-			Mailer: portal.NewSMTPMailer(upstreamOpts(cfg), cfg.Portal.Auth.OTPFrom),
+			Codes:     codes,
+			Mailer:    portal.NewSMTPMailer(upstreamOpts(cfg), cfg.Portal.Auth.OTPFrom),
+			Holds:     holdReviewer(outSvc),
+			DLPAdmins: cfg.DLP.Admins,
 		}, log)
 		log.Info("portal recipient authentication", "mode", cfg.Portal.Auth.Mode)
 		shutdowns = append(shutdowns, serveHTTP(&wg, errCh, log, "portal", cfg.Portal.Listen, p.Handler()))
@@ -225,6 +291,9 @@ func run(cfgPath, components string, log *slog.Logger) error {
 	// ---- internal API for the analyzer ----
 	if enabled["api"] && cfg.InternalAPI.Listen != "" {
 		api := internalapi.New(st, obj, svc, cfg.InternalAPI.Token, log)
+		if outSvc != nil && cfg.InternalAPI.AdminToken != "" {
+			api.EnableDLPAdmin(cfg.InternalAPI.AdminToken, outSvc)
+		}
 		shutdowns = append(shutdowns, serveHTTP(&wg, errCh, log, "internal-api", cfg.InternalAPI.Listen, api.Handler()))
 	}
 
@@ -241,6 +310,13 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			log.Info("janitor started", "interval", cfg.Analysis.JanitorInterval)
 			svc.Janitor(ctx, cfg.Analysis.JanitorInterval)
 		}()
+		if outSvc != nil {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				outSvc.Janitor(ctx, cfg.Analysis.JanitorInterval)
+			}()
+		}
 	}
 
 	select {
@@ -270,6 +346,23 @@ func upstreamOpts(cfg config.Config) smtpclient.Options {
 		InsecureSkipVerify: cfg.Upstream.InsecureSkipVerify,
 		Timeout:            cfg.Upstream.Timeout,
 	}
+}
+
+func nextHopOpts(cfg config.Config) smtpclient.Options {
+	n := cfg.Outbound.NextHop
+	if n.HeloName == "" {
+		n.HeloName = cfg.SMTP.Hostname
+	}
+	return smtpclient.Options{Addr: n.Addr, HeloName: n.HeloName, StartTLS: n.StartTLS,
+		InsecureSkipVerify: n.InsecureSkipVerify, Timeout: n.Timeout}
+}
+
+// holdReviewer avoids storing a typed nil in the interface.
+func holdReviewer(s *outbound.Service) portal.HoldReviewer {
+	if s == nil {
+		return nil
+	}
+	return s
 }
 
 func serveHTTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, name, addr string, h http.Handler) func(context.Context) error {

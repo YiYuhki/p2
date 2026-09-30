@@ -109,3 +109,57 @@ portal:
 - [ ] EICAR 첨부 메일 → 포털에서 차단 확인
 - [ ] 분석 엔진 중지 상태에서 `analysis.timeout × max_attempts` 후 `ERROR`(차단) 전환 확인
 - [ ] `download_events` 테이블에 다운로드 감사 기록 확인
+
+## 7. 발신 메일 DLP 연동
+
+내부 메일 서버가 **외부로 나가는 메일**을 secmail의 outbound 포트(`outbound.listen`, 기본 10025)로 넘기면, secmail이 검사한 뒤 `outbound.next_hop`으로 전달합니다. 정책과 탐지 항목은 [dlp.md](dlp.md)에 있습니다.
+
+- `outbound.allowed_clients`에는 **내부 메일 서버 IP만** 넣으세요. 이 포트는 인증 없이 외부로 릴레이하므로 인터넷에 노출하면 안 됩니다.
+- `MAIL FROM` 도메인은 `sender_domains`(기본값 `smtp.accepted_domains`)만 허용합니다.
+- `next_hop`은 인터넷으로 배달할 수 있는 MTA여야 합니다. secmail은 자체 발송 큐를 두지 않고, next hop이 수락해야만 250으로 응답합니다.
+- 발신 메일은 수정하지 않으므로 내부 서버의 DKIM 서명이 그대로 유지됩니다.
+
+### Postfix (content_filter + 재주입)
+
+```ini
+# /etc/postfix/master.cf
+# 1) 사용자가 보내는 메일(submission)을 secmail로 넘김
+submission inet n - n - - smtpd
+  -o syslog_name=postfix/submission
+  -o smtpd_tls_security_level=encrypt
+  -o smtpd_sasl_auth_enable=yes
+  -o content_filter=smtp:[10.0.5.20]:10025
+
+# 2) secmail이 검사를 마친 메일을 되돌려 받는 재주입 포트 (필터 없음)
+10.0.5.10:10026 inet n - n - - smtpd
+  -o syslog_name=postfix/dlp-reinject
+  -o content_filter=
+  -o receive_override_options=no_unknown_recipient_checks,no_header_body_checks,no_milters
+  -o mynetworks=10.0.5.20/32
+  -o smtpd_client_restrictions=permit_mynetworks,reject
+  -o smtpd_recipient_restrictions=permit_mynetworks,reject
+```
+secmail 설정: `outbound.next_hop.addr: 10.0.5.10:10026`, `outbound.allowed_clients: [10.0.5.10/32]`.
+사내끼리 주고받는 메일도 content_filter를 거치지만, `dlp.scan_internal: false`(기본)면 검사 없이 통과합니다.
+
+### Microsoft Exchange Server
+
+```powershell
+# 인터넷행 Send Connector를 secmail 스마트 호스트로 변경
+Set-SendConnector "Internet" -SmartHosts 10.0.5.20 -SmartHostAuthMechanism None -DNSRoutingEnabled $false -Port 10025
+```
+secmail의 `next_hop`에는 인터넷으로 배달하는 릴레이 MTA를 지정합니다 (예: DMZ의 Postfix relay, ISP 스마트 호스트).
+
+### Microsoft 365 / Google Workspace
+
+- Microsoft 365: Exchange admin center → Mail flow → Connectors → **Office 365 → Partner organization** 커넥터를 만들어 모든 외부 도메인을 secmail로 라우팅합니다 (스마트 호스트 `secmail.example.com:10025`, TLS). `allowed_clients`에는 [Microsoft 365 발신 IP 대역](https://learn.microsoft.com/microsoft-365/enterprise/urls-and-ip-address-ranges)을 넣고, `next_hop`은 인터넷 배달용 relay로 지정합니다.
+- Google Workspace: 관리 콘솔 → Gmail → 라우팅 → **Outbound gateway**에 `secmail.example.com:10025`를 지정합니다. `allowed_clients`는 Google 발신 대역(`_spf.google.com`)입니다.
+- 클라우드 발신 IP 대역은 넓으므로 `sender_domains`를 반드시 좁게 설정하고, 가능하면 상호 TLS 인증을 앞단 프록시에서 적용하세요.
+
+### 점검 항목
+
+- [ ] 내부 서버 외 IP에서 10025 접속 시 `554 Access denied`
+- [ ] 외부 도메인 발신자(`MAIL FROM:<x@other.org>`) → `550 Sender domain not allowed`
+- [ ] 주민번호가 든 xlsx 첨부 → 보류, 보안담당자 메일에 검토 링크
+- [ ] 검토 화면 승인 → 수신자 도착, 반려 → 발신자에게 사유 안내
+- [ ] `dlp_events` 테이블 기록 확인

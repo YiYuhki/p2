@@ -37,5 +37,20 @@ type Store interface {
 	// ListExpired returns non-EXPIRED attachments whose ExpiresAt < now.
 	ListExpired(ctx context.Context, now time.Time, limit int) ([]*model.Attachment, error)
 	MarkExpired(ctx context.Context, id string, at time.Time) error
+
+	// Outbound DLP.
+	CreateHold(ctx context.Context, h *model.Hold) error
+	GetHold(ctx context.Context, id string) (*model.Hold, error)
+	GetHoldByTokenHash(ctx context.Context, tokenHash string) (*model.Hold, error)
+	ListHolds(ctx context.Context, status model.HoldStatus, limit int) ([]*model.Hold, error)
+	// DecideHold moves a HELD hold to status; ErrConflict if already decided.
+	DecideHold(ctx context.Context, id string, status model.HoldStatus, by, reason string, at time.Time) error
+	// ReopenHold returns a RELEASED hold to HELD (used when relaying failed
+	// after the hold was claimed).
+	ReopenHold(ctx context.Context, id string) error
+	// ListExpiredHolds returns HELD holds whose ExpiresAt < now.
+	ListExpiredHolds(ctx context.Context, now time.Time, limit int) ([]*model.Hold, error)
+	RecordDLPEvent(ctx context.Context, ev *model.DLPEvent) error
+	ListDLPEvents(ctx context.Context, limit int) ([]*model.DLPEvent, error)
 	Close()
 }

@@ -1,8 +1,9 @@
-# secmail — 첨부파일 격리형 보안 메일 게이트웨이
+# secmail — 첨부파일 격리 + 발신 DLP 보안 메일 게이트웨이
 
-메일 서버 앞단의 SMTP 프록시입니다. 수신 메일의 첨부파일을 분리해 오브젝트 스토리지에 격리하고,
-본문에는 다운로드 링크 배너를 넣어 실제 메일 서버로 전달합니다. 외부 분석 엔진이 파일을 검사하고,
-`CLEAN` 판정을 받은 파일만 포털에서 받을 수 있습니다.
+메일 서버 앞단의 SMTP 프록시입니다.
+
+- **수신**: 첨부파일을 분리해 오브젝트 스토리지에 격리하고, 본문에는 다운로드 링크 배너를 넣어 실제 메일 서버로 전달합니다. 외부 분석 엔진이 파일을 검사하고, `CLEAN` 판정을 받은 파일만 포털에서 받을 수 있습니다.
+- **발신 (DLP)**: 외부로 나가는 메일의 본문과 첨부파일(docx/xlsx/pptx, hwp/hwpx, pdf, zip 등)에서 주민등록번호, 카드번호, API 키, 개인키 같은 민감정보를 찾아냅니다. 정책에 따라 알림, 보류(관리자 승인), 차단 중 하나를 적용합니다 → [docs/dlp.md](docs/dlp.md)
 
 > 정적/동적 분석 엔진은 **별도 프로젝트**입니다. 연동 규격은 [docs/analyzer-contract.md](docs/analyzer-contract.md),
 > DNS·내부 메일서버(Postfix/Exchange/M365/Google)·포털 운영 설정은 [docs/deployment.md](docs/deployment.md)에 있습니다.
@@ -68,6 +69,13 @@
 - 전송 직전 판정 재확인, `application/octet-stream` + `attachment` 강제, `nosniff`, nonce 기반 CSP, IP별 rate limit.
 - `Sec-Fetch-Site`/`Origin` 검사로 교차 사이트 POST(CSRF) 차단, 인증 페이지에서는 파일명도 노출하지 않음.
 
+### 5. 발신 메일 DLP (`internal/dlp`, `internal/outbound`)
+- 내부 메일 서버의 외부행 메일을 `outbound.listen`(10025)에서 받아 검사한 뒤 `next_hop`으로 전달합니다. 허용된 내부 서버와 자사 발신 도메인만 릴레이할 수 있습니다.
+- 한국 개인정보(주민/외국인등록번호, 여권, 운전면허, 대량 휴대전화)와 카드번호, 클라우드·SaaS API 키, 개인키, DB 접속정보, JWT, 비밀번호를 탐지합니다. 체크섬, 날짜, 문맥 단어, 엔트로피 검사로 오탐을 줄였습니다.
+- 등급별 동작(`allow / notify / hold / block`)을 지정합니다. 발신자와 보안담당자에게 마스킹된 탐지 내역을 메일로 알립니다.
+- 보류된 메일은 포털 검토 화면(`/dlp/<token>`)이나 관리 API에서 승인·반려합니다. 기한이 지나면 발송하지 않고 폐기합니다.
+- 모든 탐지는 `dlp_events` 감사 테이블에 남습니다.
+
 ## 빠른 시작 (Docker)
 
 ```bash
@@ -76,6 +84,8 @@ docker compose -f deploy/docker-compose.yml up --build
 swaks --server localhost:2525 --to user@example.com --attach @report.pdf
 # 내부 메일서버(mailpit)가 받은 메일: http://localhost:8025 → 링크 클릭 → http://localhost:8080/d/...
 # 데모는 otp 모드: 포털에 user@example.com 입력 → 인증 코드 메일도 mailpit에 도착
+# 발신 DLP: 주민번호가 든 메일을 localhost:10025로 보내면 보류 → security@example.com 앞 검토 링크
+swaks --server localhost:10025 --from kim@example.com --to partner@ext.org --body "고객 900101-1234567"
 ```
 S3는 RustFS(MinIO 호환) 컨테이너를 씁니다 (MinIO는 공식 이미지 배포를 중단). 운영에서는 MinIO/AWS S3를 그대로 쓰면 됩니다.
 `mock-analyzer`는 EICAR 문자열이 있으면 `MALICIOUS`, 아니면 `CLEAN`을 회신하는 참고 구현입니다. 실제 분석 프로젝트로 교체하세요.
@@ -109,6 +119,9 @@ cp config.example.yaml config.yaml   # 환경에 맞게 수정
 | `internal/internalapi` | 분석 엔진용 인증 API |
 | `internal/store` | PostgreSQL(내장 마이그레이션) / 메모리 저장소 |
 | `internal/storage` | S3·MinIO / 파일시스템 |
+| `internal/dlp` | 민감정보 탐지기, 첨부 텍스트 추출(Office/HWP/PDF/ZIP) |
+| `internal/outbound` | 발신 DLP 정책(알림/보류/차단), 보류 승인·반려, 알림 메일 |
+| `internal/notify` | 게이트웨이 알림 메일 생성·발송 |
 | `internal/smtpclient` | 업스트림 SMTP 연결 (STARTTLS, 사용자 지정 HELO) |
 | `internal/queue` | Redis / 메모리 큐 |
 
@@ -126,6 +139,8 @@ go test -count=1 ./...
 - MIME 변환: 서명·암호화·한글 파일명/EUC-KR·인라인 이미지·전달 메일·깊은 중첩
 - SMTP 종단간: 릴레이 거부, 업스트림 거부 전달, DKIM 재서명 검증, 파싱 불가 메일 격리
 - 포털: 상태별 화면, 1회용 티켓, 만료, rate limit, OTP 로그인·무차별 대입 제한·비수신자 차단·쿠키 위조, SSO 헤더 모드, CSRF
+- DLP: 탐지기 양성/음성 케이스, 실제 형식(docx·xlsx·중첩 zip·암호화 zip·zip bomb·PDF·HWP 레코드·EUC-KR), 발신 정책 종단간(보류→승인/반려/만료, 차단, 예외, 릴레이 보호), 검토 화면·관리 API
+- 실제 HWP 샘플 검증: `SECMAIL_TEST_HWP_DIR=<pyhwp>/tests/hwp5_tests/fixtures go test ./internal/dlp`
 - 저장소 적합성: 같은 테스트를 메모리/PostgreSQL, 파일시스템/S3에 각각 실행, Redis 큐 우선순위·dead-letter, Redis 티켓/OTP
 
 ## 운영 시 참고

@@ -110,3 +110,45 @@ type JobObject struct {
 	Bucket string `json:"bucket,omitempty"`
 	Key    string `json:"key"`
 }
+
+// ---- outbound DLP ----
+
+type HoldStatus string
+
+const (
+	HoldHeld     HoldStatus = "HELD"     // waiting for an administrator
+	HoldReleased HoldStatus = "RELEASED" // approved and relayed
+	HoldRejected HoldStatus = "REJECTED" // refused by an administrator
+	HoldExpired  HoldStatus = "EXPIRED"  // not decided within hold_ttl (not sent)
+)
+
+// Hold is an outgoing message withheld by DLP policy pending review.
+type Hold struct {
+	ID         string
+	TokenHash  string // review-link token (hash)
+	MailFrom   string
+	RcptTo     []string
+	Subject    string
+	StorageKey string
+	Size       int64
+	Findings   json.RawMessage // dlp.Report
+	Status     HoldStatus
+	CreatedAt  time.Time
+	ExpiresAt  time.Time
+	DecidedAt  *time.Time
+	DecidedBy  string
+	Reason     string
+}
+
+// DLPEvent is the audit record of an outbound message with findings.
+type DLPEvent struct {
+	ID       string
+	MailFrom string
+	RcptTo   []string
+	Subject  string
+	Action   string // allow | notify | hold | block
+	Severity string
+	Findings json.RawMessage
+	HoldID   string
+	At       time.Time
+}
