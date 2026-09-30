@@ -46,6 +46,13 @@ spf:
   # Result is added to Authentication-Results next to dkim= (e.g. "spf=pass smtp.mailfrom=..."),
   # giving the internal server both inputs for DMARC. Requires outbound DNS from the gateway.
 
+dmarc:
+  verify_inbound: true           # evaluate DMARC alignment from the SPF+DKIM results
+  timeout: 5s                    # DNS budget for the _dmarc policy lookup
+  # Adds "dmarc=pass|fail header.from=..." to Authentication-Results. Requires spf and/or
+  # dkim verify_inbound. Evaluation only — the gateway never rejects on DMARC (leave
+  # enforcement to the internal mail server's policy).
+
 portal:
   listen: ":8080"
   public_base_url: https://sec-mail.example.com   # used in the links inserted into mail

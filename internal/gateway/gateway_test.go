@@ -20,6 +20,7 @@ import (
 	"github.com/emersion/go-smtp"
 
 	"github.com/yiyuhki/p2/internal/dkimutil"
+	"github.com/yiyuhki/p2/internal/dmarc"
 	"github.com/yiyuhki/p2/internal/mimeproc"
 	"github.com/yiyuhki/p2/internal/model"
 	"github.com/yiyuhki/p2/internal/queue"
@@ -407,4 +408,33 @@ func TestRecordAuthMetricsParsing(t *testing.T) {
 	recordAuthMetrics("")
 	recordAuthMetrics("garbage; iprev=pass; spf=")
 	// The metric is a global counter; we only assert the parser is robust here.
+}
+
+func TestDMARCResultInAuthResults(t *testing.T) {
+	res := spfResolver{txt: map[string][]string{
+		"ext.org":        {"v=spf1 ip4:203.0.113.0/24 -all"},
+		"_dmarc.ext.org": {"v=DMARC1; p=reject"},
+	}}
+	proc := NewProcessor(stubQ{}, ProcessorOptions{
+		Hostname: "gw.example.com", GatewayID: "test-gw", LinkTTL: time.Hour,
+		VerifySPF: true, VerifyDMARC: true,
+		SPF:   spfutil.New(res, 0),
+		DMARC: dmarc.New(res, 0),
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	raw := "From: Sender <sender@ext.org>\r\nTo: user@example.com\r\nSubject: hi\r\n\r\nbody\r\n"
+	out, err := proc.Process(context.Background(), Envelope{
+		MailFrom: "sender@ext.org", RcptTo: []string{"user@example.com"}, RemoteAddr: "203.0.113.9:2500", Helo: "mail.ext.org",
+	}, []byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, _ := mimeproc.Parse(out)
+	ar := parsed.Header.Get("Authentication-Results")
+	if !strings.Contains(ar, "spf=pass") {
+		t.Fatalf("spf missing: %q", ar)
+	}
+	if !strings.Contains(ar, "dmarc=pass header.from=ext.org") {
+		t.Fatalf("dmarc result missing/wrong: %q", ar)
+	}
 }

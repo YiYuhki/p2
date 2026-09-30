@@ -14,6 +14,7 @@ import (
 	"github.com/emersion/go-smtp"
 
 	"github.com/yiyuhki/p2/internal/dkimutil"
+	"github.com/yiyuhki/p2/internal/dmarc"
 	"github.com/yiyuhki/p2/internal/metrics"
 	"github.com/yiyuhki/p2/internal/mimeproc"
 	"github.com/yiyuhki/p2/internal/model"
@@ -34,12 +35,16 @@ type ProcessorOptions struct {
 	Location      *time.Location
 	VerifyDKIM    bool
 	VerifySPF     bool
+	VerifyDMARC   bool
 	StripOrigDKIM bool
 	Signer        *dkimutil.Signer // nil disables re-signing
 	// LookupTXT overrides DNS for DKIM verification (tests).
 	LookupTXT func(string) ([]string, error)
 	// SPF is the SPF checker; nil disables SPF even when VerifySPF is set.
 	SPF *spfutil.Checker
+	// DMARC is the DMARC evaluator; nil disables DMARC even when VerifyDMARC is
+	// set. DMARC needs SPF and/or DKIM to be enabled to have inputs to align.
+	DMARC *dmarc.Evaluator
 }
 
 // Processor turns an inbound message into the message relayed upstream.
@@ -84,7 +89,7 @@ func (p *Processor) Process(ctx context.Context, env Envelope, raw []byte) ([]by
 	// and the DNS lookups overlap with the CPU-bound MIME parse instead of
 	// adding to it. The buffered channel means the goroutine never leaks even on
 	// the early-return paths that do not consume the result.
-	authCh := make(chan string, 1)
+	authCh := make(chan inboundAuth, 1)
 	go func() { authCh <- p.authenticate(ctx, env, raw) }()
 
 	root, err := mimeproc.Parse(raw)
@@ -124,12 +129,16 @@ func (p *Processor) Process(ctx context.Context, env Envelope, raw []byte) ([]by
 }
 
 func (p *Processor) finish(ctx context.Context, log *slog.Logger, env Envelope, queueID string, root *mimeproc.Part,
-	atts []*mimeproc.Extracted, notice, authResults string, modified bool) ([]byte, error) {
+	atts []*mimeproc.Extracted, notice string, auth inboundAuth, modified bool) ([]byte, error) {
 
 	// RFC 8601 §5: strip any inbound Authentication-Results that claim this
 	// gateway's identity, so a sender cannot forge results downstream filters
 	// would trust as ours. Done unconditionally, even when we do not verify.
 	stripSpoofedAuthResults(&root.Header, p.opts.Hostname)
+
+	// DMARC is evaluated here (not in the concurrent authenticate) because it
+	// needs the parsed From-header domain to check alignment.
+	authResults := p.authResultsHeader(ctx, root, auth)
 
 	msgID := ""
 	if len(atts) > 0 {
@@ -180,20 +189,68 @@ func (p *Processor) finish(ctx context.Context, log *slog.Logger, env Envelope, 
 	return out, nil
 }
 
-// authenticate runs the enabled inbound checks against the original message and
-// returns their combined RFC 8601 method list (e.g. "spf=pass smtp.mailfrom=…;
-// dkim=pass header.d=…"), or "" when nothing is enabled.
-func (p *Processor) authenticate(ctx context.Context, env Envelope, raw []byte) string {
-	var methods []string
+// inboundAuth carries the SPF and DKIM outcomes computed off the original
+// message, both as rendered Authentication-Results fragments and structured for
+// DMARC alignment.
+type inboundAuth struct {
+	methods []string       // rendered spf/dkim fragments, in order
+	spf     spfutil.Result // zero value when SPF is disabled
+	spfOn   bool
+	dkim    []dkimutil.Result // nil when DKIM is disabled
+	dkimOn  bool
+}
+
+// authenticate runs the enabled SPF and DKIM checks against the original
+// message. DMARC is computed later (it needs the parsed From domain).
+func (p *Processor) authenticate(ctx context.Context, env Envelope, raw []byte) inboundAuth {
+	var a inboundAuth
 	if p.opts.VerifySPF && p.opts.SPF != nil {
-		methods = append(methods, p.opts.SPF.Check(ctx, env.RemoteAddr, env.Helo, env.MailFrom))
+		a.spf = p.opts.SPF.CheckResult(ctx, env.RemoteAddr, env.Helo, env.MailFrom)
+		a.spfOn = true
+		a.methods = append(a.methods, a.spf.AuthResults())
 	}
 	if p.opts.VerifyDKIM {
-		methods = append(methods, dkimutil.Verify(raw, p.opts.LookupTXT))
+		a.dkim = dkimutil.VerifyResults(raw, p.opts.LookupTXT)
+		a.dkimOn = true
+		a.methods = append(a.methods, dkimutil.AuthResults(a.dkim))
+	}
+	return a
+}
+
+// authResultsHeader finishes the Authentication-Results value: it appends the
+// DMARC verdict (which needs the From domain from the parsed message), records
+// per-method metrics, and returns the combined method list ("" if nothing ran).
+func (p *Processor) authResultsHeader(ctx context.Context, root *mimeproc.Part, a inboundAuth) string {
+	methods := a.methods
+	if p.opts.VerifyDMARC && p.opts.DMARC != nil && (a.spfOn || a.dkimOn) {
+		from := fromHeaderDomain(root.Header.Get("From"))
+		sigs := make([]dmarc.Signature, len(a.dkim))
+		for i, r := range a.dkim {
+			sigs[i] = dmarc.Signature{Result: r.Value, Domain: r.Domain}
+		}
+		methods = append(methods, p.opts.DMARC.Evaluate(ctx, from, a.spf.Value, a.spf.Domain, sigs))
 	}
 	joined := strings.Join(methods, "; ")
 	recordAuthMetrics(joined)
 	return joined
+}
+
+// fromHeaderDomain extracts the domain of the (first) From-header address.
+func fromHeaderDomain(from string) string {
+	from = mimeproc.DecodeHeader(from)
+	if i := strings.LastIndexByte(from, '@'); i >= 0 {
+		rest := from[i+1:]
+		// Trim address trailing '>' and any following display text / comments.
+		rest = strings.TrimSpace(rest)
+		for j, r := range rest {
+			if r == '>' || r == ' ' || r == '\t' || r == ')' || r == ',' || r == ';' {
+				rest = rest[:j]
+				break
+			}
+		}
+		return strings.ToLower(strings.Trim(rest, ".<>"))
+	}
+	return ""
 }
 
 // recordAuthMetrics parses the RFC 8601 method list and counts each
@@ -210,7 +267,7 @@ func recordAuthMetrics(results string) {
 			continue
 		}
 		name := strings.TrimSpace(kv[0])
-		if name != "spf" && name != "dkim" {
+		if name != "spf" && name != "dkim" && name != "dmarc" {
 			continue
 		}
 		// The result is the token immediately after '='; drop any properties.

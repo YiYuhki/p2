@@ -21,6 +21,7 @@ type Config struct {
 	Rewrite     RewriteConfig     `yaml:"rewrite"`
 	DKIM        DKIMConfig        `yaml:"dkim"`
 	SPF         SPFConfig         `yaml:"spf"`
+	DMARC       DMARCConfig       `yaml:"dmarc"`
 	Portal      PortalConfig      `yaml:"portal"`
 	InternalAPI InternalAPIConfig `yaml:"internal_api"`
 	Storage     StorageConfig     `yaml:"storage"`
@@ -185,6 +186,15 @@ type SPFConfig struct {
 	Timeout       time.Duration `yaml:"timeout"` // per-message DNS budget (default 10s)
 }
 
+// DMARCConfig controls inbound DMARC evaluation. The verdict (dmarc=pass/fail)
+// is added to Authentication-Results; the gateway does not reject on it
+// (enforcement is left to the internal mail server's policy). Requires SPF
+// and/or DKIM verification to be enabled to have inputs to align.
+type DMARCConfig struct {
+	VerifyInbound bool          `yaml:"verify_inbound"`
+	Timeout       time.Duration `yaml:"timeout"` // DNS budget for the policy lookup (default 5s)
+}
+
 type DKIMConfig struct {
 	VerifyInbound  bool   `yaml:"verify_inbound"`
 	StripOriginal  bool   `yaml:"strip_original"`
@@ -322,8 +332,9 @@ func Default() Config {
 			EncryptedPolicy:  PolicyPassthrough,
 			GatewayID:        "secmail",
 		},
-		DKIM: DKIMConfig{StripOriginal: true},
-		SPF:  SPFConfig{Timeout: 10 * time.Second},
+		DKIM:  DKIMConfig{StripOriginal: true},
+		SPF:   SPFConfig{Timeout: 10 * time.Second},
+		DMARC: DMARCConfig{Timeout: 5 * time.Second},
 		Portal: PortalConfig{
 			Listen:         ":8080",
 			PublicBaseURL:  "http://localhost:8080",
@@ -392,6 +403,9 @@ func (c *Config) Validate() error {
 	}
 	if len(c.SMTP.AcceptedDomains) == 0 {
 		errs = append(errs, errors.New("smtp.accepted_domains must not be empty (open relay protection)"))
+	}
+	if c.DMARC.VerifyInbound && !c.SPF.VerifyInbound && !c.DKIM.VerifyInbound {
+		errs = append(errs, errors.New("dmarc.verify_inbound requires spf.verify_inbound and/or dkim.verify_inbound"))
 	}
 	for i, d := range c.SMTP.AcceptedDomains {
 		c.SMTP.AcceptedDomains[i] = strings.ToLower(strings.TrimSpace(d))

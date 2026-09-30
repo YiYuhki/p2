@@ -33,27 +33,50 @@ func New(resolver Resolver, timeout time.Duration) *Checker {
 	return &Checker{resolver: resolver, timeout: timeout}
 }
 
-// Check evaluates SPF for the given client IP, HELO name and MAIL FROM, and
-// returns an Authentication-Results method result such as
-// "spf=pass smtp.mailfrom=example.com". When MAIL FROM carries no usable domain
-// (a null return-path bounce, or a bare address), SPF is evaluated against the
-// HELO identity per RFC 7208 §2.4; if neither yields an identity the result is
-// "spf=none". The reported identity always matches the domain actually checked.
+// Result is a structured SPF outcome. Ident is the property name
+// ("smtp.mailfrom" or "smtp.helo") and Domain the domain actually evaluated —
+// what DMARC needs for alignment.
+type Result struct {
+	Value  string // pass/fail/softfail/neutral/none/temperror/permerror
+	Ident  string // smtp.mailfrom | smtp.helo | ""
+	Domain string // the evaluated domain, or ""
+}
+
+// AuthResults renders the RFC 8601 method fragment, e.g.
+// "spf=pass smtp.mailfrom=example.com".
+func (r Result) AuthResults() string {
+	if r.Ident == "" || r.Domain == "" {
+		return "spf=" + r.Value
+	}
+	return "spf=" + r.Value + " " + r.Ident + "=" + r.Domain
+}
+
+// Check evaluates SPF and returns the rendered Authentication-Results fragment.
 func (c *Checker) Check(ctx context.Context, remoteAddr, helo, mailFrom string) string {
+	return c.CheckResult(ctx, remoteAddr, helo, mailFrom).AuthResults()
+}
+
+// CheckResult evaluates SPF for the given client IP, HELO name and MAIL FROM.
+// When MAIL FROM carries no usable domain (a null return-path bounce, or a bare
+// address), SPF is evaluated against the HELO identity per RFC 7208 §2.4; if
+// neither yields an identity the result is "none". The reported identity always
+// matches the domain actually checked.
+func (c *Checker) CheckResult(ctx context.Context, remoteAddr, helo, mailFrom string) Result {
 	ip := parseIP(remoteAddr)
 	if ip == nil {
-		return "spf=none"
+		return Result{Value: "none"}
 	}
 	helo = authres.Sanitize(helo)
 
-	var sender, idKey, idVal string
+	var sender string
+	res := Result{}
 	if d := domainOf(mailFrom); d != "" {
 		sender = strings.Trim(strings.TrimSpace(mailFrom), "<>")
-		idKey, idVal = "smtp.mailfrom", d
+		res.Ident, res.Domain = "smtp.mailfrom", d
 	} else if helo != "" {
-		sender, idKey, idVal = "postmaster@"+helo, "smtp.helo", helo
+		sender, res.Ident, res.Domain = "postmaster@"+helo, "smtp.helo", helo
 	} else {
-		return "spf=none" // nothing to authenticate
+		return Result{Value: "none"} // nothing to authenticate
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
@@ -63,8 +86,9 @@ func (c *Checker) Check(ctx context.Context, remoteAddr, helo, mailFrom string) 
 		opts = append(opts, spf.WithResolver(c.resolver))
 	}
 
-	res, _ := spf.CheckHostWithSender(ip, helo, sender, opts...)
-	return "spf=" + string(res) + " " + idKey + "=" + idVal
+	r, _ := spf.CheckHostWithSender(ip, helo, sender, opts...)
+	res.Value = string(r)
+	return res
 }
 
 func parseIP(remoteAddr string) net.IP {

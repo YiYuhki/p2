@@ -34,6 +34,7 @@ import (
 	"github.com/yiyuhki/p2/internal/config"
 	"github.com/yiyuhki/p2/internal/dkimutil"
 	"github.com/yiyuhki/p2/internal/dlp"
+	"github.com/yiyuhki/p2/internal/dmarc"
 	"github.com/yiyuhki/p2/internal/gateway"
 	"github.com/yiyuhki/p2/internal/internalapi"
 	"github.com/yiyuhki/p2/internal/mimeproc"
@@ -271,6 +272,10 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		if cfg.SPF.VerifyInbound {
 			spfChecker = spfutil.New(nil, cfg.SPF.Timeout) // nil = system resolver
 		}
+		var dmarcEval *dmarc.Evaluator
+		if cfg.DMARC.VerifyInbound {
+			dmarcEval = dmarc.New(nil, cfg.DMARC.Timeout) // nil = system resolver
+		}
 		proc := gateway.NewProcessor(svc, gateway.ProcessorOptions{
 			Hostname:  cfg.SMTP.Hostname,
 			GatewayID: cfg.Rewrite.GatewayID,
@@ -283,9 +288,11 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			Location:      loc,
 			VerifyDKIM:    cfg.DKIM.VerifyInbound,
 			VerifySPF:     cfg.SPF.VerifyInbound,
+			VerifyDMARC:   cfg.DMARC.VerifyInbound,
 			StripOrigDKIM: cfg.DKIM.StripOriginal,
 			Signer:        signer,
 			SPF:           spfChecker,
+			DMARC:         dmarcEval,
 		}, log)
 		be := gateway.NewBackend(proc, gateway.BackendOptions{
 			RecipientDomains: cfg.SMTP.AcceptedDomains,

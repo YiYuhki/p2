@@ -90,18 +90,43 @@ func (s *Signer) Sign(msg []byte) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-// Verify checks the original DKIM signatures and renders the result as an
-// RFC 8601 Authentication-Results method list ("dkim=pass header.d=...").
-func Verify(msg []byte, lookup func(string) ([]string, error)) string {
+// Result is a structured per-signature DKIM outcome: the verification result
+// and the signing domain (d=), which DMARC needs for alignment.
+type Result struct {
+	Value  string // pass/fail/temperror/permerror
+	Domain string // header.d
+}
+
+// AuthResults renders the RFC 8601 method list ("dkim=pass header.d=...").
+// A "none"/"temperror" pseudo-result (no signatures) renders as a single method.
+func AuthResults(rs []Result) string {
+	if len(rs) == 0 {
+		return "dkim=none"
+	}
+	parts := make([]string, 0, len(rs))
+	for _, r := range rs {
+		if r.Domain == "" {
+			parts = append(parts, "dkim="+r.Value)
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("dkim=%s header.d=%s", r.Value, authres.Sanitize(r.Domain)))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// VerifyResults checks the original DKIM signatures and returns one Result per
+// signature. A nil slice means no signatures were present; a single {temperror}
+// means verification could not run at all.
+func VerifyResults(msg []byte, lookup func(string) ([]string, error)) []Result {
 	opts := &dkim.VerifyOptions{MaxVerifications: 5, LookupTXT: lookup}
 	vs, err := dkim.VerifyWithOptions(bytes.NewReader(msg), opts)
 	if err != nil && len(vs) == 0 {
-		return "dkim=temperror"
+		return []Result{{Value: "temperror"}}
 	}
 	if len(vs) == 0 {
-		return "dkim=none"
+		return nil
 	}
-	parts := make([]string, 0, len(vs))
+	out := make([]Result, 0, len(vs))
 	for _, v := range vs {
 		res := "pass"
 		switch {
@@ -113,7 +138,13 @@ func Verify(msg []byte, lookup func(string) ([]string, error)) string {
 		default:
 			res = "fail"
 		}
-		parts = append(parts, fmt.Sprintf("dkim=%s header.d=%s", res, authres.Sanitize(v.Domain)))
+		out = append(out, Result{Value: res, Domain: v.Domain})
 	}
-	return strings.Join(parts, "; ")
+	return out
+}
+
+// Verify checks the original DKIM signatures and renders the result as an
+// RFC 8601 Authentication-Results method list ("dkim=pass header.d=...").
+func Verify(msg []byte, lookup func(string) ([]string, error)) string {
+	return AuthResults(VerifyResults(msg, lookup))
 }
