@@ -59,7 +59,7 @@ type Store interface {
 // EventFilter narrows a DLP event listing. Empty fields match anything.
 type EventFilter struct {
 	Action   string // allow | notify | hold | block | exempt
-	Severity string // high | medium | low | uninspectable | encrypted
+	Severity string // none | low | medium | high (the recorded MaxSeverity)
 }
 
 // Page is a keyset pagination cursor for the admin list endpoints. Rows are

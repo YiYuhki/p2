@@ -90,7 +90,8 @@ func limitParam(r *http.Request, def int) int {
 func (a *API) listHolds(w http.ResponseWriter, r *http.Request) {
 	st := model.HoldStatus(strings.ToUpper(r.URL.Query().Get("status")))
 	limit := limitParam(r, 50)
-	hs, err := a.store.ListHolds(r.Context(), st, limit, decodeCursor(r.URL.Query().Get("cursor")))
+	page, _ := decodeCursor(r.URL.Query().Get("cursor"))
+	hs, err := a.store.ListHolds(r.Context(), st, limit, page)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errBody("internal error"))
 		return
@@ -101,34 +102,43 @@ func (a *API) listHolds(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(hs) == limit {
 		last := hs[len(hs)-1]
-		w.Header().Set("X-Next-Cursor", encodeCursor(last.CreatedAt, last.ID))
+		w.Header().Set("X-Next-Cursor", encodeCursor(last.CreatedAt, last.ID, store.EventFilter{}))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
 
-// encodeCursor / decodeCursor carry a keyset position (time + id) as an opaque
-// base64 token in the X-Next-Cursor header and the ?cursor= query parameter.
-func encodeCursor(t time.Time, id string) string {
-	return base64.RawURLEncoding.EncodeToString([]byte(strconv.FormatInt(t.UnixNano(), 10) + "|" + id))
+// encodeCursor / decodeCursor carry a keyset position (time + id) and, for the
+// events list, the active filter as an opaque base64 token in the X-Next-Cursor
+// header and the ?cursor= query parameter. Carrying the filter means a client
+// can page a filtered list by passing ?cursor= alone without the second page
+// silently reverting to unfiltered.
+func encodeCursor(t time.Time, id string, f store.EventFilter) string {
+	raw := strings.Join([]string{strconv.FormatInt(t.UnixNano(), 10), id, f.Action, f.Severity}, "\x00")
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
 }
 
-func decodeCursor(s string) store.Page {
+func decodeCursor(s string) (store.Page, store.EventFilter) {
 	if s == "" {
-		return store.Page{}
+		return store.Page{}, store.EventFilter{}
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(s)
 	if err != nil {
-		return store.Page{}
+		return store.Page{}, store.EventFilter{}
 	}
-	ns, id, ok := strings.Cut(string(raw), "|")
-	if !ok {
-		return store.Page{}
+	parts := strings.Split(string(raw), "\x00")
+	if len(parts) < 2 {
+		return store.Page{}, store.EventFilter{}
 	}
-	n, err := strconv.ParseInt(ns, 10, 64)
+	n, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
-		return store.Page{}
+		return store.Page{}, store.EventFilter{}
 	}
-	return store.Page{Before: time.Unix(0, n).UTC(), BeforeID: id}
+	page := store.Page{Before: time.Unix(0, n).UTC(), BeforeID: parts[1]}
+	var f store.EventFilter
+	if len(parts) >= 4 {
+		f = store.EventFilter{Action: parts[2], Severity: parts[3]}
+	}
+	return page, f
 }
 
 func (a *API) getHold(w http.ResponseWriter, r *http.Request) {
@@ -183,18 +193,24 @@ func (a *API) decide(release bool) http.HandlerFunc {
 
 func (a *API) listEvents(w http.ResponseWriter, r *http.Request) {
 	limit := limitParam(r, 100)
-	filter := store.EventFilter{
-		Action:   strings.ToLower(strings.TrimSpace(r.URL.Query().Get("action"))),
-		Severity: strings.ToLower(strings.TrimSpace(r.URL.Query().Get("severity"))),
+	page, curFilter := decodeCursor(r.URL.Query().Get("cursor"))
+	// On the first page the filter comes from the query; on subsequent pages it
+	// is taken from the cursor so paging cannot silently drop it.
+	filter := curFilter
+	if !page.Set() {
+		filter = store.EventFilter{
+			Action:   strings.ToLower(strings.TrimSpace(r.URL.Query().Get("action"))),
+			Severity: strings.ToLower(strings.TrimSpace(r.URL.Query().Get("severity"))),
+		}
 	}
-	evs, err := a.store.ListDLPEvents(r.Context(), filter, limit, decodeCursor(r.URL.Query().Get("cursor")))
+	evs, err := a.store.ListDLPEvents(r.Context(), filter, limit, page)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errBody("internal error"))
 		return
 	}
 	if len(evs) == limit {
 		last := evs[len(evs)-1]
-		w.Header().Set("X-Next-Cursor", encodeCursor(last.At, last.ID))
+		w.Header().Set("X-Next-Cursor", encodeCursor(last.At, last.ID, filter))
 	}
 	type evJSON struct {
 		ID       string          `json:"id"`

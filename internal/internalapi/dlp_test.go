@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/yiyuhki/p2/internal/model"
 	"github.com/yiyuhki/p2/internal/storage"
 	"github.com/yiyuhki/p2/internal/store"
@@ -159,3 +161,55 @@ func httpNewGet(url, bearer string) (*http.Request, error) {
 }
 
 func httpDo(req *http.Request) (*http.Response, error) { return http.DefaultClient.Do(req) }
+
+func TestDLPEventsFilteredPaginationKeepsFilter(t *testing.T) {
+	st := store.NewMemory()
+	obj, _ := storage.NewFS(t.TempDir())
+	base0 := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	// 3 block + 3 notify events, interleaved in time.
+	for i := 0; i < 6; i++ {
+		action := "block"
+		if i%2 == 1 {
+			action = "notify"
+		}
+		st.RecordDLPEvent(context.Background(), &model.DLPEvent{ID: uuid.NewString(), MailFrom: "a@ex.org",
+			RcptTo: []string{"x@ext.org"}, Action: action, Severity: "high", Findings: json.RawMessage(`{}`),
+			At: base0.Add(time.Duration(i) * time.Minute)})
+	}
+	api := New(st, obj, nil, secret, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	const admin = "admin-token-0123456789"
+	api.EnableDLPAdmin(admin, reviewer{st})
+	srv := httptest.NewServer(api.Handler())
+	defer srv.Close()
+
+	get := func(url string) (string, int) {
+		req, _ := httpNewGet(url, admin)
+		resp, err := httpDo(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		var evs []struct {
+			Action string `json:"action"`
+		}
+		json.Unmarshal(b, &evs)
+		for _, e := range evs {
+			if e.Action != "block" {
+				t.Fatalf("filtered page leaked a %q event", e.Action)
+			}
+		}
+		return resp.Header.Get("X-Next-Cursor"), len(evs)
+	}
+
+	// limit=2 over 3 block events: page 1 (2) + page 2 via cursor alone (1).
+	cursor, n1 := get(srv.URL + "/internal/v1/dlp/events?action=block&limit=2")
+	if n1 != 2 || cursor == "" {
+		t.Fatalf("page1: n=%d cursor=%q", n1, cursor)
+	}
+	// Deliberately omit action= on page 2 — the cursor must carry it.
+	_, n2 := get(srv.URL + "/internal/v1/dlp/events?limit=2&cursor=" + cursor)
+	if n2 != 1 {
+		t.Fatalf("page2 should have the last block event only, got %d", n2)
+	}
+}
