@@ -151,18 +151,29 @@ func TestOCRLimitsAndTimeouts(t *testing.T) {
 func TestHEICReported(t *testing.T) {
 	heic := append([]byte{0, 0, 0, 24}, []byte("ftypheic\x00\x00\x00\x00mif1heic")...)
 	e := Extract("첨부 IMG_0001.HEIC", "IMG_0001.HEIC", heic, DefaultLimits())
-	if len(e.Problems) != 1 || !strings.Contains(e.Problems[0], "HEIC") {
-		t.Fatalf("heic: %+v", e.Problems)
+	if len(e.Images) != 1 || e.Images[0].Kind != KindHEIF {
+		t.Fatalf("heic: %+v", e.Images)
+	}
+	// With OCR on but no converter, the photo is reported as uninspectable.
+	s, _ := NewScanner(Options{ScanAttachments: true, OCR: OCROptions{Engine: &fakeOCR{}}})
+	msg := "Subject: x\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\nContent-Type: image/heic; name=a.heic\r\n" +
+		"Content-Transfer-Encoding: base64\r\n\r\n" + base64.StdEncoding.EncodeToString(heic) + "\r\n--B--\r\n"
+	rep := s.ScanMessage(context.Background(), []byte(msg))
+	if len(rep.Uninspectable) != 1 || !strings.Contains(rep.Uninspectable[0], "HEIC") {
+		t.Fatalf("heic without converter: %v", rep.Uninspectable)
 	}
 }
 
 func TestNormalizeOCR(t *testing.T) {
 	cases := map[string]string{
-		"900101 - l234567":     "900101-1234567",
-		"4111 –  1111":         "4111-1111",
-		"O1O-1234-5678":        "010-1234-5678",
-		"Hello Illinois":       "Hello Illinois", // words untouched
-		"AKIAIOSFODNN7EXAMPLE": "AKIAIOSFODNN7EXAMPLE",
+		"900101 - l234567":           "900101-1234567",
+		"4111 –  1111":               "4111-1111",
+		"O1O-1234-5678":              "010-1234-5678",
+		"Hello Illinois":             "Hello Illinois", // words untouched
+		"AKIAIOSFODNN7EXAMPLE":       "AKIAIOSFODNN7EXAMPLE",
+		"주 민 등 록 번 호 900101-1234567": "주민등록번호 900101-1234567",
+		"여 권 번 호 M12345678":          "여권번호 M12345678",
+		"그 사람의 전화":                   "그 사람의 전화",
 	}
 	for in, want := range cases {
 		if got := NormalizeOCR(in); got != want {
@@ -190,9 +201,21 @@ func TestImagesFromDocxHwpxAndPDF(t *testing.T) {
 	jpg := encJPEG(image.NewGray(image.Rect(0, 0, 64, 32)))
 	pdf := scannedPDF(t, jpg, flateRGBWithPredictor(t, 8, 4))
 	e = Extract("첨부 scan.pdf", "scan.pdf", pdf, DefaultLimits())
-	if len(e.Images) != 2 {
-		t.Fatalf("pdf images: %d %+v", len(e.Images), e.Problems)
+	var raster []Image
+	pdfRender := 0
+	for _, im := range e.Images {
+		switch im.Kind {
+		case KindRaster:
+			raster = append(raster, im)
+		case KindPDF:
+			pdfRender++
+		}
 	}
+	// DCT + Flate decoded in Go; the JBIG2 object queues page rendering.
+	if len(raster) != 2 || pdfRender != 1 {
+		t.Fatalf("pdf images: raster=%d render=%d", len(raster), pdfRender)
+	}
+	e.Images = raster
 	if !bytes.Equal(e.Images[0].Data, jpg) {
 		t.Error("DCT image must be passed through unchanged")
 	}
@@ -288,7 +311,14 @@ func TestTesseractEndToEnd(t *testing.T) {
 	// 3. Scanned PDF (JPEG page image, no text layer).
 	pdf := scannedPDF(t, encJPEG(doc), flateRGBWithPredictor(t, 8, 4))
 	e := Extract("첨부 scan.pdf", "scan.pdf", pdf, DefaultLimits())
-	text, err := eng.Recognize(context.Background(), e.Images[0].Data)
+	var page []byte
+	for _, im := range e.Images {
+		if im.Kind == KindRaster {
+			page = im.Data // the DCT page image
+			break
+		}
+	}
+	text, err := eng.Recognize(context.Background(), page)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,9 +340,18 @@ func TestPDFFilterChainASCII85Flate(t *testing.T) {
 	pdf := fmt.Sprintf("%%PDF-1.4\n1 0 obj\n<< /Type /XObject /Subtype /Image /Width 6 /Height 2 /ColorSpace /DeviceGray "+
 		"/BitsPerComponent 8 /Filter [ /ASCII85Decode /FlateDecode ] /Length %d >>\nstream\n%s\nendstream\nendobj\n", len(stream), stream)
 	e := Extract("x.pdf", "x.pdf", []byte(pdf), DefaultLimits())
-	if len(e.Images) != 1 {
-		t.Fatalf("images=%d problems=%v", len(e.Images), e.Problems)
+	// The minimal file has no xref, so it is also queued for poppler; the
+	// raw image scan must still find the picture.
+	var raster []Image
+	for _, im := range e.Images {
+		if im.Kind == KindRaster {
+			raster = append(raster, im)
+		}
 	}
+	if len(raster) != 1 {
+		t.Fatalf("images=%+v problems=%v", e.Images, e.Problems)
+	}
+	e.Images = raster
 	img, err := png.Decode(bytes.NewReader(e.Images[0].Data))
 	if err != nil {
 		t.Fatal(err)

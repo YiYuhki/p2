@@ -36,8 +36,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: install tesseract (OCR tests)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-kor tesseract-ocr-eng fonts-nanum
+      - name: install OCR tools (tesseract, libheif, poppler)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-kor tesseract-ocr-eng fonts-nanum libheif-examples libheif-plugin-libde265 libheif-plugin-dav1d poppler-utils
       - name: gofmt
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - run: go vet ./...

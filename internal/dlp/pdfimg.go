@@ -11,15 +11,19 @@ import (
 	"io"
 	"regexp"
 	"strconv"
+
+	"golang.org/x/image/ccitt"
 )
 
 // pdfImages extracts image XObjects from a PDF so that scanned pages can be
 // OCR'd. Image streams are always top-level indirect objects, so a byte
 // scan for "obj ... stream" is sufficient without a full PDF parser.
 //
-// Supported: DCTDecode (JPEG, used by virtually all scanners) and
-// FlateDecode 8-bit Gray/RGB with or without PNG predictors. JBIG2, CCITT
-// and JPEG2000 images are reported as uninspectable.
+// Decoded in Go: DCTDecode (JPEG), FlateDecode 8-bit Gray/RGB (with PNG
+// predictors), ASCII85/ASCIIHex chains and CCITT Group 4 / Group 3 1-D.
+// If any image uses another codec (JBIG2, JPEG2000, CCITT 2-D, ...), the
+// whole PDF is additionally queued for page rendering with poppler; the OCR
+// stage then drops the individually extracted images of that PDF.
 func (x *extractor) pdfImages(loc string, data []byte) {
 	n, unsupported := 0, 0
 	for i := 0; ; {
@@ -73,7 +77,8 @@ func (x *extractor) pdfImages(loc string, data []byte) {
 		}
 	}
 	if unsupported > 0 {
-		x.problem(loc, fmt.Sprintf("이미지 %d개가 OCR 미지원 형식(JBIG2/CCITT/JPEG2000 등)", unsupported))
+		x.addPDFRender(loc, data,
+			fmt.Sprintf("이미지 %d개가 JBIG2/JPEG2000 등 형식 (렌더링 도구 없음, 검사 불가)", unsupported), false)
 	}
 }
 
@@ -133,6 +138,19 @@ func decodePDFImage(dict, raw []byte) ([]byte, error) {
 				return nil, fmt.Errorf("DCT not last in chain")
 			}
 			return data, nil // a complete JPEG file
+		case "CCITTFaxDecode", "CCF":
+			if !last {
+				return nil, fmt.Errorf("CCITT not last in chain")
+			}
+			img, err := ccittImage(dict, data)
+			if err != nil {
+				return nil, err
+			}
+			var buf bytes.Buffer
+			if err := png.Encode(&buf, img); err != nil {
+				return nil, err
+			}
+			return buf.Bytes(), nil
 		default: // JBIG2Decode, CCITTFaxDecode, JPXDecode, RunLength, LZW...
 			return nil, fmt.Errorf("unsupported filter %s", f)
 		}
@@ -149,6 +167,50 @@ func decodePDFImage(dict, raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+var (
+	reK    = regexp.MustCompile(`/K\s+(-?\d+)`)
+	reRows = regexp.MustCompile(`/Rows\s+(\d+)`)
+	reEBA  = regexp.MustCompile(`/EncodedByteAlign\s+(true|false)`)
+)
+
+// ccittImage decodes CCITT fax data (K<0: Group 4, K=0: Group 3 1-D).
+// Mixed 2-D Group 3 (K>0) is left to page rendering.
+func ccittImage(dict, data []byte) (*image.Gray, error) {
+	k := pdfInt(dict, reK, 0)
+	var sf ccitt.SubFormat
+	switch {
+	case k < 0:
+		sf = ccitt.Group4
+	case k == 0:
+		sf = ccitt.Group3
+	default:
+		return nil, fmt.Errorf("CCITT K>0 not supported")
+	}
+	cols := pdfInt(dict, reColumns, pdfInt(dict, reWidth, 1728))
+	rows := pdfInt(dict, reRows, pdfInt(dict, reHeight, 0))
+	if cols <= 0 || rows <= 0 || cols*rows > 60_000_000 {
+		return nil, fmt.Errorf("CCITT geometry")
+	}
+	opts := &ccitt.Options{Align: bytes.Contains(reEBA.Find(dict), []byte("true"))}
+	img := image.NewGray(image.Rect(0, 0, cols, rows))
+	if err := ccitt.DecodeIntoGray(img, bytes.NewReader(data), ccitt.MSB, sf, opts); err != nil {
+		return nil, err
+	}
+	// BlackIs1 and /Decode arrays can flip polarity; OCR wants dark text on
+	// a light page, and document pages are mostly white, so normalise by the
+	// mean brightness instead of trusting the flags.
+	sum := 0
+	for _, v := range img.Pix {
+		sum += int(v)
+	}
+	if sum/len(img.Pix) < 128 {
+		for i := range img.Pix {
+			img.Pix[i] = 255 - img.Pix[i]
+		}
+	}
+	return img, nil
 }
 
 func decodeASCII85(b []byte) ([]byte, error) {
@@ -182,8 +244,12 @@ func decodeASCIIHex(b []byte) ([]byte, error) {
 // predictors when present.
 func pixelsImage(dict, pix []byte) (image.Image, error) {
 	w, h := pdfInt(dict, reWidth, 0), pdfInt(dict, reHeight, 0)
-	if w <= 0 || h <= 0 || w*h > 60_000_000 || pdfInt(dict, reBPC, 8) != 8 {
+	bpc := pdfInt(dict, reBPC, 8)
+	if w <= 0 || h <= 0 || w*h > 60_000_000 || (bpc != 8 && bpc != 1) {
 		return nil, fmt.Errorf("unsupported image geometry")
+	}
+	if bpc == 1 {
+		return bilevelImage(dict, pix, w, h)
 	}
 	var err error
 	pred := pdfInt(dict, rePredictor, 1)
@@ -219,6 +285,38 @@ func pixelsImage(dict, pix []byte) (image.Image, error) {
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
 	for p, q := 0, 0; p+2 < len(pix) && q+3 < len(img.Pix); p, q = p+3, q+4 {
 		img.Pix[q], img.Pix[q+1], img.Pix[q+2], img.Pix[q+3] = pix[p], pix[p+1], pix[p+2], 0xFF
+	}
+	return img, nil
+}
+
+// bilevelImage unpacks 1-bit rows (MSB first, rows padded to a byte);
+// 0 = black for DeviceGray. Polarity is normalised by mean brightness.
+func bilevelImage(dict, pix []byte, w, h int) (image.Image, error) {
+	stride := (w + 7) / 8
+	if pdfInt(dict, rePredictor, 1) >= 10 {
+		var err error
+		if pix, err = unpredictPNG(pix, stride, 1, h); err != nil {
+			return nil, err
+		}
+	}
+	if len(pix) < stride*h {
+		return nil, fmt.Errorf("short bilevel data")
+	}
+	img := image.NewGray(image.Rect(0, 0, w, h))
+	white := 0
+	for y := 0; y < h; y++ {
+		row := pix[y*stride:]
+		for x := 0; x < w; x++ {
+			if row[x/8]&(0x80>>(x%8)) != 0 {
+				img.Pix[y*w+x] = 0xFF
+				white++
+			}
+		}
+	}
+	if white*2 < w*h {
+		for i := range img.Pix {
+			img.Pix[i] = 255 - img.Pix[i]
+		}
 	}
 	return img, nil
 }

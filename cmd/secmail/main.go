@@ -159,9 +159,15 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			}
 			log.Info("dlp OCR enabled", "engine", "tesseract", "languages", o.Languages)
 		}
+		o := cfg.DLP.OCR
+		conv := dlp.DetectConverter(o.HEIFCommand, o.PDFRenderCommand, o.PDFTextCommand,
+			o.PDFScaleTo, o.PDFMaxPages, o.MaxProcesses)
+		log.Info("dlp converters", "heif", orNone(conv.HEIFCmd), "pdf_render", orNone(conv.PDFToPPMCmd),
+			"pdf_text", orNone(conv.PDFToTextCmd))
 		scanner, err := dlp.NewScanner(dlp.Options{
 			Disabled: cfg.DLP.Disabled, MinCounts: cfg.DLP.MinCounts, Rules: rules,
 			ScanAttachments: cfg.DLP.ScanAttachments, Limits: dlp.DefaultLimits(), OCR: ocr,
+			Converter: conv,
 		})
 		if err != nil {
 			return err
@@ -358,6 +364,13 @@ func upstreamOpts(cfg config.Config) smtpclient.Options {
 		InsecureSkipVerify: cfg.Upstream.InsecureSkipVerify,
 		Timeout:            cfg.Upstream.Timeout,
 	}
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "none (reported as uninspectable)"
+	}
+	return s
 }
 
 func nextHopOpts(cfg config.Config) smtpclient.Options {

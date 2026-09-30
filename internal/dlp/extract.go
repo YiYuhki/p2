@@ -118,7 +118,8 @@ func (x *extractor) file(loc, name string, data []byte, depth int) {
 	case isImage(data):
 		x.addImage(loc, data)
 	case isHEIF(data):
-		x.problem(loc, "HEIC/AVIF 이미지 (OCR 미지원, 검사 불가)")
+		x.images = append(x.images, Image{Location: loc, Data: data, Kind: KindHEIF,
+			Reason: "HEIC/AVIF 이미지 (변환 도구 없음, 검사 불가)"})
 	case isTextLike(ext, data):
 		x.add(loc, decodeText(data))
 	case ext == ".eml" || bytes.HasPrefix(data, []byte("From:")) || bytes.HasPrefix(data, []byte("Received:")):
@@ -508,21 +509,37 @@ func printableRuns(b []byte) string {
 
 // ---- PDF ----
 
-func (x *extractor) pdf(loc string, data []byte) {
+// addPDFRender queues the whole PDF for poppler (once per location).
+func (x *extractor) addPDFRender(loc string, data []byte, reason string, needText bool) {
+	for i := range x.images {
+		if x.images[i].Kind == KindPDF && x.images[i].Location == loc {
+			x.images[i].NeedText = x.images[i].NeedText || needText
+			return
+		}
+	}
+	x.images = append(x.images, Image{Location: loc, Data: data, Kind: KindPDF, Reason: reason, NeedText: needText})
+}
+
+// pdf extracts the text layer. When the built-in parser cannot open the file
+// (owner/user password, unusual structure), the whole PDF is handed to the
+// OCR stage for poppler (pdftotext + page rendering); it returns false then.
+func (x *extractor) pdf(loc string, data []byte) bool {
+	fallback := func(reason string) bool {
+		x.addPDFRender(loc, data, reason, true)
+		return false
+	}
 	r, err := pdf.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
-		if err == pdf.ErrInvalidPassword {
-			x.problem(loc, "암호가 설정된 PDF (검사 불가)")
-		} else {
-			x.problem(loc, "PDF 해석 실패")
+		if err == pdf.ErrInvalidPassword || bytes.Contains(data, []byte("/Encrypt")) {
+			return fallback("암호가 설정된 PDF (검사 불가)")
 		}
-		return
+		return fallback("PDF 해석 실패")
 	}
 	tr, err := r.GetPlainText()
 	if err != nil {
-		x.problem(loc, "PDF 텍스트 추출 실패")
-		return
+		return fallback("PDF 텍스트 추출 실패")
 	}
 	b, _ := io.ReadAll(io.LimitReader(tr, int64(x.lim.MaxTextPerFile)))
 	x.add(loc, string(b))
+	return true
 }

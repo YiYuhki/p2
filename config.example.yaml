@@ -129,6 +129,12 @@ dlp:
     total_timeout: 60s             # per message
     concurrency: 2                 # images OCR'd in parallel per message
     max_processes: 4               # tesseract processes for the whole server
+    # external converters (auto-detected on PATH; "none" disables):
+    # heif_command: heif-dec         # HEIC/AVIF photos (libheif)
+    # pdf_render_command: pdftoppm   # JBIG2/JPEG2000 scans, restricted PDFs (poppler)
+    # pdf_text_command: pdftotext    # text layer of PDFs the built-in parser rejects
+    pdf_max_pages: 10              # pages rendered per PDF
+    pdf_scale_to: 2400             # rendered page long side in pixels (~A4 @ 200 dpi)
   # disabled: [jwt, email_address]         # built-in detector IDs to turn off
   # min_counts: {kr_mobile: 10}            # bulk thresholds per location
   # exempt_senders: [payroll-bot@example.com]

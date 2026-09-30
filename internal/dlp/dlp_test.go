@@ -256,9 +256,17 @@ func TestPDF(t *testing.T) {
 	if _, ok := ids(newScanner(t).ScanText("x", texts[0].Content))["aws_access_key"]; !ok {
 		t.Fatalf("pdf text: %q", texts[0].Content)
 	}
-	_, probs = ExtractText("첨부 e.pdf", "e.pdf", []byte("%PDF-1.4 garbage"), DefaultLimits())
-	if len(probs) == 0 {
-		t.Fatal("broken pdf must be reported as uninspectable")
+	// Unparseable PDF: queued for poppler; without a converter it is
+	// reported as uninspectable by the scanner.
+	e := Extract("첨부 e.pdf", "e.pdf", []byte("%PDF-1.4 garbage"), DefaultLimits())
+	if len(e.Images) != 1 || e.Images[0].Kind != KindPDF || !e.Images[0].NeedText {
+		t.Fatalf("broken pdf must be queued for rendering: %+v", e.Images)
+	}
+	s, _ := NewScanner(Options{ScanAttachments: true})
+	rep := s.ScanMessage(context.Background(), []byte("Subject: x\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\n"+
+		"Content-Type: application/pdf; name=e.pdf\r\n\r\n%PDF-1.4 garbage\r\n--B--\r\n"))
+	if len(rep.Uninspectable) != 1 || !strings.Contains(rep.Uninspectable[0], "PDF 해석 실패") {
+		t.Fatalf("without converter: %v", rep.Uninspectable)
 	}
 }
 

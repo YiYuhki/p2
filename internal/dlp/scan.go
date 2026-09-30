@@ -37,6 +37,9 @@ type Options struct {
 	// OCR, when OCR.Engine is set, reads text in images (image
 	// attachments, inline images, pictures in documents, scanned PDFs).
 	OCR OCROptions
+	// Converter handles HEIC/AVIF and PDFs the built-in decoders cannot
+	// read (JBIG2/JPEG2000 images, password-restricted files). Optional.
+	Converter *Converter
 }
 
 type Scanner struct {
@@ -89,9 +92,7 @@ func NewScanner(opts Options) (*Scanner, error) {
 	if opts.Limits.MaxDepth == 0 {
 		opts.Limits = DefaultLimits()
 	}
-	if opts.OCR.Engine != nil {
-		opts.OCR.defaults()
-	}
+	opts.OCR.defaults()
 	return &Scanner{detectors: ds, opts: opts}, nil
 }
 
@@ -442,6 +443,12 @@ func htmlToText(s string) string {
 // or errors is reported as uninspectable.
 func (s *Scanner) ocrImages(ctx context.Context, rep *Report, images []Image) {
 	o := s.opts.OCR
+	if len(images) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, o.TotalTimeout)
+	defer cancel()
+	images = s.convertImages(ctx, rep, images)
 	if o.Engine == nil || len(images) == 0 {
 		return
 	}
@@ -476,8 +483,6 @@ func (s *Scanner) ocrImages(ctx context.Context, rep *Report, images []Image) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, o.TotalTimeout)
-	defer cancel()
 	type result struct {
 		text string
 		err  error
@@ -515,4 +520,94 @@ func (s *Scanner) ocrImages(ctx context.Context, rep *Report, images []Image) {
 		}
 		rep.Findings = append(rep.Findings, s.ScanText(loc, NormalizeOCR(r.text))...)
 	}
+}
+
+// convertImages turns HEIC/AVIF files and PDFs that need poppler into raster
+// page images (and scans recovered PDF text layers). Raster images pass
+// through unchanged.
+func (s *Scanner) convertImages(ctx context.Context, rep *Report, images []Image) []Image {
+	o, conv := s.opts.OCR, s.opts.Converter
+	// PDFs that will be rendered page by page make their individually
+	// extracted images redundant (same pixels, duplicate findings).
+	rendered := map[string]bool{}
+	if o.Engine != nil && conv != nil && conv.PDFToPPMCmd != "" {
+		for _, im := range images {
+			if im.Kind == KindPDF {
+				rendered[im.Location] = true
+			}
+		}
+	}
+	var out []Image
+	for _, im := range images {
+		if im.Kind == KindRaster {
+			if i := strings.Index(im.Location, " > 이미지 "); i >= 0 && rendered[im.Location[:i]] {
+				continue
+			}
+		}
+		switch im.Kind {
+		case KindRaster:
+			out = append(out, im)
+
+		case KindHEIF:
+			if o.Engine == nil {
+				continue // photos only matter for OCR
+			}
+			if conv == nil || conv.HEIFCmd == "" {
+				rep.Uninspectable = append(rep.Uninspectable, im.Location+": "+im.Reason)
+				continue
+			}
+			cctx, cancel := context.WithTimeout(ctx, o.Timeout)
+			pngs, err := conv.HEIF(cctx, im.Data)
+			cancel()
+			if err != nil {
+				rep.Uninspectable = append(rep.Uninspectable, im.Location+": HEIC/AVIF 변환 실패")
+				continue
+			}
+			for i, p := range pngs {
+				loc := im.Location
+				if len(pngs) > 1 {
+					loc = fmt.Sprintf("%s #%d", im.Location, i+1)
+				}
+				out = append(out, Image{Location: loc, Data: p})
+			}
+
+		case KindPDF:
+			if conv == nil || conv.PDFToPPMCmd == "" {
+				rep.Uninspectable = append(rep.Uninspectable, im.Location+": "+im.Reason)
+				continue
+			}
+			if o.Engine == nil && !im.NeedText {
+				// Only images were unreadable and OCR is off: nothing to gain.
+				rep.Uninspectable = append(rep.Uninspectable, im.Location+": "+im.Reason)
+				continue
+			}
+			cctx, cancel := context.WithTimeout(ctx, 2*o.Timeout)
+			pages, text, err := conv.PDF(cctx, im.Data, im.NeedText)
+			cancel()
+			if text != "" {
+				rep.Findings = append(rep.Findings, s.ScanText(im.Location, text)...)
+			}
+			if err != nil {
+				if text == "" {
+					reason := im.Reason
+					if strings.Contains(strings.ToLower(err.Error()), "password") {
+						reason = "암호가 설정된 PDF (검사 불가)"
+					}
+					rep.Uninspectable = append(rep.Uninspectable, im.Location+": "+reason)
+				}
+				continue
+			}
+			if o.Engine == nil {
+				continue
+			}
+			for i, p := range pages {
+				out = append(out, Image{Location: fmt.Sprintf("%s > 페이지 %d", im.Location, i+1), Data: p})
+			}
+			if len(pages) >= conv.maxPages() {
+				rep.Uninspectable = append(rep.Uninspectable,
+					fmt.Sprintf("%s: 앞 %d페이지만 렌더링하여 검사", im.Location, conv.maxPages()))
+			}
+		}
+	}
+	return out
 }

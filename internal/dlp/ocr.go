@@ -64,10 +64,26 @@ func (o *OCROptions) defaults() {
 	}
 }
 
+// ImageKind tells the OCR stage how to turn Data into pixels.
+type ImageKind int
+
+const (
+	KindRaster ImageKind = iota // PNG/JPEG/GIF/BMP/TIFF/WebP, decoded in Go
+	KindHEIF                    // HEIC/AVIF: converted with libheif
+	KindPDF                     // whole PDF: rendered page by page with poppler
+)
+
 // Image is an embedded picture found while extracting a message.
 type Image struct {
 	Location string
 	Data     []byte
+	Kind     ImageKind
+	// Reason is reported as uninspectable when a non-raster image cannot be
+	// converted (converter missing or conversion failed).
+	Reason string
+	// NeedText (KindPDF): also extract the text layer with pdftotext because
+	// the built-in parser could not read it.
+	NeedText bool
 }
 
 // isImage recognises the formats we can decode by magic number.
@@ -234,7 +250,40 @@ func NormalizeOCR(s string) string {
 		}
 		return strings.NewReplacer("O", "0", "o", "0", "I", "1", "l", "1", "|", "1").Replace(run)
 	})
-	return reDigitDash.ReplaceAllString(s, "$1-$2")
+	s = reDigitDash.ReplaceAllString(s, "$1-$2")
+	return joinSpacedHangul(s)
+}
+
+func isHangul(r rune) bool { return r >= 0xAC00 && r <= 0xD7A3 }
+
+// joinSpacedHangul undoes OCR output like "주 민 등 록 번 호" (three or more
+// single syllables separated by single spaces) so that keyword context
+// checks ("여권", "카드") work. Normal text such as "그 사람" is untouched.
+func joinSpacedHangul(s string) string {
+	lines := strings.Split(s, "\n")
+	for li, line := range lines {
+		toks := strings.Split(line, " ")
+		var out []string
+		for i := 0; i < len(toks); {
+			j := i
+			for j < len(toks) {
+				r := []rune(toks[j])
+				if len(r) != 1 || !isHangul(r[0]) {
+					break
+				}
+				j++
+			}
+			if j-i >= 3 {
+				out = append(out, strings.Join(toks[i:j], ""))
+				i = j
+				continue
+			}
+			out = append(out, toks[i])
+			i++
+		}
+		lines[li] = strings.Join(out, " ")
+	}
+	return strings.Join(lines, "\n")
 }
 
 func imageKey(b []byte) [32]byte { return sha256.Sum256(b) }

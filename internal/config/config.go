@@ -84,6 +84,14 @@ type DLPOCRConfig struct {
 	Concurrency  int           `yaml:"concurrency"`   // per message
 	// MaxProcesses caps concurrent tesseract processes for the whole server.
 	MaxProcesses int `yaml:"max_processes"`
+
+	// External converters for formats Go cannot decode. Empty = auto-detect
+	// on PATH, "none" = disabled (those files are reported uninspectable).
+	HEIFCommand      string `yaml:"heif_command"`       // heif-dec / heif-convert (HEIC, AVIF)
+	PDFRenderCommand string `yaml:"pdf_render_command"` // pdftoppm (JBIG2/JPEG2000 scans, restricted PDFs)
+	PDFTextCommand   string `yaml:"pdf_text_command"`   // pdftotext (text of PDFs the Go parser rejects)
+	PDFMaxPages      int    `yaml:"pdf_max_pages"`      // pages rendered per PDF
+	PDFScaleTo       int    `yaml:"pdf_scale_to"`       // long side of a rendered page in pixels
 }
 
 type DLPConfig struct {
@@ -302,7 +310,7 @@ func Default() Config {
 			HoldTTL:      72 * time.Hour,
 			OCR: DLPOCRConfig{Command: "tesseract", Languages: "kor+eng", PSM: 4, MaxImages: 20,
 				MinPixels: 150 * 60, Timeout: 20 * time.Second, TotalTimeout: 60 * time.Second,
-				Concurrency: 2, MaxProcesses: 4},
+				Concurrency: 2, MaxProcesses: 4, PDFMaxPages: 10, PDFScaleTo: 2400},
 		},
 		Analysis: AnalysisConfig{
 			Timeout:            5 * time.Minute,

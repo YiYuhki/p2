@@ -47,11 +47,10 @@
 
 다음 파일은 내용을 볼 수 없으므로 **검사 불가**로 보고되고, `actions.uninspectable` 정책이 적용됩니다.
 - 암호화된 zip 항목
-- 암호가 걸린 Office·PDF·HWP 문서
+- 열람 암호가 걸린 Office·PDF·HWP 문서 (열람 암호 없이 편집·인쇄만 제한된 PDF는 poppler로 검사됨)
 - 한글 **배포용 문서**
-- HEIC/AVIF 사진 (아이폰 기본 형식, OCR 미지원)
-- JBIG2/CCITT/JPEG2000으로 압축된 PDF 이미지
-- OCR 한도(이미지 수·시간)를 넘긴 이미지
+- OCR 한도(이미지 수·시간·PDF 페이지 수)를 넘긴 이미지
+- 변환 도구가 설치되지 않은 환경의 HEIC/AVIF 사진, JBIG2/JPEG2000 스캔 PDF (Docker 이미지에는 모두 포함)
 
 ## 이미지 OCR (`dlp.ocr`)
 
@@ -62,10 +61,33 @@
 | 이미지 첨부파일 (스크린샷, 휴대폰 사진) | `첨부 캡처.png (OCR)` |
 | 본문에 삽입된 이미지 | `본문 삽입 이미지 (OCR)` |
 | 문서에 붙여 넣은 그림 (docx/xlsx/pptx `media/`, hwpx `BinData/`, **hwp BinData**, odt `Pictures/`) | `첨부 가이드.docx > word/media/image1.png (OCR)` |
-| **스캔 PDF** 페이지 이미지 (DCT/JPEG, Flate, ASCII85/ASCIIHex 필터 체인, PNG predictor) | `첨부 scan.pdf > 이미지 1 (OCR)` |
+| **스캔 PDF** 페이지 이미지 | `첨부 scan.pdf > 이미지 1 (OCR)` 또는 `> 페이지 1 (OCR)` |
+| **HEIC/AVIF** 사진 (아이폰 기본 형식) | `첨부 IMG_2231.heic (OCR)` |
 | zip 안의 위 파일들 | `첨부 a.zip > 신분증.jpg (OCR)` |
 
-- OCR 전에 흑백으로 바꾸고, 작은 이미지는 확대, 큰 이미지는 축소합니다.
+### 형식별 처리
+
+Go로 바로 디코딩하는 형식과, 외부 도구로 변환한 뒤 OCR하는 형식이 있습니다.
+
+| 형식 | 처리 |
+|---|---|
+| PNG, JPEG, GIF, BMP, TIFF(팩스 G3/G4 포함), WebP | Go 디코더 |
+| PDF 이미지: DCT(JPEG), Flate 8비트·**1비트**, ASCII85/ASCIIHex 체인, PNG predictor, **CCITT G4 / G3 1D** | Go 디코더 (`x/image/ccitt`) |
+| **HEIC / AVIF** | libheif `heif-dec`(또는 `heif-convert`)로 PNG 변환 |
+| PDF 이미지: **JBIG2**, **JPEG2000**, CCITT G3 2D | poppler `pdftoppm`으로 **페이지 전체를 렌더링** (최대 `pdf_max_pages`쪽, 긴 변 `pdf_scale_to`px) |
+| Go 파서가 못 여는 PDF (AES-256 암호화, 비표준 구조, **열람 암호 없는 사용 제한 PDF**) | poppler `pdftotext`로 텍스트 레이어 추출 + 페이지 렌더링 OCR |
+
+- 페이지를 렌더링하는 PDF는 개별 추출한 이미지를 버리고 페이지 이미지만 OCR합니다. 같은 내용이 두 번 탐지되지 않습니다.
+- 변환 도구는 시작할 때 PATH에서 자동으로 찾고 로그에 남깁니다 (`dlp converters`). 없으면 해당 파일만 "검사 불가"로 보고됩니다. `none`으로 끌 수도 있습니다.
+- 외부 도구는 신뢰할 수 없는 파일을 처리하는 C 프로그램입니다. 다음과 같이 격리해서 실행합니다.
+  - 시간 제한과 동시 실행 수 제한을 적용합니다.
+  - 파일마다 전용 임시 디렉터리를 만들고 처리 후 삭제합니다.
+  - 컨테이너 안에서 root가 아닌 사용자로 실행합니다.
+  - 추가로 격리하려면 게이트웨이를 seccomp·read-only 파일시스템 컨테이너로 실행하세요.
+
+### OCR 전처리
+- OCR 전에 흑백으로 바꾸고, 작은 이미지는 확대, 큰 이미지는 축소합니다. 흑백 반전된 팩스 이미지는 자동으로 뒤집습니다.
+- 글자 사이가 벌어진 한글(`주 민 등 록 번 호`)을 붙여서, '여권'·'카드' 같은 문맥 단어 검사가 동작하게 합니다.
 - OCR이 자주 헷갈리는 글자를 **숫자 덩어리 안에서만** 보정합니다 (`O→0`, `l/I/|→1`, `900101 - 1234567`의 공백 제거). 일반 단어는 건드리지 않습니다.
 - 서명 로고처럼 같은 이미지가 반복되면 한 번만 OCR하고, 아이콘처럼 작은 이미지(`min_pixels` 미만)는 건너뜁니다.
 - 부하 제한:
@@ -73,7 +95,9 @@
   - 메일당 동시 처리 `concurrency`(2), 서버 전체 동시 tesseract 프로세스 `max_processes`(4)
   - 한도를 넘은 이미지는 **검사 불가**로 보고되어 `actions.uninspectable` 정책을 따릅니다.
 - 처리 시간은 A4 한 장 분량 이미지 기준 약 0.3~1초입니다. SMTP 응답이 그만큼 늦어집니다.
-- Docker 이미지에는 tesseract와 한국어 데이터가 포함되어 있습니다. 직접 설치할 때는 `apt install tesseract-ocr tesseract-ocr-kor`(Debian/Ubuntu) 또는 `apk add tesseract-ocr tesseract-ocr-data-kor`(Alpine)로 설치합니다. `ocr.enabled: true`인데 설치되어 있지 않으면 시작 시 오류로 알려줍니다.
+- Docker 이미지에는 tesseract(한국어 데이터), libheif, poppler가 모두 포함되어 있습니다. 직접 설치할 때는 다음 패키지를 설치합니다.
+  - Debian/Ubuntu: `apt install tesseract-ocr tesseract-ocr-kor libheif-examples libheif-plugin-libde265 libheif-plugin-dav1d poppler-utils`
+  - Alpine: `apk add tesseract-ocr tesseract-ocr-data-kor libheif-tools poppler-utils` `ocr.enabled: true`인데 설치되어 있지 않으면 시작 시 오류로 알려줍니다.
 
 정확도 한계:
 - 인쇄체·화면 캡처는 잘 읽습니다. 손글씨, 심하게 기울거나 흐린 사진, 배경이 복잡한 신분증 사진은 놓칠 수 있습니다.
