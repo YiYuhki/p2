@@ -164,6 +164,13 @@ curl -H "Authorization: Bearer $ADMIN" -d '{"by":"sec@example.com","reason":"마
 curl -H "Authorization: Bearer $ADMIN" http://secmail:8081/internal/v1/dlp/events?limit=100
 ```
 
+`holds`·`events` 목록은 `limit`(최대 500)과 **커서 페이지네이션**을 지원합니다. 응답이 `limit`만큼 가득 차면 `X-Next-Cursor` 헤더에 다음 페이지 커서가 담기며, 이를 `?cursor=` 로 넘겨 이어서 조회합니다(시각·id 복합 키 기준이라 같은 시각의 항목도 누락·중복 없이 페이징됩니다).
+```bash
+next=$(curl -sD - -H "Authorization: Bearer $ADMIN" \
+       "http://secmail:8081/internal/v1/dlp/events?limit=100" | grep -i x-next-cursor | cut -d' ' -f2 | tr -d '\r')
+curl -H "Authorization: Bearer $ADMIN" "http://secmail:8081/internal/v1/dlp/events?limit=100&cursor=$next"
+```
+
 ## 감사 로그
 
 탐지 내역이 있는 모든 발신 메일은 `dlp_events` 테이블에 기록됩니다: 발신자, 수신자, 제목, 동작, 최고 등급, 마스킹된 탐지 내역, 보류 ID.

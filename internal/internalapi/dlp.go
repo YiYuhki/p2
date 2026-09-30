@@ -3,6 +3,7 @@ package internalapi
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -88,7 +89,8 @@ func limitParam(r *http.Request, def int) int {
 
 func (a *API) listHolds(w http.ResponseWriter, r *http.Request) {
 	st := model.HoldStatus(strings.ToUpper(r.URL.Query().Get("status")))
-	hs, err := a.store.ListHolds(r.Context(), st, limitParam(r, 50))
+	limit := limitParam(r, 50)
+	hs, err := a.store.ListHolds(r.Context(), st, limit, decodeCursor(r.URL.Query().Get("cursor")))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errBody("internal error"))
 		return
@@ -97,7 +99,36 @@ func (a *API) listHolds(w http.ResponseWriter, r *http.Request) {
 	for _, h := range hs {
 		out = append(out, toHoldJSON(h))
 	}
+	if len(hs) == limit {
+		last := hs[len(hs)-1]
+		w.Header().Set("X-Next-Cursor", encodeCursor(last.CreatedAt, last.ID))
+	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// encodeCursor / decodeCursor carry a keyset position (time + id) as an opaque
+// base64 token in the X-Next-Cursor header and the ?cursor= query parameter.
+func encodeCursor(t time.Time, id string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(strconv.FormatInt(t.UnixNano(), 10) + "|" + id))
+}
+
+func decodeCursor(s string) store.Page {
+	if s == "" {
+		return store.Page{}
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return store.Page{}
+	}
+	ns, id, ok := strings.Cut(string(raw), "|")
+	if !ok {
+		return store.Page{}
+	}
+	n, err := strconv.ParseInt(ns, 10, 64)
+	if err != nil {
+		return store.Page{}
+	}
+	return store.Page{Before: time.Unix(0, n).UTC(), BeforeID: id}
 }
 
 func (a *API) getHold(w http.ResponseWriter, r *http.Request) {
@@ -151,10 +182,15 @@ func (a *API) decide(release bool) http.HandlerFunc {
 }
 
 func (a *API) listEvents(w http.ResponseWriter, r *http.Request) {
-	evs, err := a.store.ListDLPEvents(r.Context(), limitParam(r, 100))
+	limit := limitParam(r, 100)
+	evs, err := a.store.ListDLPEvents(r.Context(), limit, decodeCursor(r.URL.Query().Get("cursor")))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errBody("internal error"))
 		return
+	}
+	if len(evs) == limit {
+		last := evs[len(evs)-1]
+		w.Header().Set("X-Next-Cursor", encodeCursor(last.At, last.ID))
 	}
 	type evJSON struct {
 		ID       string          `json:"id"`

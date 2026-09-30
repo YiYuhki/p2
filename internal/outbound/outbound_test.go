@@ -215,7 +215,7 @@ func TestHighFindingHeldThenReleased(t *testing.T) {
 	if e.next.count() != 0 {
 		t.Fatal("held mail was relayed")
 	}
-	holds, _ := e.store.ListHolds(context.Background(), model.HoldHeld, 10)
+	holds, _ := e.store.ListHolds(context.Background(), model.HoldHeld, 10, store.Page{})
 	if len(holds) != 1 {
 		t.Fatalf("holds: %d", len(holds))
 	}
@@ -235,7 +235,7 @@ func TestHighFindingHeldThenReleased(t *testing.T) {
 		t.Fatalf("double release: %v", err)
 	}
 	e.box.waitFor(t, "kim@example.com", "승인하여 메일이 발송")
-	evs, _ := e.store.ListDLPEvents(context.Background(), 10)
+	evs, _ := e.store.ListDLPEvents(context.Background(), 10, store.Page{})
 	if len(evs) != 1 || evs[0].Action != "hold" || evs[0].HoldID != holds[0].ID {
 		t.Fatalf("audit event: %+v", evs)
 	}
@@ -244,7 +244,7 @@ func TestHighFindingHeldThenReleased(t *testing.T) {
 func TestReleaseFailureReopensHold(t *testing.T) {
 	e := setup(t, nil)
 	e.send("kim@example.com", []string{"partner@ext.org"}, mail("x", "AKIAIOSFODNN7EXAMPLE"))
-	holds, _ := e.store.ListHolds(context.Background(), model.HoldHeld, 10)
+	holds, _ := e.store.ListHolds(context.Background(), model.HoldHeld, 10, store.Page{})
 	e.svc.relay = func(string, []string, []byte) error { return errors.New("next hop down") }
 	if err := e.svc.Release(context.Background(), holds[0].ID, "sec"); err == nil {
 		t.Fatal("expected relay error")
@@ -260,7 +260,7 @@ func TestRejectAndExpiry(t *testing.T) {
 	ctx := context.Background()
 	e.send("kim@example.com", []string{"partner@ext.org"}, mail("a", "-----BEGIN RSA PRIVATE KEY-----"))
 	e.send("kim@example.com", []string{"partner@ext.org"}, mail("b", "카드 4111-1111-1111-1111"))
-	holds, _ := e.store.ListHolds(ctx, model.HoldHeld, 10)
+	holds, _ := e.store.ListHolds(ctx, model.HoldHeld, 10, store.Page{})
 	if len(holds) != 2 {
 		t.Fatalf("holds %d", len(holds))
 	}
@@ -332,7 +332,7 @@ func TestExemptions(t *testing.T) {
 	if e.next.count() != 2 {
 		t.Fatalf("exempt mail should be delivered: %d", e.next.count())
 	}
-	evs, _ := e.store.ListDLPEvents(context.Background(), 10)
+	evs, _ := e.store.ListDLPEvents(context.Background(), 10, store.Page{})
 	if len(evs) != 1 || evs[0].Action != "allow" {
 		t.Fatalf("exempt recipient should be logged as allow: %+v", evs)
 	}
@@ -398,7 +398,7 @@ func TestEncryptedAttachmentPolicy(t *testing.T) {
 	if e.next.count() != 0 {
 		t.Fatal("encrypted attachment must be held, not relayed")
 	}
-	holds, _ := e.store.ListHolds(context.Background(), model.HoldHeld, 10)
+	holds, _ := e.store.ListHolds(context.Background(), model.HoldHeld, 10, store.Page{})
 	if len(holds) != 1 {
 		t.Fatalf("expected one hold, got %d", len(holds))
 	}

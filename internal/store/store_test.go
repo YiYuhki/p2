@@ -118,7 +118,7 @@ func holdConformance(t *testing.T, s Store) {
 	if err != nil || g.ID != h1.ID || g.RcptTo[0] != "x@ext.org" || g.Status != model.HoldHeld {
 		t.Fatalf("hold by token: %+v %v", g, err)
 	}
-	held, _ := s.ListHolds(ctx, model.HoldHeld, 100)
+	held, _ := s.ListHolds(ctx, model.HoldHeld, 100, Page{})
 	if len(held) < 2 {
 		t.Fatalf("list held: %d", len(held))
 	}
@@ -148,7 +148,7 @@ func holdConformance(t *testing.T, s Store) {
 	if err := s.RecordDLPEvent(ctx, ev); err != nil {
 		t.Fatal(err)
 	}
-	evs, err := s.ListDLPEvents(ctx, 10)
+	evs, err := s.ListDLPEvents(ctx, 10, Page{})
 	if err != nil || len(evs) == 0 || evs[0].ID != ev.ID || evs[0].HoldID != h1.ID {
 		t.Fatalf("events: %+v %v", evs, err)
 	}
@@ -196,4 +196,85 @@ func TestPostgresConformance(t *testing.T) {
 	if err := p.pool.QueryRow(ctx, `SELECT count(*) FROM download_events WHERE username='u1@example.com'`).Scan(&n); err != nil || n == 0 {
 		t.Fatalf("download event not persisted: %d %v", n, err)
 	}
+}
+
+func TestHoldAndEventPagination(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemory()
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	// 5 holds and 5 events at distinct, increasing times.
+	for i := 0; i < 5; i++ {
+		at := base.Add(time.Duration(i) * time.Minute)
+		h := &model.Hold{ID: uuid.NewString(), Status: model.HoldHeld, MailFrom: "a@ex.org",
+			RcptTo: []string{"x@ext.org"}, Findings: json.RawMessage(`{}`), CreatedAt: at, ExpiresAt: at.Add(time.Hour)}
+		if err := s.CreateHold(ctx, h); err != nil {
+			t.Fatal(err)
+		}
+		ev := &model.DLPEvent{ID: uuid.NewString(), MailFrom: "a@ex.org", Action: "notify",
+			Severity: "low", Findings: json.RawMessage(`{}`), At: at}
+		if err := s.RecordDLPEvent(ctx, ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Page holds 2 at a time; expect newest-first, no gaps or repeats.
+	var seen []string
+	page := Page{}
+	for {
+		hs, err := s.ListHolds(ctx, model.HoldHeld, 2, page)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(hs) == 0 {
+			break
+		}
+		for i := 1; i < len(hs); i++ {
+			if hs[i].CreatedAt.After(hs[i-1].CreatedAt) {
+				t.Fatal("not sorted newest-first")
+			}
+		}
+		for _, h := range hs {
+			seen = append(seen, h.ID)
+		}
+		if len(hs) < 2 {
+			break
+		}
+		last := hs[len(hs)-1]
+		page = Page{Before: last.CreatedAt, BeforeID: last.ID}
+	}
+	if len(seen) != 5 || !distinct(seen) {
+		t.Fatalf("paged holds = %v (want 5 distinct)", seen)
+	}
+
+	// Events: same walk.
+	seen = nil
+	page = Page{}
+	for {
+		evs, _ := s.ListDLPEvents(ctx, 2, page)
+		if len(evs) == 0 {
+			break
+		}
+		for _, e := range evs {
+			seen = append(seen, e.ID)
+		}
+		if len(evs) < 2 {
+			break
+		}
+		last := evs[len(evs)-1]
+		page = Page{Before: last.At, BeforeID: last.ID}
+	}
+	if len(seen) != 5 || !distinct(seen) {
+		t.Fatalf("paged events = %v (want 5 distinct)", seen)
+	}
+}
+
+func distinct(ids []string) bool {
+	m := map[string]bool{}
+	for _, id := range ids {
+		if m[id] {
+			return false
+		}
+		m[id] = true
+	}
+	return true
 }

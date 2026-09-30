@@ -52,17 +52,39 @@ func (s *Memory) holdList(limit int, keep func(*model.Hold) bool) []*model.Hold 
 			out = append(out, cloneHold(h))
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	sort.Slice(out, func(i, j int) bool { return beforeKey(out[i].CreatedAt, out[i].ID, out[j].CreatedAt, out[j].ID) })
 	if len(out) > limit {
 		out = out[:limit]
 	}
 	return out
 }
 
-func (s *Memory) ListHolds(_ context.Context, st model.HoldStatus, limit int) ([]*model.Hold, error) {
+// beforeKey orders by (time DESC, id DESC): row (ai,aid) sorts before (bi,bid).
+func beforeKey(at time.Time, aid string, bt time.Time, bid string) bool {
+	if at.Equal(bt) {
+		return aid > bid
+	}
+	return at.After(bt)
+}
+
+// afterCursor reports whether (t,id) is strictly older than the cursor under
+// the (time DESC, id DESC) ordering, i.e. it belongs on a later page.
+func afterCursor(t time.Time, id string, page Page) bool {
+	if !page.Set() {
+		return true
+	}
+	if t.Equal(page.Before) {
+		return id < page.BeforeID
+	}
+	return t.Before(page.Before)
+}
+
+func (s *Memory) ListHolds(_ context.Context, st model.HoldStatus, limit int, page Page) ([]*model.Hold, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.holdList(limit, func(h *model.Hold) bool { return st == "" || h.Status == st }), nil
+	return s.holdList(limit, func(h *model.Hold) bool {
+		return (st == "" || h.Status == st) && afterCursor(h.CreatedAt, h.ID, page)
+	}), nil
 }
 
 func (s *Memory) DecideHold(_ context.Context, id string, st model.HoldStatus, by, reason string, at time.Time) error {
@@ -93,15 +115,21 @@ func (s *Memory) RecordDLPEvent(_ context.Context, ev *model.DLPEvent) error {
 	return nil
 }
 
-func (s *Memory) ListDLPEvents(_ context.Context, limit int) ([]*model.DLPEvent, error) {
+func (s *Memory) ListDLPEvents(_ context.Context, limit int, page Page) ([]*model.DLPEvent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var out []*model.DLPEvent
-	for i := len(s.dlpEvents) - 1; i >= 0 && len(out) < limit; i-- {
-		c := *s.dlpEvents[i]
-		out = append(out, &c)
+	var all []*model.DLPEvent
+	for _, e := range s.dlpEvents {
+		if afterCursor(e.At, e.ID, page) {
+			c := *e
+			all = append(all, &c)
+		}
 	}
-	return out, nil
+	sort.Slice(all, func(i, j int) bool { return beforeKey(all[i].At, all[i].ID, all[j].At, all[j].ID) })
+	if len(all) > limit {
+		all = all[:limit]
+	}
+	return all, nil
 }
 
 func (s *Memory) ReopenHold(_ context.Context, id string) error {

@@ -62,9 +62,15 @@ func (p *Postgres) GetHoldByTokenHash(ctx context.Context, th string) (*model.Ho
 	return scanHold(p.pool.QueryRow(ctx, `SELECT `+holdCols+` FROM dlp_holds WHERE token_hash=$1`, th))
 }
 
-func (p *Postgres) ListHolds(ctx context.Context, st model.HoldStatus, limit int) ([]*model.Hold, error) {
+func (p *Postgres) ListHolds(ctx context.Context, st model.HoldStatus, limit int, page Page) ([]*model.Hold, error) {
+	if page.Set() {
+		return p.queryHolds(ctx, `SELECT `+holdCols+` FROM dlp_holds
+			WHERE ($1 = '' OR status = $1)
+			  AND (created_at < $3 OR (created_at = $3 AND id < $4))
+			ORDER BY created_at DESC, id DESC LIMIT $2`, string(st), limit, page.Before, page.BeforeID)
+	}
 	return p.queryHolds(ctx, `SELECT `+holdCols+` FROM dlp_holds
-		WHERE ($1 = '' OR status = $1) ORDER BY created_at DESC LIMIT $2`, string(st), limit)
+		WHERE ($1 = '' OR status = $1) ORDER BY created_at DESC, id DESC LIMIT $2`, string(st), limit)
 }
 
 func (p *Postgres) DecideHold(ctx context.Context, id string, st model.HoldStatus, by, reason string, at time.Time) error {
@@ -99,9 +105,18 @@ func (p *Postgres) RecordDLPEvent(ctx context.Context, ev *model.DLPEvent) error
 	return err
 }
 
-func (p *Postgres) ListDLPEvents(ctx context.Context, limit int) ([]*model.DLPEvent, error) {
-	rows, err := p.pool.Query(ctx, `SELECT id, mail_from, rcpt_to, subject, action, severity, findings,
-		COALESCE(hold_id::text, ''), at FROM dlp_events ORDER BY at DESC LIMIT $1`, limit)
+func (p *Postgres) ListDLPEvents(ctx context.Context, limit int, page Page) ([]*model.DLPEvent, error) {
+	const cols = `id, mail_from, rcpt_to, subject, action, severity, findings, COALESCE(hold_id::text, ''), at`
+	var rows pgx.Rows
+	var err error
+	if page.Set() {
+		rows, err = p.pool.Query(ctx, `SELECT `+cols+` FROM dlp_events
+			WHERE (at < $2 OR (at = $2 AND id < $3))
+			ORDER BY at DESC, id DESC LIMIT $1`, limit, page.Before, page.BeforeID)
+	} else {
+		rows, err = p.pool.Query(ctx, `SELECT `+cols+` FROM dlp_events
+			ORDER BY at DESC, id DESC LIMIT $1`, limit)
+	}
 	if err != nil {
 		return nil, err
 	}

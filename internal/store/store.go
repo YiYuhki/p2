@@ -43,7 +43,7 @@ type Store interface {
 	CreateHold(ctx context.Context, h *model.Hold) error
 	GetHold(ctx context.Context, id string) (*model.Hold, error)
 	GetHoldByTokenHash(ctx context.Context, tokenHash string) (*model.Hold, error)
-	ListHolds(ctx context.Context, status model.HoldStatus, limit int) ([]*model.Hold, error)
+	ListHolds(ctx context.Context, status model.HoldStatus, limit int, page Page) ([]*model.Hold, error)
 	// DecideHold moves a HELD hold to status; ErrConflict if already decided.
 	DecideHold(ctx context.Context, id string, status model.HoldStatus, by, reason string, at time.Time) error
 	// ReopenHold returns a RELEASED hold to HELD (used when relaying failed
@@ -52,6 +52,17 @@ type Store interface {
 	// ListExpiredHolds returns HELD holds whose ExpiresAt < now.
 	ListExpiredHolds(ctx context.Context, now time.Time, limit int) ([]*model.Hold, error)
 	RecordDLPEvent(ctx context.Context, ev *model.DLPEvent) error
-	ListDLPEvents(ctx context.Context, limit int) ([]*model.DLPEvent, error)
+	ListDLPEvents(ctx context.Context, limit int, page Page) ([]*model.DLPEvent, error)
 	Close()
 }
+
+// Page is a keyset pagination cursor for the admin list endpoints. Rows are
+// ordered (time DESC, id DESC); a set cursor returns only rows strictly before
+// this position. The zero value starts from the newest row.
+type Page struct {
+	Before   time.Time
+	BeforeID string
+}
+
+// Set reports whether the cursor points past the first page.
+func (p Page) Set() bool { return !p.Before.IsZero() }

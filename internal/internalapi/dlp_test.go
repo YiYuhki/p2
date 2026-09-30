@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -94,3 +95,67 @@ func TestReadyzReportsFailure(t *testing.T) {
 type failingStore struct{ store.Store }
 
 func (failingStore) Ping(context.Context) error { return context.DeadlineExceeded }
+
+func TestDLPHoldsPaginationCursor(t *testing.T) {
+	st := store.NewMemory()
+	obj, _ := storage.NewFS(t.TempDir())
+	base0 := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+	ids := map[string]bool{}
+	for i := 0; i < 3; i++ {
+		id := "00000000-0000-0000-0000-00000000000" + string(rune('a'+i))
+		ids[id] = true
+		st.CreateHold(context.Background(), &model.Hold{ID: id, Status: model.HoldHeld,
+			Findings: json.RawMessage(`{}`), CreatedAt: base0.Add(time.Duration(i) * time.Minute),
+			ExpiresAt: base0.Add(time.Hour)})
+	}
+	api := New(st, obj, nil, secret, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	const admin = "admin-token-0123456789"
+	api.EnableDLPAdmin(admin, reviewer{st})
+	srv := httptest.NewServer(api.Handler())
+	defer srv.Close()
+
+	get := func(url string) (int, string, []holdJSON) {
+		t.Helper()
+		req, _ := httpNewGet(url, admin)
+		resp, err := httpDo(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		var hs []holdJSON
+		json.Unmarshal(b, &hs)
+		return resp.StatusCode, resp.Header.Get("X-Next-Cursor"), hs
+	}
+
+	code, cursor, page1 := get(srv.URL + "/internal/v1/dlp/holds?status=held&limit=2")
+	if code != 200 || len(page1) != 2 || cursor == "" {
+		t.Fatalf("page1: code=%d n=%d cursor=%q", code, len(page1), cursor)
+	}
+	_, cursor2, page2 := get(srv.URL + "/internal/v1/dlp/holds?status=held&limit=2&cursor=" + cursor)
+	if len(page2) != 1 {
+		t.Fatalf("page2 should have the last hold, got %d", len(page2))
+	}
+	if cursor2 != "" {
+		t.Fatalf("no more pages expected, got cursor %q", cursor2)
+	}
+	all := map[string]bool{page1[0].ID: true, page1[1].ID: true, page2[0].ID: true}
+	if len(all) != 3 {
+		t.Fatalf("pages overlapped: %v", all)
+	}
+	for id := range ids {
+		if !all[id] {
+			t.Fatalf("hold %s missing across pages", id)
+		}
+	}
+}
+
+func httpNewGet(url, bearer string) (*http.Request, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err == nil && bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	return req, err
+}
+
+func httpDo(req *http.Request) (*http.Response, error) { return http.DefaultClient.Do(req) }
