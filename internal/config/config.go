@@ -70,6 +70,22 @@ type DLPRule struct {
 	Context  []string `yaml:"context"`
 }
 
+// DLPOCRConfig enables text recognition in images (Tesseract).
+type DLPOCRConfig struct {
+	Enabled   bool   `yaml:"enabled"`
+	Command   string `yaml:"command"`   // default "tesseract"
+	Languages string `yaml:"languages"` // default "kor+eng"
+	PSM       int    `yaml:"psm"`       // page segmentation mode, default 4
+	// Per message.
+	MaxImages    int           `yaml:"max_images"`
+	MinPixels    int           `yaml:"min_pixels"`
+	Timeout      time.Duration `yaml:"timeout"`       // per image
+	TotalTimeout time.Duration `yaml:"total_timeout"` // per message
+	Concurrency  int           `yaml:"concurrency"`   // per message
+	// MaxProcesses caps concurrent tesseract processes for the whole server.
+	MaxProcesses int `yaml:"max_processes"`
+}
+
 type DLPConfig struct {
 	ScanAttachments bool       `yaml:"scan_attachments"`
 	Actions         DLPActions `yaml:"actions"`
@@ -85,7 +101,8 @@ type DLPConfig struct {
 	Rules     []DLPRule      `yaml:"rules"`
 	// ExemptSenders skip DLP entirely; ExemptRecipientDomains are trusted
 	// partners (findings are recorded but the action is "allow").
-	ExemptSenders []string `yaml:"exempt_senders"`
+	ExemptSenders []string     `yaml:"exempt_senders"`
+	OCR           DLPOCRConfig `yaml:"ocr"`
 	// ScanInternal also inspects mail whose recipients are all in our own
 	// domains (off by default: only mail leaving the organisation).
 	ScanInternal           bool     `yaml:"scan_internal"`
@@ -283,6 +300,9 @@ func Default() Config {
 				Uninspectable: ActionNotify},
 			NotifySender: true,
 			HoldTTL:      72 * time.Hour,
+			OCR: DLPOCRConfig{Command: "tesseract", Languages: "kor+eng", PSM: 4, MaxImages: 20,
+				MinPixels: 150 * 60, Timeout: 20 * time.Second, TotalTimeout: 60 * time.Second,
+				Concurrency: 2, MaxProcesses: 4},
 		},
 		Analysis: AnalysisConfig{
 			Timeout:            5 * time.Minute,

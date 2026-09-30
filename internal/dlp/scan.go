@@ -1,11 +1,14 @@
 package dlp
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"html"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/yiyuhki/p2/internal/mimeproc"
@@ -31,6 +34,9 @@ type Options struct {
 	// ScanAttachments enables attachment text extraction.
 	ScanAttachments bool
 	Limits          Limits
+	// OCR, when OCR.Engine is set, reads text in images (image
+	// attachments, inline images, pictures in documents, scanned PDFs).
+	OCR OCROptions
 }
 
 type Scanner struct {
@@ -82,6 +88,9 @@ func NewScanner(opts Options) (*Scanner, error) {
 	}
 	if opts.Limits.MaxDepth == 0 {
 		opts.Limits = DefaultLimits()
+	}
+	if opts.OCR.Engine != nil {
+		opts.OCR.defaults()
 	}
 	return &Scanner{detectors: ds, opts: opts}, nil
 }
@@ -303,8 +312,8 @@ func hasContext(lower string, start, end int, kws []string) bool {
 	return false
 }
 
-// ScanMessage scans subject, bodies and (optionally) attachments.
-func (s *Scanner) ScanMessage(raw []byte) *Report {
+// ScanMessage scans subject, bodies and (optionally) attachments and images.
+func (s *Scanner) ScanMessage(ctx context.Context, raw []byte) *Report {
 	rep := &Report{}
 	root, err := mimeproc.Parse(raw)
 	if err != nil {
@@ -312,12 +321,14 @@ func (s *Scanner) ScanMessage(raw []byte) *Report {
 		rep.Findings = append(rep.Findings, s.ScanText("메일 원문", decodeText(raw))...)
 		return rep
 	}
-	s.scanEntity(rep, root, "", 0)
+	var images []Image
+	s.scanEntity(rep, root, "", 0, &images)
+	s.ocrImages(ctx, rep, images)
 	sort.SliceStable(rep.Findings, func(i, j int) bool { return rep.Findings[i].Sev() > rep.Findings[j].Sev() })
 	return rep
 }
 
-func (s *Scanner) scanEntity(rep *Report, root *mimeproc.Part, prefix string, depth int) {
+func (s *Scanner) scanEntity(rep *Report, root *mimeproc.Part, prefix string, depth int, images *[]Image) {
 	if subj := root.Header.Get("Subject"); subj != "" {
 		rep.Findings = append(rep.Findings, s.ScanText(prefix+"제목", mimeproc.DecodeHeader(subj))...)
 	}
@@ -358,22 +369,30 @@ func (s *Scanner) scanEntity(rep *Report, root *mimeproc.Part, prefix string, de
 				rep.Uninspectable = append(rep.Uninspectable, prefix+label+": 해석 실패")
 				return
 			}
-			s.scanEntity(rep, inner, prefix+"첨부 "+label+" > ", depth+1)
+			s.scanEntity(rep, inner, prefix+"첨부 "+label+" > ", depth+1, images)
 		default:
 			if !s.opts.ScanAttachments {
 				return
 			}
-			if name == "" {
-				name = "(이름 없음)"
-			}
-			if strings.HasPrefix(mt, "image/") || strings.HasPrefix(mt, "video/") || strings.HasPrefix(mt, "audio/") {
+			if strings.HasPrefix(mt, "video/") || strings.HasPrefix(mt, "audio/") {
 				return
 			}
-			texts, probs := ExtractText(prefix+"첨부 "+name, name, p.DecodeBody(), s.opts.Limits)
-			for _, t := range texts {
+			if strings.HasPrefix(mt, "image/") && s.opts.OCR.Engine == nil {
+				return
+			}
+			loc := prefix + "첨부 " + name
+			switch {
+			case name == "" && strings.HasPrefix(mt, "image/"):
+				loc = prefix + "본문 삽입 이미지"
+			case name == "":
+				loc = prefix + "첨부 (이름 없음)"
+			}
+			ex := Extract(loc, name, p.DecodeBody(), s.opts.Limits)
+			for _, t := range ex.Texts {
 				rep.Findings = append(rep.Findings, s.ScanText(t.Location, t.Content)...)
 			}
-			rep.Uninspectable = append(rep.Uninspectable, probs...)
+			rep.Uninspectable = append(rep.Uninspectable, ex.Problems...)
+			*images = append(*images, ex.Images...)
 		}
 	}
 	walk(root)
@@ -416,4 +435,84 @@ func htmlToText(s string) string {
 	s = reCellTag.ReplaceAllString(s, "\t")
 	s = reTag.ReplaceAllString(s, "")
 	return html.UnescapeString(s)
+}
+
+// ocrImages OCRs distinct, reasonably sized images within the configured
+// limits and scans the recognised text. Anything skipped because of limits
+// or errors is reported as uninspectable.
+func (s *Scanner) ocrImages(ctx context.Context, rep *Report, images []Image) {
+	o := s.opts.OCR
+	if o.Engine == nil || len(images) == 0 {
+		return
+	}
+	seen := map[[32]byte]bool{}
+	var todo []Image
+	for _, im := range images {
+		k := imageKey(im.Data)
+		if seen[k] { // signature logos, repeated screenshots
+			continue
+		}
+		seen[k] = true
+		w, h, err := imageSize(im.Data)
+		if err != nil {
+			rep.Uninspectable = append(rep.Uninspectable, im.Location+": 이미지 해석 실패")
+			continue
+		}
+		if w*h < o.MinPixels || w < 40 || h < 16 {
+			continue // icons, bullets, spacer images
+		}
+		if w*h > o.MaxPixels {
+			rep.Uninspectable = append(rep.Uninspectable, im.Location+": 이미지가 너무 큼 (OCR 생략)")
+			continue
+		}
+		todo = append(todo, im)
+	}
+	if len(todo) > o.MaxImages {
+		rep.Uninspectable = append(rep.Uninspectable,
+			fmt.Sprintf("이미지 %d개 중 %d개만 OCR 검사 (한도 초과)", len(todo), o.MaxImages))
+		todo = todo[:o.MaxImages]
+	}
+	if len(todo) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, o.TotalTimeout)
+	defer cancel()
+	type result struct {
+		text string
+		err  error
+	}
+	results := make([]result, len(todo))
+	sem := make(chan struct{}, o.Concurrency)
+	var wg sync.WaitGroup
+	for i, im := range todo {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				results[i].err = ctx.Err()
+				return
+			}
+			defer func() { <-sem }()
+			ictx, icancel := context.WithTimeout(ctx, o.Timeout)
+			defer icancel()
+			results[i].text, results[i].err = o.Engine.Recognize(ictx, im.Data)
+		}()
+	}
+	wg.Wait()
+
+	for i, r := range results {
+		loc := todo[i].Location + " (OCR)"
+		if r.err != nil {
+			why := "OCR 실패"
+			if errors.Is(r.err, context.DeadlineExceeded) || errors.Is(r.err, context.Canceled) {
+				why = "OCR 시간 한도 초과"
+			}
+			rep.Uninspectable = append(rep.Uninspectable, todo[i].Location+": "+why)
+			continue
+		}
+		rep.Findings = append(rep.Findings, s.ScanText(loc, NormalizeOCR(r.text))...)
+	}
 }

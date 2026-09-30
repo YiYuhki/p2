@@ -147,9 +147,21 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		for _, r := range cfg.DLP.Rules {
 			rules = append(rules, dlp.Rule(r))
 		}
+		var ocr dlp.OCROptions
+		if o := cfg.DLP.OCR; o.Enabled {
+			if err := dlp.CheckTesseract(o.Command, o.Languages); err != nil {
+				return fmt.Errorf("dlp.ocr: %w", err)
+			}
+			ocr = dlp.OCROptions{
+				Engine:    dlp.NewTesseract(o.Command, o.Languages, o.PSM, o.MaxProcesses),
+				MaxImages: o.MaxImages, MinPixels: o.MinPixels, Timeout: o.Timeout,
+				TotalTimeout: o.TotalTimeout, Concurrency: o.Concurrency,
+			}
+			log.Info("dlp OCR enabled", "engine", "tesseract", "languages", o.Languages)
+		}
 		scanner, err := dlp.NewScanner(dlp.Options{
 			Disabled: cfg.DLP.Disabled, MinCounts: cfg.DLP.MinCounts, Rules: rules,
-			ScanAttachments: cfg.DLP.ScanAttachments, Limits: dlp.DefaultLimits(),
+			ScanAttachments: cfg.DLP.ScanAttachments, Limits: dlp.DefaultLimits(), OCR: ocr,
 		})
 		if err != nil {
 			return err

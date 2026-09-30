@@ -42,15 +42,48 @@ type extractor struct {
 	lim      Limits
 	budget   int64
 	texts    []Text
+	images   []Image
 	problems []string
+}
+
+// Extracted is everything pulled out of one attachment.
+type Extracted struct {
+	Texts []Text
+	// Images are pictures to OCR (attachments, pictures pasted into
+	// documents, scanned PDF pages).
+	Images   []Image
+	Problems []string
+}
+
+// Extract walks an attachment (recursively for archives and documents).
+func Extract(location, filename string, data []byte, lim Limits) Extracted {
+	x := &extractor{lim: lim, budget: lim.MaxInflate}
+	x.file(location, filename, data, 0)
+	return Extracted{Texts: x.texts, Images: x.images, Problems: x.problems}
 }
 
 // ExtractText returns the text found in an attachment and a list of parts
 // that could not be inspected (encrypted archives/documents, parse errors).
 func ExtractText(location, filename string, data []byte, lim Limits) ([]Text, []string) {
-	x := &extractor{lim: lim, budget: lim.MaxInflate}
-	x.file(location, filename, data, 0)
-	return x.texts, x.problems
+	e := Extract(location, filename, data, lim)
+	return e.Texts, e.Problems
+}
+
+func (x *extractor) addImage(loc string, b []byte) {
+	if len(x.images) < 200 { // hard cap; the scanner applies MaxImages
+		x.images = append(x.images, Image{Location: loc, Data: b})
+	}
+}
+
+func isHEIF(b []byte) bool {
+	if len(b) < 12 || string(b[4:8]) != "ftyp" {
+		return false
+	}
+	switch string(b[8:12]) {
+	case "heic", "heix", "hevc", "heim", "heis", "mif1", "msf1", "avif":
+		return true
+	}
+	return false
 }
 
 func (x *extractor) add(loc, s string) {
@@ -81,6 +114,11 @@ func (x *extractor) file(loc, name string, data []byte, depth int) {
 		x.ole(loc, data)
 	case bytes.HasPrefix(data, []byte("%PDF")):
 		x.pdf(loc, data)
+		x.pdfImages(loc, data)
+	case isImage(data):
+		x.addImage(loc, data)
+	case isHEIF(data):
+		x.problem(loc, "HEIC/AVIF 이미지 (OCR 미지원, 검사 불가)")
 	case isTextLike(ext, data):
 		x.add(loc, decodeText(data))
 	case ext == ".eml" || bytes.HasPrefix(data, []byte("From:")) || bytes.HasPrefix(data, []byte("Received:")):
@@ -219,8 +257,14 @@ func isOfficeZip(zr *zip.Reader) bool {
 // ODF documents.
 func (x *extractor) officeZip(loc string, zr *zip.Reader) {
 	var sb strings.Builder
-	for _, f := range zr.File {
+	for i, f := range zr.File {
 		n := strings.ToLower(f.Name)
+		if i < x.lim.MaxEntries && isMediaPath(n) {
+			if b, err := x.readZipEntry(f); err == nil && isImage(b) {
+				x.addImage(loc+" > "+f.Name, b)
+			}
+			continue
+		}
 		if !strings.HasSuffix(n, ".xml") || strings.Contains(n, "_rels/") ||
 			strings.Contains(n, "theme") || strings.Contains(n, "styles") ||
 			strings.HasPrefix(n, "[content_types]") || strings.Contains(n, "settings") ||
@@ -239,6 +283,12 @@ func (x *extractor) officeZip(loc string, zr *zip.Reader) {
 		}
 	}
 	x.add(loc, sb.String())
+}
+
+// isMediaPath matches picture folders of OOXML, HWPX and ODF packages.
+func isMediaPath(n string) bool {
+	return strings.Contains(n, "/media/") || strings.HasPrefix(n, "bindata/") ||
+		strings.HasPrefix(n, "pictures/")
 }
 
 // Element local names that end a line / cell in OOXML, HWPX and ODF.
@@ -346,6 +396,25 @@ func (x *extractor) hwp(loc string, fh []byte, streams map[string][]byte, order 
 		hwpRecords(&sb, b)
 	}
 	x.add(loc, sb.String())
+
+	// Embedded pictures (BinData/BINxxxx.png|jpg|bmp...), deflated when the
+	// document is compressed.
+	for _, k := range order {
+		if !strings.HasPrefix(k, "BinData/") {
+			continue
+		}
+		b := streams[k]
+		if compressed {
+			r := flate.NewReader(bytes.NewReader(b))
+			if d, err := io.ReadAll(io.LimitReader(r, 50<<20)); err == nil || len(d) > 0 {
+				b = d
+			}
+			r.Close()
+		}
+		if isImage(b) {
+			x.addImage(loc+" > "+k, b)
+		}
+	}
 }
 
 const hwpTagParaText = 0x10 + 51

@@ -155,7 +155,7 @@ func (s *Service) Process(ctx context.Context, env gateway.Envelope, raw []byte)
 			return raw, nil
 		}
 	}
-	rep := s.scanner.ScanMessage(raw)
+	rep := s.scanner.ScanMessage(ctx, raw)
 	if len(rep.Findings) == 0 && len(rep.Uninspectable) == 0 {
 		return raw, nil
 	}

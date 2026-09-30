@@ -118,6 +118,17 @@ dlp:
   admins: [security@example.com]   # receive notices; approve/reject holds on the portal
   notify_from: dlp-noreply@example.com
   hold_ttl: 72h                    # undecided holds are discarded (not sent) after this
+  ocr:                             # read text in images: screenshots, photos, scanned PDFs,
+    enabled: true                  # pictures pasted into docx/xlsx/pptx/hwp (needs tesseract + kor data)
+    command: tesseract
+    languages: kor+eng
+    psm: 4                         # tesseract page segmentation mode
+    max_images: 20                 # distinct images per message (rest reported as uninspectable)
+    min_pixels: 9000               # skip icons / logos smaller than this (w*h)
+    timeout: 20s                   # per image
+    total_timeout: 60s             # per message
+    concurrency: 2                 # images OCR'd in parallel per message
+    max_processes: 4               # tesseract processes for the whole server
   # disabled: [jwt, email_address]         # built-in detector IDs to turn off
   # min_counts: {kr_mobile: 10}            # bulk thresholds per location
   # exempt_senders: [payroll-bot@example.com]

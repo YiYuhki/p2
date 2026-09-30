@@ -42,14 +42,42 @@
 | zip (중첩 포함) | 최대 3단계, 파일 500개, 압축 해제 200MB 한도 (zip bomb 방지) |
 | doc, xls, ppt (구형) | 스트림에서 문자열 추출 |
 | 첨부된 메일(.eml) | 재귀 검사 |
-| 이미지·동영상·실행파일 | 텍스트 없음. 검사 대상 아님 |
+| **이미지** (png/jpg/gif/bmp/tiff/webp) | **OCR** (아래 참고) |
+| 동영상·음성·실행파일 | 검사 대상 아님 |
 
 다음 파일은 내용을 볼 수 없으므로 **검사 불가**로 보고되고, `actions.uninspectable` 정책이 적용됩니다.
 - 암호화된 zip 항목
 - 암호가 걸린 Office·PDF·HWP 문서
 - 한글 **배포용 문서**
+- HEIC/AVIF 사진 (아이폰 기본 형식, OCR 미지원)
+- JBIG2/CCITT/JPEG2000으로 압축된 PDF 이미지
+- OCR 한도(이미지 수·시간)를 넘긴 이미지
 
-> 이미지 속 글자(스캔한 신분증 등)는 OCR이 필요하므로 현재 탐지하지 않습니다.
+## 이미지 OCR (`dlp.ocr`)
+
+[Tesseract](https://github.com/tesseract-ocr/tesseract)(한국어+영어)로 이미지 속 글자를 읽은 뒤 같은 탐지기로 검사합니다.
+
+| OCR 대상 | 위치 표기 예 |
+|---|---|
+| 이미지 첨부파일 (스크린샷, 휴대폰 사진) | `첨부 캡처.png (OCR)` |
+| 본문에 삽입된 이미지 | `본문 삽입 이미지 (OCR)` |
+| 문서에 붙여 넣은 그림 (docx/xlsx/pptx `media/`, hwpx `BinData/`, **hwp BinData**, odt `Pictures/`) | `첨부 가이드.docx > word/media/image1.png (OCR)` |
+| **스캔 PDF** 페이지 이미지 (DCT/JPEG, Flate, ASCII85/ASCIIHex 필터 체인, PNG predictor) | `첨부 scan.pdf > 이미지 1 (OCR)` |
+| zip 안의 위 파일들 | `첨부 a.zip > 신분증.jpg (OCR)` |
+
+- OCR 전에 흑백으로 바꾸고, 작은 이미지는 확대, 큰 이미지는 축소합니다.
+- OCR이 자주 헷갈리는 글자를 **숫자 덩어리 안에서만** 보정합니다 (`O→0`, `l/I/|→1`, `900101 - 1234567`의 공백 제거). 일반 단어는 건드리지 않습니다.
+- 서명 로고처럼 같은 이미지가 반복되면 한 번만 OCR하고, 아이콘처럼 작은 이미지(`min_pixels` 미만)는 건너뜁니다.
+- 부하 제한:
+  - 메일당 `max_images`(20개), 이미지당 `timeout`(20초), 메일당 `total_timeout`(60초)
+  - 메일당 동시 처리 `concurrency`(2), 서버 전체 동시 tesseract 프로세스 `max_processes`(4)
+  - 한도를 넘은 이미지는 **검사 불가**로 보고되어 `actions.uninspectable` 정책을 따릅니다.
+- 처리 시간은 A4 한 장 분량 이미지 기준 약 0.3~1초입니다. SMTP 응답이 그만큼 늦어집니다.
+- Docker 이미지에는 tesseract와 한국어 데이터가 포함되어 있습니다. 직접 설치할 때는 `apt install tesseract-ocr tesseract-ocr-kor`(Debian/Ubuntu) 또는 `apk add tesseract-ocr tesseract-ocr-data-kor`(Alpine)로 설치합니다. `ocr.enabled: true`인데 설치되어 있지 않으면 시작 시 오류로 알려줍니다.
+
+정확도 한계:
+- 인쇄체·화면 캡처는 잘 읽습니다. 손글씨, 심하게 기울거나 흐린 사진, 배경이 복잡한 신분증 사진은 놓칠 수 있습니다.
+- OCR은 보조 수단입니다. 신분증 사본처럼 반드시 막아야 하는 경우에는 `dlp.rules`에 "신분증", "주민등록증" 같은 파일명·제목 규칙을 함께 두기를 권장합니다.
 
 ## 정책 (`dlp.actions`)
 
@@ -111,3 +139,4 @@ secmail은 발신 메일을 **수정하지 않고** 전달하므로, 내부 서�
 
 - 탐지기는 리터럴 힌트(`AKIA`, `ghp_`, `password` 등)나 숫자 토큰 위치 주변에서만 정규식을 실행합니다. 숫자가 빽빽한 최악 조건에서 약 40MB/s입니다 (`go test -bench ScanText ./internal/dlp`).
 - 소스코드·문서 2만여 파일(217MB) 코퍼스 기준 검사 시간은 6초이고, 카드번호 오탐은 2건이었습니다.
+- OCR은 이미지당 약 0.3~1초로, 텍스트 검사보다 훨씬 비쌉니다. 위의 한도 설정으로 조절하세요.

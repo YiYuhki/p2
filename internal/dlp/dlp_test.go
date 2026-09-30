@@ -3,6 +3,7 @@ package dlp
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
@@ -296,7 +297,7 @@ func TestScanMessage(t *testing.T) {
 		"--A\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>접속키 <b>AKIAIOSFODNN7EXAMPLE</b></p>\r\n--A--\r\n" +
 		"--B\r\nContent-Type: text/csv; name=list.csv\r\nContent-Disposition: attachment; filename=list.csv\r\n" +
 		"Content-Transfer-Encoding: base64\r\n\r\n" + base64.StdEncoding.EncodeToString([]byte(csv)) + "\r\n--B--\r\n"
-	rep := newScanner(t).ScanMessage([]byte(msg))
+	rep := newScanner(t).ScanMessage(context.Background(), []byte(msg))
 	if rep.MaxSeverity() != SeverityHigh {
 		t.Fatalf("severity %v", rep.MaxSeverity())
 	}

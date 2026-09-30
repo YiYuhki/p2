@@ -72,6 +72,7 @@
 ### 5. 발신 메일 DLP (`internal/dlp`, `internal/outbound`)
 - 내부 메일 서버의 외부행 메일을 `outbound.listen`(10025)에서 받아 검사한 뒤 `next_hop`으로 전달합니다. 허용된 내부 서버와 자사 발신 도메인만 릴레이할 수 있습니다.
 - 한국 개인정보(주민/외국인등록번호, 여권, 운전면허, 대량 휴대전화)와 카드번호, 클라우드·SaaS API 키, 개인키, DB 접속정보, JWT, 비밀번호를 탐지합니다. 체크섬, 날짜, 문맥 단어, 엔트로피 검사로 오탐을 줄였습니다.
+- **이미지 OCR**(Tesseract 한국어+영어): 스크린샷, 사진, 스캔 PDF, 문서에 붙여 넣은 그림 속 글자도 검사합니다.
 - 등급별 동작(`allow / notify / hold / block`)을 지정합니다. 발신자와 보안담당자에게 마스킹된 탐지 내역을 메일로 알립니다.
 - 보류된 메일은 포털 검토 화면(`/dlp/<token>`)이나 관리 API에서 승인·반려합니다. 기한이 지나면 발송하지 않고 폐기합니다.
 - 모든 탐지는 `dlp_events` 감사 테이블에 남습니다.
@@ -139,6 +140,7 @@ go test -count=1 ./...
 - MIME 변환: 서명·암호화·한글 파일명/EUC-KR·인라인 이미지·전달 메일·깊은 중첩
 - SMTP 종단간: 릴레이 거부, 업스트림 거부 전달, DKIM 재서명 검증, 파싱 불가 메일 격리
 - 포털: 상태별 화면, 1회용 티켓, 만료, rate limit, OTP 로그인·무차별 대입 제한·비수신자 차단·쿠키 위조, SSO 헤더 모드, CSRF
+- OCR: 가짜 엔진으로 중복 제거·크기 필터·한도·시간 초과 검증, 실제 tesseract로 PNG·docx 삽입 그림·스캔 PDF 인식 (tesseract가 설치된 경우에만 실행)
 - DLP: 탐지기 양성/음성 케이스, 실제 형식(docx·xlsx·중첩 zip·암호화 zip·zip bomb·PDF·HWP 레코드·EUC-KR), 발신 정책 종단간(보류→승인/반려/만료, 차단, 예외, 릴레이 보호), 검토 화면·관리 API
 - 실제 HWP 샘플 검증: `SECMAIL_TEST_HWP_DIR=<pyhwp>/tests/hwp5_tests/fixtures go test ./internal/dlp`
 - 저장소 적합성: 같은 테스트를 메모리/PostgreSQL, 파일시스템/S3에 각각 실행, Redis 큐 우선순위·dead-letter, Redis 티켓/OTP

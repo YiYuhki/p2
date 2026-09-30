@@ -61,3 +61,5 @@ dlp:
   admins: [security@example.com]
   notify_from: dlp-noreply@example.com
   hold_ttl: 72h
+  ocr:
+    enabled: true   # tesseract + Korean data ship in the image

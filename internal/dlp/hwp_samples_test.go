@@ -20,14 +20,16 @@ func TestHWPSamples(t *testing.T) {
 	if len(files) == 0 {
 		t.Fatal("no .hwp files found")
 	}
-	withText := 0
+	withText, totalImages := 0, 0
 	for _, f := range files {
 		data, err := os.ReadFile(f)
 		if err != nil {
 			t.Fatal(err)
 		}
 		name := filepath.Base(f)
-		texts, probs := ExtractText(name, name, data, DefaultLimits())
+		ex := Extract(name, name, data, DefaultLimits())
+		texts, probs := ex.Texts, ex.Problems
+		totalImages += len(ex.Images)
 		if strings.HasPrefix(name, "password") {
 			if len(probs) == 0 || !strings.Contains(probs[0], "암호") {
 				t.Errorf("%s: encrypted HWP not reported: %v", name, probs)
@@ -49,6 +51,10 @@ func TestHWPSamples(t *testing.T) {
 			withText++
 			t.Logf("%-40s %q", name, truncate(texts[0].Content, 60))
 		}
+	}
+	t.Logf("embedded pictures extracted: %d", totalImages)
+	if totalImages == 0 {
+		t.Error("no BinData pictures extracted from samples")
 	}
 	if withText == 0 {
 		t.Fatal("no text extracted from any sample")

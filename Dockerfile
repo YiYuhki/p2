@@ -7,7 +7,11 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/secmail ./cmd/secmail \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/mock-analyzer ./cmd/mock-analyzer
 
-FROM gcr.io/distroless/static-debian12:nonroot
+# Alpine (not distroless) because outbound DLP shells out to Tesseract for
+# OCR; Korean + English language data are included.
+FROM alpine:3
+RUN apk add --no-cache ca-certificates tzdata tesseract-ocr tesseract-ocr-data-kor tesseract-ocr-data-eng \
+ && adduser -D -H -u 65532 nonroot
 COPY --from=build /out/secmail /out/mock-analyzer /usr/local/bin/
 USER nonroot
 EXPOSE 2525 8080 8081
