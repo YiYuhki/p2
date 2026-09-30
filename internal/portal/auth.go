@@ -20,6 +20,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/yiyuhki/p2/internal/config"
+	"github.com/yiyuhki/p2/internal/metrics"
 	"github.com/yiyuhki/p2/internal/model"
 )
 
@@ -191,6 +192,7 @@ func (s *Server) authorizeGuard(w http.ResponseWriter, r *http.Request, g guard,
 		return "", false
 	}
 	if !ok {
+		metrics.PortalRequests.WithLabelValues("denied").Inc()
 		s.log.Warn("portal: access denied", "user", user, "resource", g.logID)
 		if asJSON {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})

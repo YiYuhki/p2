@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -113,8 +114,11 @@ func TestPendingThenCleanDownloadFlow(t *testing.T) {
 	if ct := resp.Header.Get("Content-Type"); ct != "application/octet-stream" {
 		t.Fatalf("content type %q", ct)
 	}
-	if cd := resp.Header.Get("Content-Disposition"); !strings.Contains(cd, "filename*=utf-8''") {
-		t.Fatalf("non-ASCII filename should be RFC 2231 encoded: %q", cd)
+	if cd := resp.Header.Get("Content-Disposition"); !strings.Contains(strings.ToLower(cd), "filename*=utf-8''") {
+		t.Fatalf("non-ASCII filename should be RFC 5987 encoded: %q", cd)
+	}
+	if cd := resp.Header.Get("Content-Disposition"); !strings.HasPrefix(cd, "attachment;") {
+		t.Fatalf("must be an attachment disposition: %q", cd)
 	}
 
 	// Ticket is single use.
@@ -189,5 +193,105 @@ func TestRateLimit(t *testing.T) {
 	}
 	if codes[3] != http.StatusTooManyRequests {
 		t.Fatalf("expected throttling, got %v", codes)
+	}
+}
+
+func TestContentDisposition(t *testing.T) {
+	cases := []struct {
+		name      string
+		wantASCII string // filename="..."
+	}{
+		{"report.pdf", "report.pdf"},
+		{"보고서.pdf", "___.pdf"},
+		{`a"b.txt`, "a_b.txt"},         // quote replaced in ascii fallback
+		{"a\r\nb.txt", "ab.txt"},       // control chars stripped
+		{"../../etc/passwd", "passwd"}, // path traversal stripped
+		{"", "download"},               // empty -> download
+		{"..", "download"},             // dotdot -> download
+		{"a/b/c.bin", "c.bin"},         // unix separator stripped
+		{`x\y\z.bin`, "z.bin"},         // windows separator stripped
+	}
+	for _, c := range cases {
+		got := contentDisposition(c.name)
+		if !strings.HasPrefix(got, "attachment;") {
+			t.Errorf("%q: not an attachment disposition: %q", c.name, got)
+		}
+		if !strings.Contains(got, `filename="`+c.wantASCII+`"`) {
+			t.Errorf("%q: want ascii %q, got %q", c.name, c.wantASCII, got)
+		}
+		// The header must never carry a raw quote-break or CR/LF that could
+		// escape the value or inject a header.
+		if v := strings.TrimPrefix(got, `attachment; filename="`); strings.HasPrefix(v, c.wantASCII+`"`) {
+			// ok: the ascii value is properly closed
+		}
+		if strings.ContainsAny(got, "\r\n") {
+			t.Errorf("%q: header contains CR/LF: %q", c.name, got)
+		}
+	}
+	// A non-ASCII name must also emit an RFC 5987 filename* carrying the real name.
+	if got := contentDisposition("보고서.pdf"); !strings.Contains(got, "filename*=UTF-8''") {
+		t.Errorf("non-ASCII name should include filename*: %q", got)
+	}
+	// A plain ASCII name needs no filename*.
+	if got := contentDisposition("report.pdf"); strings.Contains(got, "filename*=") {
+		t.Errorf("ascii name should not include filename*: %q", got)
+	}
+}
+
+func TestAllowFailPerIP(t *testing.T) {
+	// failBurst 3, generous global so only the per-IP budget bites.
+	l := newIPLimiterFull(1000, 1000, 3, 1000, 2000, false)
+	ok := 0
+	for i := 0; i < 10; i++ {
+		if l.AllowFail("10.0.0.1") {
+			ok++
+		}
+	}
+	if ok != 3 {
+		t.Fatalf("per-IP miss budget = %d, want 3", ok)
+	}
+	// A different IP has its own budget.
+	if !l.AllowFail("10.0.0.2") {
+		t.Fatal("second IP should have its own budget")
+	}
+}
+
+func TestAllowFailGlobal(t *testing.T) {
+	// Large per-IP burst but a global cap of 5; spread across many IPs.
+	l := newIPLimiterFull(1000, 1000, 1000, 1, 5, false)
+	ok := 0
+	for i := 0; i < 50; i++ {
+		if l.AllowFail(fmt.Sprintf("172.16.0.%d", i)) {
+			ok++
+		}
+	}
+	if ok != 5 {
+		t.Fatalf("global miss budget = %d, want 5 (distributed guessing must be capped)", ok)
+	}
+}
+
+func TestEnumerationThrottleHTTP(t *testing.T) {
+	f := newFixture(t, time.Now().Add(time.Hour))
+	// Unknown but well-formed tokens: first EnumPerIPBurst (default 10) return
+	// 404, then the client is throttled with 429.
+	var got404, got429 int
+	for i := 0; i < 20; i++ {
+		resp, _ := get(t, f.srv.URL+"/d/"+token.New())
+		switch resp.StatusCode {
+		case http.StatusNotFound:
+			got404++
+		case http.StatusTooManyRequests:
+			got429++
+		default:
+			t.Fatalf("unexpected status %d", resp.StatusCode)
+		}
+	}
+	if got429 == 0 {
+		t.Fatalf("token guessing was never throttled (404=%d 429=%d)", got404, got429)
+	}
+	// A valid token still works despite the guessing storm on the same IP.
+	resp, _ := get(t, f.srv.URL+"/d/"+f.tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("valid token must still resolve, got %d", resp.StatusCode)
 	}
 }

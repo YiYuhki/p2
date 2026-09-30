@@ -274,6 +274,8 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			TicketTTL:         cfg.Portal.TicketTTL,
 			RateLimitRPS:      cfg.Portal.RateLimitRPS,
 			RateLimitBurst:    cfg.Portal.RateLimitBurst,
+			EnumPerIPBurst:    cfg.Portal.EnumPerIPBurst,
+			EnumGlobalRPS:     cfg.Portal.EnumGlobalRPS,
 			TrustProxyHeaders: cfg.Portal.TrustProxyHeaders,
 			Location:          loc,
 			PublicBaseURL:     cfg.Portal.PublicBaseURL,

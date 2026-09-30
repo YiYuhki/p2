@@ -64,6 +64,13 @@ var (
 		Name: "secmail_holds_total",
 		Help: "DLP holds, by event (created/released/rejected/expired).",
 	}, []string{"event"})
+
+	// PortalRequests counts download-portal token lookups by outcome. A spike
+	// in notfound/throttled is the signature of token enumeration.
+	PortalRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "secmail_portal_requests_total",
+		Help: "Download-portal token lookups, by outcome (ok/notfound/throttled/denied/error).",
+	}, []string{"outcome"})
 )
 
 func init() {
@@ -71,7 +78,7 @@ func init() {
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		InboundMessages, Attachments, Verdicts, OutboundMessages,
-		DLPFindings, DLPScanSeconds, ExternalToolSeconds, Holds,
+		DLPFindings, DLPScanSeconds, ExternalToolSeconds, Holds, PortalRequests,
 	)
 }
 

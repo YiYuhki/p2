@@ -45,8 +45,10 @@ portal:
   public_base_url: https://sec-mail.example.com   # used in the links inserted into mail
   link_ttl: 336h                 # 14 days; objects are deleted afterwards
   ticket_ttl: 60s                # one-time download ticket lifetime
-  rate_limit_rps: 5
+  rate_limit_rps: 5              # per-IP cap on all token lookups
   rate_limit_burst: 20
+  enum_per_ip_burst: 10          # missed (unknown) tokens per IP before throttling — anti-guessing
+  enum_global_rps: 20            # aggregate miss rate across all IPs (defeats distributed guessing)
   trust_proxy_headers: true      # behind a reverse proxy / load balancer
   auth:                          # recipient authentication (see docs/deployment.md)
     mode: otp                    # none | otp | header

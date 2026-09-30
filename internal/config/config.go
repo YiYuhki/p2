@@ -193,6 +193,11 @@ type PortalConfig struct {
 	TicketTTL      time.Duration `yaml:"ticket_ttl"`
 	RateLimitRPS   float64       `yaml:"rate_limit_rps"`
 	RateLimitBurst int           `yaml:"rate_limit_burst"`
+	// EnumPerIPBurst is how many missed (unknown/malformed) token lookups a
+	// single client may make before it is throttled; EnumGlobalRPS caps the
+	// aggregate miss rate across all clients (defends distributed guessing).
+	EnumPerIPBurst int     `yaml:"enum_per_ip_burst"`
+	EnumGlobalRPS  float64 `yaml:"enum_global_rps"`
 	// TrustProxyHeaders makes the rate limiter key on X-Forwarded-For.
 	TrustProxyHeaders bool             `yaml:"trust_proxy_headers"`
 	Auth              PortalAuthConfig `yaml:"auth"`
@@ -311,6 +316,8 @@ func Default() Config {
 			TicketTTL:      60 * time.Second,
 			RateLimitRPS:   5,
 			RateLimitBurst: 20,
+			EnumPerIPBurst: 10,
+			EnumGlobalRPS:  20,
 			Auth: PortalAuthConfig{
 				Mode:           AuthNone,
 				SessionTTL:     12 * time.Hour,

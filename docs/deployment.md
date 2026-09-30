@@ -67,6 +67,16 @@ Set-TransportConfig -InternalSMTPServers @{Add="10.0.5.20"}
 - 반드시 HTTPS 리버스 프록시 뒤에 둡니다 (쿠키 `Secure` 플래그는 `public_base_url`이 `https://`면 자동 적용).
 - 프록시 뒤라면 `trust_proxy_headers: true` (IP별 rate limit이 `X-Forwarded-For` 기준으로 동작).
 
+### 토큰 추측·열거 방어
+
+다운로드 링크는 256비트 난수 토큰(해시만 저장)이라 추측이 사실상 불가능하지만, 무차별 대입 시도 자체를 억제하고 탐지할 수 있게 다층 방어를 둡니다.
+
+- **일반 rate limit** (`rate_limit_rps`/`rate_limit_burst`): IP별 전체 요청 상한. 정상적인 페이지 열람·상태 폴링을 포괄합니다.
+- **열거 방어** (`enum_per_ip_burst`/`enum_global_rps`): *실패한* 조회(존재하지 않거나 형식이 잘못된 토큰)에만 부과하는 별도 예산입니다. 정상 사용자는 유효한 링크를 따라오므로 거의 실패하지 않습니다. 실패가 몰리면 그 IP는 `enum_per_ip_burst`회(기본 10) 후 `429`로 제한되고, 여러 IP로 분산된 공격도 전체 `enum_global_rps`(기본 20/s) 상한으로 함께 막힙니다. 유효 토큰 요청은 이 예산을 소비하지 않으므로 공격 중에도 정상 다운로드는 영향받지 않습니다.
+- 존재하지 않는 토큰은 형식 오류든 미등록이든 **동일하게 404/429**만 반환해, 추측한 토큰의 존재 여부를 노출하지 않습니다.
+- 다운로드 파일은 항상 `Content-Disposition: attachment`(제어문자·경로 제거, 원본 파일명은 RFC 5987 `filename*`)로 내려보내 브라우저 인라인 렌더링(HTML/SVG 등)을 차단하고, `Content-Security-Policy: default-src 'none'; sandbox`를 함께 적용합니다.
+- 열거 시도는 `secmail_portal_requests_total{outcome="notfound"|"throttled"}` 메트릭과 경고 로그로 드러납니다. `notfound`/`throttled`의 급증에 알림을 걸어 두세요. 성공 다운로드는 `download_events` 테이블에도 감사 기록됩니다.
+
 ### 수신자 인증 모드 (`portal.auth.mode`)
 
 | 모드 | 동작 | 적합한 환경 |
@@ -193,5 +203,6 @@ Internal API 리스너(`internal_api.listen`, 기본 8081)에서 다음을 인�
 | `secmail_dlp_scan_seconds` | 발신 메일 검사 소요시간 히스토그램 |
 | `secmail_external_tool_seconds{tool}` | OCR/변환/압축해제 소요시간(ocr/pdf/heif/archive) |
 | `secmail_holds_total{event}` | 보류 생성/승인/반려/만료 |
+| `secmail_portal_requests_total{outcome}` | 포털 토큰 조회 결과(ok/notfound/throttled/denied/error) — notfound·throttled 급증은 토큰 열거 신호 |
 
 Kubernetes 예: livenessProbe → `/healthz`, readinessProbe → `/readyz`. Prometheus scrape 대상은 `<secmail>:8081/metrics`.

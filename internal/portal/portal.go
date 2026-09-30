@@ -15,13 +15,13 @@ import (
 	"html/template"
 	"io"
 	"log/slog"
-	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/yiyuhki/p2/internal/metrics"
 	"github.com/yiyuhki/p2/internal/model"
 	"github.com/yiyuhki/p2/internal/storage"
 	"github.com/yiyuhki/p2/internal/store"
@@ -47,9 +47,13 @@ var tmpl = template.Must(template.New("page.html").Funcs(template.FuncMap{
 }).ParseFS(templateFS, "templates/*.html"))
 
 type Options struct {
-	TicketTTL         time.Duration
-	RateLimitRPS      float64
-	RateLimitBurst    int
+	TicketTTL      time.Duration
+	RateLimitRPS   float64
+	RateLimitBurst int
+	// EnumPerIPBurst / EnumGlobalRPS bound token-guessing (failed lookups);
+	// zero values fall back to safe defaults.
+	EnumPerIPBurst    int
+	EnumGlobalRPS     float64
 	TrustProxyHeaders bool
 	Location          *time.Location
 	// PublicBaseURL is used to validate the Origin of POST requests.
@@ -83,7 +87,8 @@ func New(st store.Store, obj storage.Storage, tk Tickets, opts Options, log *slo
 	return &Server{
 		store: st, storage: obj, tickets: tk, codes: opts.Codes, mailer: opts.Mailer,
 		opts: opts, log: log, now: time.Now,
-		limiter: newIPLimiter(opts.RateLimitRPS, opts.RateLimitBurst, opts.TrustProxyHeaders),
+		limiter: newIPLimiterFull(opts.RateLimitRPS, opts.RateLimitBurst,
+			opts.EnumPerIPBurst, opts.EnumGlobalRPS, 0, opts.TrustProxyHeaders),
 	}
 }
 
@@ -165,26 +170,46 @@ func (s *Server) effectiveStatus(a *model.Attachment) model.Status {
 // lookup resolves the path token; it writes the error response itself.
 func (s *Server) lookup(w http.ResponseWriter, r *http.Request, asJSON bool) (*model.Attachment, bool) {
 	if !s.limiter.Allow(r) {
+		metrics.PortalRequests.WithLabelValues("throttled").Inc()
 		w.Header().Set("Retry-After", "5")
 		s.fail(w, r, http.StatusTooManyRequests, asJSON, "요청이 너무 많습니다. 잠시 후 다시 시도하세요.")
 		return nil, false
 	}
 	tok := r.PathValue("token")
 	if !token.WellFormed(tok) {
-		s.fail(w, r, http.StatusNotFound, asJSON, "")
-		return nil, false
+		return nil, s.miss(w, r, asJSON)
 	}
 	a, err := s.store.GetAttachmentByTokenHash(r.Context(), token.Hash(tok))
 	if errors.Is(err, store.ErrNotFound) {
-		s.fail(w, r, http.StatusNotFound, asJSON, "")
-		return nil, false
+		return nil, s.miss(w, r, asJSON)
 	}
 	if err != nil {
+		metrics.PortalRequests.WithLabelValues("error").Inc()
 		s.log.Error("portal: lookup failed", "err", err)
 		s.fail(w, r, http.StatusInternalServerError, asJSON, "일시적인 오류가 발생했습니다.")
 		return nil, false
 	}
+	metrics.PortalRequests.WithLabelValues("ok").Inc()
 	return a, true
+}
+
+// miss handles a lookup that resolved no attachment (unknown or malformed
+// token). It charges the enumeration budget and returns 429 once a client — or
+// the gateway as a whole — is guessing tokens too fast, and a plain 404
+// otherwise. Either response is identical for every unknown token, so it never
+// reveals whether a guessed token exists. Always returns false.
+func (s *Server) miss(w http.ResponseWriter, r *http.Request, asJSON bool) bool {
+	ip := s.limiter.clientIP(r)
+	if !s.limiter.AllowFail(ip) {
+		metrics.PortalRequests.WithLabelValues("throttled").Inc()
+		s.log.Warn("portal: token enumeration throttled", "ip", ip)
+		w.Header().Set("Retry-After", "30")
+		s.fail(w, r, http.StatusTooManyRequests, asJSON, "요청이 너무 많습니다. 잠시 후 다시 시도하세요.")
+		return false
+	}
+	metrics.PortalRequests.WithLabelValues("notfound").Inc()
+	s.fail(w, r, http.StatusNotFound, asJSON, "")
+	return false
 }
 
 type pageData struct {
@@ -309,7 +334,7 @@ func (s *Server) file(w http.ResponseWriter, r *http.Request) {
 
 	h := w.Header()
 	h.Set("Content-Type", "application/octet-stream")
-	h.Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": a.Filename}))
+	h.Set("Content-Disposition", contentDisposition(a.Filename))
 	h.Set("Content-Length", strconv.FormatInt(a.Size, 10))
 	h.Set("Content-Security-Policy", "default-src 'none'; sandbox")
 	w.WriteHeader(http.StatusOK)
@@ -347,6 +372,63 @@ func (s *Server) render(w http.ResponseWriter, code int, d pageData) {
 	if err := tmpl.ExecuteTemplate(w, "page.html", d); err != nil {
 		s.log.Error("portal: render", "err", err)
 	}
+}
+
+// contentDisposition builds an "attachment" Content-Disposition that is always
+// well-formed, so the browser downloads the file rather than rendering it
+// inline (which would be dangerous for html/svg). It carries a sanitised ASCII
+// filename plus an RFC 5987 filename* for the original UTF-8 name; control
+// characters, quotes and path separators are stripped from both.
+func contentDisposition(name string) string {
+	// Reduce to a bare filename: drop any directory components on either
+	// separator, so a saved file can never traverse out of its folder.
+	name = name[strings.LastIndexAny(name, "/\\")+1:]
+	// Drop control characters (they could inject header lines or hide an
+	// extension from the user).
+	name = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, name)
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." {
+		name = "download"
+	}
+
+	// ASCII fallback for legacy clients: printable ASCII only, no quotes/backslash.
+	var ascii strings.Builder
+	for _, r := range name {
+		if r < 0x20 || r > 0x7e || r == '"' || r == '\\' {
+			ascii.WriteByte('_')
+		} else {
+			ascii.WriteRune(r)
+		}
+	}
+	disp := `attachment; filename="` + ascii.String() + `"`
+
+	// RFC 5987 filename* preserves the original UTF-8 name for modern clients.
+	if enc := rfc5987(name); enc != ascii.String() {
+		disp += `; filename*=UTF-8''` + enc
+	}
+	return disp
+}
+
+const rfc5987Unreserved = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$&+-.^_`|~"
+
+func rfc5987(s string) string {
+	var b strings.Builder
+	for _, c := range []byte(s) {
+		if strings.IndexByte(rfc5987Unreserved, c) >= 0 {
+			b.WriteByte(c)
+		} else {
+			const hex = "0123456789ABCDEF"
+			b.WriteByte('%')
+			b.WriteByte(hex[c>>4])
+			b.WriteByte(hex[c&0x0f])
+		}
+	}
+	return b.String()
 }
 
 func nonce() string {
