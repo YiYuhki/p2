@@ -287,3 +287,75 @@ func (w testWriter) Write(p []byte) (int, error) {
 	w.t.Log(strings.TrimSpace(string(p)))
 	return len(p), nil
 }
+
+// stubQ satisfies Quarantiner; it is never called for attachment-free mail.
+type stubQ struct{}
+
+func (stubQ) Quarantine(context.Context, *model.Message, []*mimeproc.Extracted) ([]service.Link, error) {
+	return nil, nil
+}
+
+func TestSpoofedAuthResultsStripped(t *testing.T) {
+	proc := NewProcessor(stubQ{}, ProcessorOptions{
+		Hostname: "gw.example.com", GatewayID: "test-gw", LinkTTL: time.Hour,
+		VerifyDKIM: true,
+		LookupTXT:  func(string) ([]string, error) { return nil, errors.New("no key") },
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	raw := "From: sender@ext.org\r\n" +
+		"To: user@example.com\r\n" +
+		"Subject: hi\r\n" +
+		// Forged: claims OUR authserv-id -> must be removed.
+		"Authentication-Results: gw.example.com; dkim=pass header.d=trusted-bank.com\r\n" +
+		// Forged with a version token before the id -> still ours.
+		"Authentication-Results: gw.example.com 1; spf=pass smtp.mailfrom=trusted-bank.com\r\n" +
+		// Legitimate upstream result from a different authserv-id -> must survive.
+		"Authentication-Results: relay.internal.example.com; dkim=pass header.d=ext.org\r\n" +
+		"\r\n" +
+		"hello\r\n"
+
+	out, err := proc.Process(context.Background(), Envelope{
+		MailFrom: "sender@ext.org", RcptTo: []string{"user@example.com"}, RemoteAddr: "203.0.113.9:2500",
+	}, []byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := mimeproc.Parse(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ours, legit int
+	for _, v := range parsed.Header.Values("Authentication-Results") {
+		if strings.Contains(v, "trusted-bank.com") {
+			t.Fatalf("forged Authentication-Results survived: %q", v)
+		}
+		switch authResultsID(v) {
+		case "gw.example.com":
+			ours++ // the gateway's own freshly-computed result
+		case "relay.internal.example.com":
+			legit++
+		}
+	}
+	if legit != 1 {
+		t.Fatalf("legitimate upstream Authentication-Results should be preserved (got %d)", legit)
+	}
+	// We verify DKIM, so exactly one fresh gateway result (dkim=none here) is added.
+	if ours != 1 {
+		t.Fatalf("want exactly one gateway-authored Authentication-Results, got %d", ours)
+	}
+}
+
+func TestAuthResultsID(t *testing.T) {
+	cases := map[string]string{
+		"gw.example.com; dkim=pass":  "gw.example.com",
+		"  GW.Example.com ; x":       "gw.example.com",
+		"gw.example.com 1; spf=pass": "gw.example.com",
+		"other.host; dkim=fail":      "other.host",
+		"gw.example.com":             "gw.example.com",
+	}
+	for in, want := range cases {
+		if got := authResultsID(in); got != want {
+			t.Errorf("authResultsID(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

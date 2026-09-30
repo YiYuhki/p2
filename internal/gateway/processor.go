@@ -119,6 +119,11 @@ func (p *Processor) Process(ctx context.Context, env Envelope, raw []byte) ([]by
 func (p *Processor) finish(ctx context.Context, log *slog.Logger, env Envelope, queueID string, root *mimeproc.Part,
 	atts []*mimeproc.Extracted, notice, authResults string, modified bool) ([]byte, error) {
 
+	// RFC 8601 §5: strip any inbound Authentication-Results that claim this
+	// gateway's identity, so a sender cannot forge results downstream filters
+	// would trust as ours. Done unconditionally, even when we do not verify.
+	stripSpoofedAuthResults(&root.Header, p.opts.Hostname)
+
 	msgID := ""
 	if len(atts) > 0 {
 		meta := &model.Message{
@@ -210,6 +215,35 @@ func stripGatewayHeaders(h *textproto.Header) {
 			fields.Del()
 		}
 	}
+}
+
+// stripSpoofedAuthResults removes Authentication-Results header fields whose
+// authserv-id matches this gateway (RFC 8601 §5). Fields authored by other
+// (trusted upstream) authserv-ids are left in place.
+func stripSpoofedAuthResults(h *textproto.Header, authservID string) {
+	id := strings.ToLower(strings.TrimSpace(authservID))
+	if id == "" {
+		return
+	}
+	fields := h.Fields()
+	for fields.Next() {
+		if strings.EqualFold(fields.Key(), "Authentication-Results") && authResultsID(fields.Value()) == id {
+			fields.Del()
+		}
+	}
+}
+
+// authResultsID returns the lower-cased authserv-id of an Authentication-Results
+// value: the first token, before any version number or the first ';'.
+func authResultsID(v string) string {
+	v = strings.TrimSpace(v)
+	if i := strings.IndexByte(v, ';'); i >= 0 {
+		v = v[:i]
+	}
+	if i := strings.IndexAny(v, " \t"); i >= 0 { // drop optional version token
+		v = v[:i]
+	}
+	return strings.ToLower(strings.TrimSpace(v))
 }
 
 func renameHeader(h *textproto.Header, from, to string) {

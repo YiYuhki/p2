@@ -28,7 +28,7 @@ secmail을 인터넷과 내부 메일 서버 사이에 넣을 때 필요한 DNS,
 
 그래서 내부 메일 서버는 다음과 같이 설정해야 합니다.
 1. 게이트웨이 IP에서 오는 연결을 **신뢰된 릴레이**로 등록하고, 그 연결에서는 SPF/DKIM/DMARC 재검사를 끕니다.
-2. 게이트웨이가 남긴 `Authentication-Results: secmail.example.com; dkim=...` 헤더(수정 전 원본 검증 결과)를 신뢰합니다. 게이트웨이는 발신자가 넣은 `X-SecMail-*` 헤더를 항상 지우므로 위조할 수 없습니다.
+2. 게이트웨이가 남긴 `Authentication-Results: secmail.example.com; dkim=...` 헤더(수정 전 원본 검증 결과)를 신뢰합니다. 게이트웨이는 발신자가 넣은 `X-SecMail-*` 헤더를 항상 지우고, **자신의 authserv-id(`hostname`)를 사칭한 인바운드 `Authentication-Results` 헤더도 제거**하므로(RFC 8601 §5) 위조할 수 없습니다. 다른 authserv-id로 된 상류 결과는 그대로 보존됩니다. 따라서 내부 서버의 `TrustedAuthservIDs`에는 게이트웨이 `hostname`만 신뢰 대상으로 등록하세요.
 3. 게이트웨이 IP 외에는 25번 포트를 막아 **게이트웨이 우회를 차단**합니다. 우회가 가능하면 첨부파일 격리가 무력화됩니다.
 
 ### Postfix
