@@ -136,6 +136,8 @@ func prepare(b []byte, maxPixels int) ([]byte, error) {
 	// Flatten transparency onto white (screenshots, logos).
 	draw.Draw(dst, dst.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
 	draw.CatmullRom.Scale(dst, dst.Bounds(), src, src.Bounds(), draw.Over, nil)
+	// Contrast-stretch and deskew for photos/scans.
+	dst = preprocessGray(dst)
 	var out bytes.Buffer
 	if err := (&png.Encoder{CompressionLevel: png.BestSpeed}).Encode(&out, dst); err != nil {
 		return nil, err
