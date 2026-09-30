@@ -262,12 +262,18 @@ type FSConfig struct {
 type DatabaseConfig struct {
 	Type string `yaml:"type"` // postgres | memory
 	DSN  string `yaml:"dsn"`
+	// Connection pool tuning (0 = pgx default; DSN pool params still apply).
+	MaxConns        int32         `yaml:"max_conns"`
+	MinConns        int32         `yaml:"min_conns"`
+	ConnMaxLifetime time.Duration `yaml:"conn_max_lifetime"`
 }
 
 type RedisConfig struct {
 	Addr     string `yaml:"addr"`
 	Password string `yaml:"password"`
 	DB       int    `yaml:"db"`
+	// PoolSize caps connections per instance (0 = go-redis default, 10×CPU).
+	PoolSize int `yaml:"pool_size"`
 }
 
 type QueueConfig struct {
@@ -328,7 +334,7 @@ func Default() Config {
 		},
 		InternalAPI: InternalAPIConfig{Listen: "127.0.0.1:8081"},
 		Storage:     StorageConfig{Type: "fs", FS: FSConfig{Dir: "./data/objects"}},
-		Database:    DatabaseConfig{Type: "memory"},
+		Database:    DatabaseConfig{Type: "memory", MaxConns: 20, MinConns: 2, ConnMaxLifetime: 30 * time.Minute},
 		Redis:       RedisConfig{Addr: "localhost:6379"},
 		Queue:       QueueConfig{Type: "memory", KeyPrefix: "secmail"},
 		Outbound: OutboundConfig{Listen: ":10025", MaxMessageBytes: 50 << 20,

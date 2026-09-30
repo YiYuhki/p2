@@ -67,6 +67,42 @@ func main() {
 	}
 }
 
+// startupReadyTimeout bounds how long the process waits for a dependency
+// (database, storage, Redis) to become reachable at boot, smoothing over
+// start-ordering races in orchestrated environments before failing.
+const startupReadyTimeout = 30 * time.Second
+
+// waitReady retries connect until it succeeds or the timeout elapses, backing
+// off exponentially (1s→5s). It returns the last error on timeout.
+func waitReady(ctx context.Context, log *slog.Logger, name string, timeout time.Duration, connect func(context.Context) error) error {
+	deadline := time.Now().Add(timeout)
+	delay := time.Second
+	for attempt := 1; ; attempt++ {
+		err := connect(ctx)
+		if err == nil {
+			if attempt > 1 {
+				log.Info("dependency ready", "name", name, "attempts", attempt)
+			}
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s not ready after %s: %w", name, timeout, err)
+		}
+		log.Warn("dependency not ready, retrying", "name", name, "attempt", attempt, "err", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		if delay < 5*time.Second {
+			delay *= 2
+		}
+	}
+}
+
 func run(cfgPath, components string, log *slog.Logger) error {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
@@ -91,7 +127,14 @@ func run(cfgPath, components string, log *slog.Logger) error {
 	var st store.Store
 	switch cfg.Database.Type {
 	case "postgres":
-		pg, err := store.NewPostgres(ctx, cfg.Database.DSN)
+		pg, err := store.Open(ctx, store.PGOptions{
+			DSN:             cfg.Database.DSN,
+			MaxConns:        cfg.Database.MaxConns,
+			MinConns:        cfg.Database.MinConns,
+			MaxConnLifetime: cfg.Database.ConnMaxLifetime,
+			ReadyTimeout:    startupReadyTimeout,
+			Log:             log,
+		})
 		if err != nil {
 			return err
 		}
@@ -104,8 +147,15 @@ func run(cfgPath, components string, log *slog.Logger) error {
 	}
 	defer st.Close()
 
-	obj, err := storage.New(ctx, cfg.Storage)
-	if err != nil {
+	var obj storage.Storage
+	if err := waitReady(ctx, log, "storage", startupReadyTimeout, func(ctx context.Context) error {
+		o, err := storage.New(ctx, cfg.Storage)
+		if err != nil {
+			return err
+		}
+		obj = o
+		return nil
+	}); err != nil {
 		return err
 	}
 
@@ -115,9 +165,17 @@ func run(cfgPath, components string, log *slog.Logger) error {
 	var codes portal.CodeStore
 	switch cfg.Queue.Type {
 	case "redis":
-		rdb = redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB})
-		if err := rdb.Ping(ctx).Err(); err != nil {
-			return fmt.Errorf("redis: %w", err)
+		rdb = redis.NewClient(&redis.Options{
+			Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB,
+			PoolSize:     cfg.Redis.PoolSize,
+			DialTimeout:  5 * time.Second,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+		})
+		if err := waitReady(ctx, log, "redis", startupReadyTimeout, func(ctx context.Context) error {
+			return rdb.Ping(ctx).Err()
+		}); err != nil {
+			return err
 		}
 		defer rdb.Close()
 		q = queue.NewRedis(rdb, cfg.Queue.KeyPrefix, log)

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"sort"
 	"time"
 
@@ -23,14 +24,40 @@ type Postgres struct {
 	pool *pgxpool.Pool
 }
 
+// PGOptions configures the connection pool and startup behaviour. Zero values
+// keep pgx defaults, except ReadyTimeout (0 = ping once, no retry).
+type PGOptions struct {
+	DSN               string
+	MaxConns          int32
+	MinConns          int32
+	MaxConnLifetime   time.Duration
+	MaxConnIdleTime   time.Duration
+	HealthCheckPeriod time.Duration
+	// ReadyTimeout bounds how long Open retries the initial connection while
+	// the database is still starting up. 0 means a single attempt.
+	ReadyTimeout time.Duration
+	Log          *slog.Logger
+}
+
+// NewPostgres opens a pool with default tuning (convenience for tests).
 func NewPostgres(ctx context.Context, dsn string) (*Postgres, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+	return Open(ctx, PGOptions{DSN: dsn})
+}
+
+// Open builds a tuned connection pool, waits (with backoff) for the database to
+// accept connections, then applies migrations.
+func Open(ctx context.Context, opts PGOptions) (*Postgres, error) {
+	cfg, err := poolConfig(opts)
 	if err != nil {
 		return nil, err
 	}
-	if err := pool.Ping(ctx); err != nil {
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := pingWithRetry(ctx, pool, opts.ReadyTimeout, opts.Log); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("postgres: ping: %w", err)
+		return nil, err
 	}
 	p := &Postgres{pool: pool}
 	if err := p.migrate(ctx); err != nil {
@@ -38,6 +65,69 @@ func NewPostgres(ctx context.Context, dsn string) (*Postgres, error) {
 		return nil, err
 	}
 	return p, nil
+}
+
+// poolConfig parses the DSN and overlays the non-zero tuning options.
+func poolConfig(opts PGOptions) (*pgxpool.Config, error) {
+	cfg, err := pgxpool.ParseConfig(opts.DSN)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse dsn: %w", err)
+	}
+	if opts.MaxConns > 0 {
+		cfg.MaxConns = opts.MaxConns
+	}
+	if opts.MinConns > 0 {
+		cfg.MinConns = opts.MinConns
+	}
+	if opts.MaxConnLifetime > 0 {
+		cfg.MaxConnLifetime = opts.MaxConnLifetime
+	}
+	if opts.MaxConnIdleTime > 0 {
+		cfg.MaxConnIdleTime = opts.MaxConnIdleTime
+	}
+	if opts.HealthCheckPeriod > 0 {
+		cfg.HealthCheckPeriod = opts.HealthCheckPeriod
+	}
+	return cfg, nil
+}
+
+// pingWithRetry pings until success or the timeout elapses, backing off
+// exponentially (1s→5s). A zero timeout pings once.
+func pingWithRetry(ctx context.Context, pool *pgxpool.Pool, timeout time.Duration, log *slog.Logger) error {
+	if timeout <= 0 {
+		if err := pool.Ping(ctx); err != nil {
+			return fmt.Errorf("postgres: ping: %w", err)
+		}
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	delay := time.Second
+	for attempt := 1; ; attempt++ {
+		err := pool.Ping(ctx)
+		if err == nil {
+			if attempt > 1 && log != nil {
+				log.Info("postgres ready", "attempts", attempt)
+			}
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("postgres: not ready after %s: %w", timeout, err)
+		}
+		if log != nil {
+			log.Warn("postgres not ready, retrying", "attempt", attempt, "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		if delay < 5*time.Second {
+			delay *= 2
+		}
+	}
 }
 
 // migrate applies embedded migrations in lexical order, serialised across

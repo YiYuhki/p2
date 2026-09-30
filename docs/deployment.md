@@ -110,6 +110,8 @@ portal:
 - 상태는 PostgreSQL·Redis·S3에만 있으므로 `-components smtp`, `-components portal`을 여러 대 띄워 수평 확장할 수 있습니다.
 - `worker`(판정 소비 + janitor)는 여러 대 떠도 안전하지만(판정은 `PENDING`에서 한 번만 반영) 1~2대면 충분합니다.
 - MX를 여러 게이트웨이에 걸어 두면 한 대가 죽어도 발신 MTA가 다른 MX로 재시도합니다. 게이트웨이는 업스트림이 수락해야만 250을 응답하므로 메일이 유실되지 않습니다.
+- **의존성 기동 대기**: 부팅 시 DB·스토리지·Redis가 아직 준비되지 않았으면 최대 30초(지수 백오프)까지 재시도한 뒤 실패합니다. compose/k8s에서 컨테이너 기동 순서가 어긋나도 게이트웨이가 스스로 붙습니다.
+- **커넥션 풀**: `database.max_conns`/`min_conns`/`conn_max_lifetime`로 PostgreSQL 풀을, `redis.pool_size`로 Redis 풀을 인스턴스별로 조정합니다. 수평 확장 시 인스턴스 수 × `max_conns` 가 PostgreSQL `max_connections`를 넘지 않게 하세요. Redis 명령은 go-redis 기본 정책상 3회 재시도되며, 명령 타임아웃(dial 5s, read/write 3s)이 설정돼 있어 장애 시 무한 대기하지 않습니다.
 
 ## 6. 운영 점검 항목
 

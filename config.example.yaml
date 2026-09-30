@@ -84,11 +84,17 @@ storage:
 database:
   type: postgres                 # postgres | memory
   dsn: ${SECMAIL_DATABASE_DSN}   # postgres://user:pass@host:5432/secmail?sslmode=require
+  max_conns: 20                  # pool size per instance (0 = pgx default)
+  min_conns: 2                   # warm connections kept open
+  conn_max_lifetime: 30m         # recycle connections (avoids stale server-side state)
+  # At startup the gateway waits up to 30s (exponential backoff) for the
+  # database, storage and Redis to become reachable before giving up.
 
 redis:
   addr: redis.internal.example.com:6379
   password: ${SECMAIL_REDIS_PASSWORD}
   db: 0
+  pool_size: 0                   # 0 = go-redis default (10×CPU)
 
 queue:
   type: redis                    # redis | memory
