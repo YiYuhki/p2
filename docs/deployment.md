@@ -207,5 +207,6 @@ Internal API 리스너(`internal_api.listen`, 기본 8081)에서 다음을 인�
 | `secmail_external_tool_seconds{tool}` | OCR/변환/압축해제 소요시간(ocr/pdf/heif/archive) |
 | `secmail_holds_total{event}` | 보류 생성/승인/반려/만료 |
 | `secmail_portal_requests_total{outcome}` | 포털 토큰 조회 결과(ok/notfound/throttled/denied/error) — notfound·throttled 급증은 토큰 열거 신호 |
+| `secmail_inbound_auth_total{method,result}` | 인바운드 인증 결과(spf/dkim × pass/fail/none/…) — fail·none 급증은 스푸핑 신호 |
 
 Kubernetes 예: livenessProbe → `/healthz`, readinessProbe → `/readyz`. Prometheus scrape 대상은 `<secmail>:8081/metrics`.

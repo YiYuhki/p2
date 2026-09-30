@@ -14,6 +14,7 @@ import (
 	"github.com/emersion/go-smtp"
 
 	"github.com/yiyuhki/p2/internal/dkimutil"
+	"github.com/yiyuhki/p2/internal/metrics"
 	"github.com/yiyuhki/p2/internal/mimeproc"
 	"github.com/yiyuhki/p2/internal/model"
 	"github.com/yiyuhki/p2/internal/service"
@@ -190,7 +191,37 @@ func (p *Processor) authenticate(ctx context.Context, env Envelope, raw []byte) 
 	if p.opts.VerifyDKIM {
 		methods = append(methods, dkimutil.Verify(raw, p.opts.LookupTXT))
 	}
-	return strings.Join(methods, "; ")
+	joined := strings.Join(methods, "; ")
+	recordAuthMetrics(joined)
+	return joined
+}
+
+// recordAuthMetrics parses the RFC 8601 method list and counts each
+// method=result pair (e.g. spf=pass, dkim=fail). Unknown methods are ignored so
+// the metric's label set stays bounded.
+func recordAuthMetrics(results string) {
+	for _, method := range strings.Split(results, ";") {
+		method = strings.TrimSpace(method)
+		if method == "" {
+			continue
+		}
+		kv := strings.SplitN(method, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		name := strings.TrimSpace(kv[0])
+		if name != "spf" && name != "dkim" {
+			continue
+		}
+		// The result is the token immediately after '='; drop any properties.
+		result := strings.TrimSpace(kv[1])
+		if i := strings.IndexAny(result, " \t"); i >= 0 {
+			result = result[:i]
+		}
+		if result != "" {
+			metrics.InboundAuth.WithLabelValues(name, result).Inc()
+		}
+	}
 }
 
 func (p *Processor) received(env Envelope, queueID string) string {

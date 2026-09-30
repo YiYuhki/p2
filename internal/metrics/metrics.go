@@ -71,6 +71,14 @@ var (
 		Name: "secmail_portal_requests_total",
 		Help: "Download-portal token lookups, by outcome (ok/notfound/throttled/denied/error).",
 	}, []string{"outcome"})
+
+	// InboundAuth counts inbound message authentication results by method and
+	// outcome (e.g. spf=fail, dkim=pass). A rise in fail/none can indicate
+	// spoofing or a misconfigured sender.
+	InboundAuth = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "secmail_inbound_auth_total",
+		Help: "Inbound authentication results, by method (spf/dkim) and result (pass/fail/none/...).",
+	}, []string{"method", "result"})
 )
 
 func init() {
@@ -78,7 +86,7 @@ func init() {
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		InboundMessages, Attachments, Verdicts, OutboundMessages,
-		DLPFindings, DLPScanSeconds, ExternalToolSeconds, Holds, PortalRequests,
+		DLPFindings, DLPScanSeconds, ExternalToolSeconds, Holds, PortalRequests, InboundAuth,
 	)
 }
 

@@ -399,3 +399,12 @@ func TestSPFResultInAuthResults(t *testing.T) {
 		t.Fatalf("DKIM result missing: %q", ar)
 	}
 }
+
+func TestRecordAuthMetricsParsing(t *testing.T) {
+	// Should not panic and should ignore unknown methods / malformed tokens.
+	recordAuthMetrics("spf=pass smtp.mailfrom=ex.org; dkim=fail header.d=ex.org")
+	recordAuthMetrics("dkim=none")
+	recordAuthMetrics("")
+	recordAuthMetrics("garbage; iprev=pass; spf=")
+	// The metric is a global counter; we only assert the parser is robust here.
+}
