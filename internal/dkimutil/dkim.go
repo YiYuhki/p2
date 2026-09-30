@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/emersion/go-msgauth/dkim"
+
+	"github.com/yiyuhki/p2/internal/authres"
 )
 
 // Signer signs outgoing (rewritten) messages.
@@ -111,16 +113,7 @@ func Verify(msg []byte, lookup func(string) ([]string, error)) string {
 		default:
 			res = "fail"
 		}
-		parts = append(parts, fmt.Sprintf("dkim=%s header.d=%s", res, sanitize(v.Domain)))
+		parts = append(parts, fmt.Sprintf("dkim=%s header.d=%s", res, authres.Sanitize(v.Domain)))
 	}
 	return strings.Join(parts, "; ")
-}
-
-func sanitize(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r == ';' || r == '\r' || r == '\n' || r < 0x20 {
-			return -1
-		}
-		return r
-	}, s)
 }

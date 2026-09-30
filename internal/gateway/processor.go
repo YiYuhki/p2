@@ -79,7 +79,12 @@ func (p *Processor) Process(ctx context.Context, env Envelope, raw []byte) ([]by
 	queueID := newQueueID()
 	log := p.log.With("queue_id", queueID, "from", env.MailFrom, "rcpt", env.RcptTo)
 
-	authResults := p.authenticate(ctx, env, raw)
+	// Authenticate (SPF/DKIM) concurrently with parsing: both only read raw,
+	// and the DNS lookups overlap with the CPU-bound MIME parse instead of
+	// adding to it. The buffered channel means the goroutine never leaks even on
+	// the early-return paths that do not consume the result.
+	authCh := make(chan string, 1)
+	go func() { authCh <- p.authenticate(ctx, env, raw) }()
 
 	root, err := mimeproc.Parse(raw)
 	if err != nil {
@@ -91,7 +96,7 @@ func (p *Processor) Process(ctx context.Context, env Envelope, raw []byte) ([]by
 		}
 		return p.finish(ctx, log, env, queueID, root, []*mimeproc.Extracted{{
 			Filename: "original-message.eml", ContentType: "message/rfc822", Data: raw,
-		}}, "원본 메일의 구조를 해석할 수 없어 메일 전체를 첨부파일로 보관했습니다.", authResults, true)
+		}}, "원본 메일의 구조를 해석할 수 없어 메일 전체를 첨부파일로 보관했습니다.", <-authCh, true)
 	}
 
 	stripGatewayHeaders(&root.Header)
@@ -114,7 +119,7 @@ func (p *Processor) Process(ctx context.Context, env Envelope, raw []byte) ([]by
 		notice = "첨부파일 분리로 인해 원본 메일의 전자서명(S/MIME/PGP)이 제거되었습니다."
 		root.Header.Add("X-SecMail-Notice", "signature-removed")
 	}
-	return p.finish(ctx, log, env, queueID, root, res.Attachments, notice, authResults, len(res.Attachments) > 0)
+	return p.finish(ctx, log, env, queueID, root, res.Attachments, notice, <-authCh, len(res.Attachments) > 0)
 }
 
 func (p *Processor) finish(ctx context.Context, log *slog.Logger, env Envelope, queueID string, root *mimeproc.Part,

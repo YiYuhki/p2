@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"blitiri.com.ar/go/spf"
+
+	"github.com/yiyuhki/p2/internal/authres"
 )
 
 // Resolver is the DNS surface SPF needs; *net.Resolver satisfies it, and tests
@@ -33,35 +35,36 @@ func New(resolver Resolver, timeout time.Duration) *Checker {
 
 // Check evaluates SPF for the given client IP, HELO name and MAIL FROM, and
 // returns an Authentication-Results method result such as
-// "spf=pass smtp.mailfrom=example.com". A nil/empty MAIL FROM (bounce) is
-// checked against the HELO identity per RFC 7208 §2.4.
+// "spf=pass smtp.mailfrom=example.com". When MAIL FROM carries no usable domain
+// (a null return-path bounce, or a bare address), SPF is evaluated against the
+// HELO identity per RFC 7208 §2.4; if neither yields an identity the result is
+// "spf=none". The reported identity always matches the domain actually checked.
 func (c *Checker) Check(ctx context.Context, remoteAddr, helo, mailFrom string) string {
 	ip := parseIP(remoteAddr)
 	if ip == nil {
 		return "spf=none"
 	}
+	helo = authres.Sanitize(helo)
+
+	var sender, idKey, idVal string
+	if d := domainOf(mailFrom); d != "" {
+		sender = strings.Trim(strings.TrimSpace(mailFrom), "<>")
+		idKey, idVal = "smtp.mailfrom", d
+	} else if helo != "" {
+		sender, idKey, idVal = "postmaster@"+helo, "smtp.helo", helo
+	} else {
+		return "spf=none" // nothing to authenticate
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
-
 	opts := []spf.Option{spf.WithContext(ctx)}
 	if c.resolver != nil {
 		opts = append(opts, spf.WithResolver(c.resolver))
 	}
 
-	sender := mailFrom
-	idKey, idVal := "smtp.mailfrom", domainOf(mailFrom)
-	if sender == "" {
-		// Null return-path: authenticate the HELO identity instead.
-		sender = "postmaster@" + helo
-		idKey, idVal = "smtp.helo", sanitize(helo)
-	}
-
 	res, _ := spf.CheckHostWithSender(ip, helo, sender, opts...)
-	out := "spf=" + string(res)
-	if idVal != "" {
-		out += " " + idKey + "=" + idVal
-	}
-	return out
+	return "spf=" + string(res) + " " + idKey + "=" + idVal
 }
 
 func parseIP(remoteAddr string) net.IP {
@@ -72,20 +75,13 @@ func parseIP(remoteAddr string) net.IP {
 	return net.ParseIP(strings.TrimSpace(host))
 }
 
+// domainOf returns the sanitised domain part of a MAIL FROM address, or "" when
+// there is no '@' or the domain is empty.
 func domainOf(addr string) string {
-	addr = strings.TrimSpace(addr)
-	if i := strings.LastIndexByte(addr, '@'); i >= 0 {
-		addr = addr[i+1:]
+	addr = strings.Trim(strings.TrimSpace(addr), "<>")
+	i := strings.LastIndexByte(addr, '@')
+	if i < 0 || i == len(addr)-1 {
+		return ""
 	}
-	return sanitize(strings.TrimSuffix(addr, ">"))
-}
-
-// sanitize strips characters that could break out of the header field value.
-func sanitize(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r == ';' || r == ' ' || r == '\t' || r < 0x20 || r == 0x7f {
-			return -1
-		}
-		return r
-	}, s)
+	return authres.Sanitize(addr[i+1:])
 }
