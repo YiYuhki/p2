@@ -71,6 +71,15 @@ type Attachment struct {
 	LastDownloadedAt *time.Time
 }
 
+// DownloadEvent is an audit record of a completed download.
+type DownloadEvent struct {
+	AttachmentID string
+	User         string // authenticated recipient address, "" when auth is off
+	RemoteIP     string
+	UserAgent    string
+	At           time.Time
+}
+
 // Verdict is what the external analyzer reports back.
 type Verdict struct {
 	AttachmentID string          `json:"attachment_id"`

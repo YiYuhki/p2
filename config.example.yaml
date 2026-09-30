@@ -45,6 +45,16 @@ portal:
   rate_limit_rps: 5
   rate_limit_burst: 20
   trust_proxy_headers: true      # behind a reverse proxy / load balancer
+  auth:                          # recipient authentication (see docs/deployment.md)
+    mode: otp                    # none | otp | header
+    session_secret: ${SECMAIL_SESSION_SECRET}   # >= 32 chars, signs the session cookie
+    session_ttl: 12h
+    allow_domain_users: false    # true: any user of smtp.accepted_domains (distribution lists)
+    otp_from: no-reply@example.com
+    otp_ttl: 10m
+    otp_max_attempts: 5
+    otp_resend_after: 1m
+    # trusted_header: X-Auth-Request-Email   # header mode (SSO reverse proxy)
 
 internal_api:                    # used by the external analysis engine only
   listen: "0.0.0.0:8081"
@@ -52,7 +62,7 @@ internal_api:                    # used by the external analysis engine only
   advertise_url: http://secmail-internal.example.com:8081
 
 storage:
-  type: s3                       # s3 (AWS S3 / MinIO) | fs
+  type: s3                       # s3 (AWS S3 / MinIO / RustFS / Ceph RGW) | fs
   s3:
     endpoint: minio.internal.example.com:9000
     region: us-east-1

@@ -16,6 +16,8 @@ type Memory struct {
 	messages map[string]*model.Message
 	atts     map[string]*model.Attachment
 	byToken  map[string]string
+	// Downloads is the audit log (exported for tests).
+	Downloads []model.DownloadEvent
 }
 
 func NewMemory() *Memory {
@@ -41,6 +43,18 @@ func (s *Memory) CreateMessage(_ context.Context, m *model.Message, atts []*mode
 		s.byToken[a.TokenHash] = a.ID
 	}
 	return nil
+}
+
+func (s *Memory) GetMessage(_ context.Context, id string) (*model.Message, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, ok := s.messages[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	c := *m
+	c.RcptTo = append([]string(nil), m.RcptTo...)
+	return &c, nil
 }
 
 func (s *Memory) GetAttachment(_ context.Context, id string) (*model.Attachment, error) {
@@ -111,15 +125,17 @@ func (s *Memory) MarkRequeued(_ context.Context, id string, at time.Time) error 
 	return nil
 }
 
-func (s *Memory) RecordDownload(_ context.Context, id string, at time.Time) error {
+func (s *Memory) RecordDownload(_ context.Context, ev model.DownloadEvent) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	a, ok := s.atts[id]
+	a, ok := s.atts[ev.AttachmentID]
 	if !ok {
 		return ErrNotFound
 	}
 	a.DownloadCount++
+	at := ev.At
 	a.LastDownloadedAt = &at
+	s.Downloads = append(s.Downloads, ev)
 	return nil
 }
 

@@ -11,26 +11,20 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"io"
 	"log/slog"
-	"net"
-	"net/textproto"
 	"strings"
 	"time"
 
 	"github.com/emersion/go-smtp"
+
+	"github.com/yiyuhki/p2/internal/smtpclient"
 )
 
-type UpstreamOptions struct {
-	Addr               string
-	HeloName           string
-	StartTLS           bool
-	InsecureSkipVerify bool
-	Timeout            time.Duration
-}
+// UpstreamOptions configures the connection to the real mail server.
+type UpstreamOptions = smtpclient.Options
 
 type BackendOptions struct {
 	AcceptedDomains []string
@@ -76,77 +70,11 @@ var (
 
 func (s *session) dialUpstream() (*smtp.Client, error) {
 	o := s.b.opts.Upstream
-	conn, err := net.DialTimeout("tcp", o.Addr, o.Timeout)
-	if err != nil {
-		return nil, err
+	if o.HeloName == "" {
+		o.HeloName = s.b.proc.opts.Hostname
 	}
-	helo := o.HeloName
-	if helo == "" {
-		helo = s.b.proc.opts.Hostname
-	}
-	if o.StartTLS {
-		host, _, _ := net.SplitHostPort(o.Addr)
-		conn, err = startTLS(conn, helo, &tls.Config{
-			ServerName: host, InsecureSkipVerify: o.InsecureSkipVerify, MinVersion: tls.VersionTLS12,
-		}, o.Timeout)
-		if err != nil {
-			return nil, err
-		}
-	}
-	c := smtp.NewClient(conn)
-	c.CommandTimeout = o.Timeout
-	c.SubmissionTimeout = 5 * o.Timeout
-	if err := c.Hello(helo); err != nil {
-		c.Close()
-		return nil, err
-	}
-	return c, nil
+	return smtpclient.Dial(o)
 }
-
-// startTLS performs the plaintext EHLO/STARTTLS exchange itself because
-// go-smtp's client only offers STARTTLS with the fixed name "localhost".
-// The returned conn replays a synthetic 220 greeting so that a fresh
-// smtp.Client can issue the post-TLS EHLO with our own name.
-func startTLS(conn net.Conn, helo string, cfg *tls.Config, timeout time.Duration) (net.Conn, error) {
-	conn.SetDeadline(time.Now().Add(timeout))
-	tp := textproto.NewConn(conn)
-	fail := func(err error) (net.Conn, error) {
-		conn.Close()
-		return nil, err
-	}
-	if _, _, err := tp.ReadResponse(220); err != nil {
-		return fail(err)
-	}
-	if err := tp.PrintfLine("EHLO %s", helo); err != nil {
-		return fail(err)
-	}
-	_, ext, err := tp.ReadResponse(250)
-	if err != nil {
-		return fail(err)
-	}
-	if !strings.Contains(strings.ToUpper(ext), "STARTTLS") {
-		return fail(errors.New("upstream does not offer STARTTLS"))
-	}
-	if err := tp.PrintfLine("STARTTLS"); err != nil {
-		return fail(err)
-	}
-	if _, _, err := tp.ReadResponse(220); err != nil {
-		return fail(err)
-	}
-	tc := tls.Client(conn, cfg)
-	if err := tc.Handshake(); err != nil {
-		return fail(err)
-	}
-	tc.SetDeadline(time.Time{})
-	return &greetingConn{Conn: tc, r: io.MultiReader(strings.NewReader("220 tls ready\r\n"), tc)}, nil
-}
-
-type greetingConn struct {
-	net.Conn
-	r io.Reader
-}
-
-func (g *greetingConn) Read(p []byte) (int, error) { return g.r.Read(p) }
 
 func (s *session) Mail(from string, opts *smtp.MailOptions) error {
 	s.resetState()

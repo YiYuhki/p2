@@ -4,3 +4,4 @@
 *.key
 *.eml
 config.yaml
+.ccr-ca.crt

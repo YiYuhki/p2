@@ -4,8 +4,9 @@
 name: secmail
 x-env: &env
   SECMAIL_INTERNAL_TOKEN: demo-internal-token-change-me
-  MINIO_ROOT_USER: secmail
-  MINIO_ROOT_PASSWORD: secmail-minio-secret
+  S3_ACCESS_KEY: secmail
+  S3_SECRET_KEY: secmail-s3-secret
+  SECMAIL_SESSION_SECRET: demo-session-secret-change-me-0123456789
 
 services:
   secmail:
@@ -19,7 +20,7 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_started}
-      minio: {condition: service_started}
+      s3: {condition: service_started}
       mailpit: {condition: service_started}
     restart: unless-stopped
 
@@ -46,17 +47,19 @@ services:
   redis:
     image: redis:7-alpine
 
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address :9001
-    environment: *env
-    ports: ["9001:9001"]
-    volumes: [miniodata:/data]
+  # S3-compatible object storage (MinIO no longer publishes images; RustFS
+  # speaks the same API). In production point storage.s3 at MinIO/AWS S3.
+  s3:
+    image: rustfs/rustfs:latest
+    environment:
+      RUSTFS_ACCESS_KEY: secmail
+      RUSTFS_SECRET_KEY: secmail-s3-secret
+    volumes: [s3data:/data]
 
   mailpit:
     image: axllent/mailpit:latest
-    ports: ["8025:8025"]   # web UI showing what the "real" mail server received
+    ports: ["8025:8025"]   # web UI: rewritten mail and one-time login codes land here
 
 volumes:
   pgdata:
-  miniodata:
+  s3data:

@@ -13,6 +13,10 @@ dkim:
 portal:
   listen: ":8080"
   public_base_url: http://localhost:8080
+  auth:
+    mode: otp                  # recipients prove ownership with a mailed code
+    session_secret: ${SECMAIL_SESSION_SECRET}
+    otp_from: no-reply@example.com
 internal_api:
   listen: ":8081"
   token: ${SECMAIL_INTERNAL_TOKEN}
@@ -20,11 +24,11 @@ internal_api:
 storage:
   type: s3
   s3:
-    endpoint: minio:9000
+    endpoint: s3:9000
     region: us-east-1
     bucket: secmail-attachments
-    access_key: ${MINIO_ROOT_USER}
-    secret_key: ${MINIO_ROOT_PASSWORD}
+    access_key: ${S3_ACCESS_KEY}
+    secret_key: ${S3_SECRET_KEY}
     use_ssl: false
 database:
   type: postgres

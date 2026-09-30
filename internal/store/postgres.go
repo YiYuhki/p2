@@ -206,10 +206,34 @@ func (p *Postgres) MarkRequeued(ctx context.Context, id string, at time.Time) er
 	return err
 }
 
-func (p *Postgres) RecordDownload(ctx context.Context, id string, at time.Time) error {
-	_, err := p.pool.Exec(ctx, `UPDATE attachments SET download_count=download_count+1, last_downloaded_at=$2
-		WHERE id=$1`, id, at)
-	return err
+func (p *Postgres) RecordDownload(ctx context.Context, ev model.DownloadEvent) error {
+	return pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `UPDATE attachments SET download_count=download_count+1, last_downloaded_at=$2
+			WHERE id=$1`, ev.AttachmentID, ev.At)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		_, err = tx.Exec(ctx, `INSERT INTO download_events (attachment_id, username, remote_ip, user_agent, at)
+			VALUES ($1,$2,$3,$4,$5)`, ev.AttachmentID, ev.User, ev.RemoteIP, ev.UserAgent, ev.At)
+		return err
+	})
+}
+
+func (p *Postgres) GetMessage(ctx context.Context, id string) (*model.Message, error) {
+	var m model.Message
+	err := p.pool.QueryRow(ctx, `SELECT id, message_id, mail_from, rcpt_to, subject, remote_addr,
+		received_at, attachment_count FROM mail_messages WHERE id=$1`, id).Scan(
+		&m.ID, &m.MessageID, &m.MailFrom, &m.RcptTo, &m.Subject, &m.RemoteAddr, &m.ReceivedAt, &m.AttachmentCount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &m, nil
 }
 
 func (p *Postgres) ListStalePending(ctx context.Context, olderThan time.Time, limit int) ([]*model.Attachment, error) {

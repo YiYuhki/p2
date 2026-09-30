@@ -4,7 +4,8 @@
 본문에는 다운로드 링크 배너를 넣어 실제 메일 서버로 전달합니다. 외부 분석 엔진이 파일을 검사하고,
 `CLEAN` 판정을 받은 파일만 포털에서 받을 수 있습니다.
 
-> 정적/동적 분석 엔진은 **별도 프로젝트**입니다. 연동 규격은 [docs/analyzer-contract.md](docs/analyzer-contract.md)에 있습니다.
+> 정적/동적 분석 엔진은 **별도 프로젝트**입니다. 연동 규격은 [docs/analyzer-contract.md](docs/analyzer-contract.md),
+> DNS·내부 메일서버(Postfix/Exchange/M365/Google)·포털 운영 설정은 [docs/deployment.md](docs/deployment.md)에 있습니다.
 
 ```
  인터넷 MTA ──SMTP──▶ ┌──────────── secmail ────────────┐ ──SMTP──▶ 내부 메일서버
@@ -54,10 +55,18 @@
 | `ERROR` | 검사 실패 → 차단 (403, fail-closed) |
 | `EXPIRED` | 링크 만료 (410) |
 
+수신자 인증 (`portal.auth.mode`):
+- `otp`: 메일을 받은 주소를 입력하면 6자리 인증 코드를 메일로 보내고, 확인되면 서명된 세션 쿠키를 발급합니다. **해당 메일의 SMTP 수신자만** 파일에 접근할 수 있으므로 링크가 전달·유출되어도 다른 사람은 받을 수 없습니다.
+- `header`: oauth2-proxy 등 SSO 리버스 프록시가 넣어준 이메일 헤더로 판단합니다.
+- `none`: 링크 소유만으로 접근 (테스트용).
+- 배포 그룹 주소로 받은 메일은 `allow_domain_users: true`로 사내 도메인 사용자 전체를 허용할 수 있습니다.
+- 모든 다운로드는 `download_events` 테이블에 사용자·IP·User-Agent와 함께 기록됩니다.
+
 보안 설계:
 - 링크 토큰은 256-bit 난수, DB에는 **SHA-256 해시만** 저장 (DB 유출 시에도 링크 사용 불가).
 - 실제 다운로드는 **POST로만 발급되는 1회용 티켓**(기본 60초)을 거칩니다 → Outlook Safe Links 같은 링크 스캐너가 GET으로 파일을 가져가지 못함.
 - 전송 직전 판정 재확인, `application/octet-stream` + `attachment` 강제, `nosniff`, nonce 기반 CSP, IP별 rate limit.
+- `Sec-Fetch-Site`/`Origin` 검사로 교차 사이트 POST(CSRF) 차단, 인증 페이지에서는 파일명도 노출하지 않음.
 
 ## 빠른 시작 (Docker)
 
@@ -66,7 +75,9 @@ docker compose -f deploy/docker-compose.yml up --build
 # 테스트 메일 발송 (수신자는 @example.com)
 swaks --server localhost:2525 --to user@example.com --attach @report.pdf
 # 내부 메일서버(mailpit)가 받은 메일: http://localhost:8025 → 링크 클릭 → http://localhost:8080/d/...
+# 데모는 otp 모드: 포털에 user@example.com 입력 → 인증 코드 메일도 mailpit에 도착
 ```
+S3는 RustFS(MinIO 호환) 컨테이너를 씁니다 (MinIO는 공식 이미지 배포를 중단). 운영에서는 MinIO/AWS S3를 그대로 쓰면 됩니다.
 `mock-analyzer`는 EICAR 문자열이 있으면 `MALICIOUS`, 아니면 `CLEAN`을 회신하는 참고 구현입니다. 실제 분석 프로젝트로 교체하세요.
 
 ## 직접 실행
@@ -94,20 +105,30 @@ cp config.example.yaml config.yaml   # 환경에 맞게 수정
 | `internal/mimeproc` | MIME 트리 파싱 · 첨부 분리 · 배너 삽입 |
 | `internal/dkimutil` | DKIM 검증/재서명 |
 | `internal/service` | 격리 저장, 판정 반영, janitor |
-| `internal/portal` | 다운로드 포털, 1회용 티켓, rate limit |
+| `internal/portal` | 다운로드 포털, 수신자 인증(OTP/SSO 헤더), 1회용 티켓, rate limit |
 | `internal/internalapi` | 분석 엔진용 인증 API |
 | `internal/store` | PostgreSQL(내장 마이그레이션) / 메모리 저장소 |
 | `internal/storage` | S3·MinIO / 파일시스템 |
+| `internal/smtpclient` | 업스트림 SMTP 연결 (STARTTLS, 사용자 지정 HELO) |
 | `internal/queue` | Redis / 메모리 큐 |
 
 ## 테스트
 
 ```bash
-go test ./...
+go test ./...          # 단위 + 종단간 (외부 인프라 불필요)
+
+# 실제 인프라 대상 통합 테스트 (환경변수가 있을 때만 실행)
+SECMAIL_TEST_PG_DSN="postgres://postgres@127.0.0.1:5432/secmail_test?sslmode=disable" \
+SECMAIL_TEST_REDIS=127.0.0.1:6379 \
+SECMAIL_TEST_S3_ENDPOINT=127.0.0.1:9000 SECMAIL_TEST_S3_ACCESS_KEY=... SECMAIL_TEST_S3_SECRET_KEY=... \
+go test -count=1 ./...
 ```
-MIME 변환(서명·암호화·한글 파일명/EUC-KR·인라인 이미지·전달 메일·깊은 중첩), SMTP 종단간(릴레이 거부, 업스트림 거부 전달, DKIM 재서명 검증, 파싱 불가 메일 격리), 포털(상태별 화면, 1회용 티켓, 만료, rate limit), 서비스(재시도·만료·판정 재사용), 내부 API를 다룹니다.
+- MIME 변환: 서명·암호화·한글 파일명/EUC-KR·인라인 이미지·전달 메일·깊은 중첩
+- SMTP 종단간: 릴레이 거부, 업스트림 거부 전달, DKIM 재서명 검증, 파싱 불가 메일 격리
+- 포털: 상태별 화면, 1회용 티켓, 만료, rate limit, OTP 로그인·무차별 대입 제한·비수신자 차단·쿠키 위조, SSO 헤더 모드, CSRF
+- 저장소 적합성: 같은 테스트를 메모리/PostgreSQL, 파일시스템/S3에 각각 실행, Redis 큐 우선순위·dead-letter, Redis 티켓/OTP
 
 ## 운영 시 참고
 - 포털은 반드시 HTTPS 리버스 프록시 뒤에 두고 `trust_proxy_headers: true`를 설정하세요.
 - Internal API는 분석 네트워크에서만 접근 가능하도록 제한하세요.
-- 현재 링크는 수신자 구분 없이 동작합니다. 수신자 인증(SSO 등)이 필요하면 포털 앞단에 붙이세요.
+- 내부 메일 서버가 게이트웨이를 신뢰하도록(SPF/DKIM 재검사 제외, 우회 차단) 설정해야 합니다 → [docs/deployment.md](docs/deployment.md)

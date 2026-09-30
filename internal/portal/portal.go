@@ -17,7 +17,9 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/yiyuhki/p2/internal/model"
@@ -39,12 +41,20 @@ type Options struct {
 	RateLimitBurst    int
 	TrustProxyHeaders bool
 	Location          *time.Location
+	// PublicBaseURL is used to validate the Origin of POST requests.
+	PublicBaseURL string
+	Auth          AuthOptions
+	// Codes and Mailer are required when Auth.Mode is "otp".
+	Codes  CodeStore
+	Mailer Mailer
 }
 
 type Server struct {
 	store   store.Store
 	storage storage.Storage
 	tickets Tickets
+	codes   CodeStore
+	mailer  Mailer
 	opts    Options
 	limiter *ipLimiter
 	log     *slog.Logger
@@ -56,7 +66,8 @@ func New(st store.Store, obj storage.Storage, tk Tickets, opts Options, log *slo
 		opts.Location = time.Local
 	}
 	return &Server{
-		store: st, storage: obj, tickets: tk, opts: opts, log: log, now: time.Now,
+		store: st, storage: obj, tickets: tk, codes: opts.Codes, mailer: opts.Mailer,
+		opts: opts, log: log, now: time.Now,
 		limiter: newIPLimiter(opts.RateLimitRPS, opts.RateLimitBurst, opts.TrustProxyHeaders),
 	}
 }
@@ -67,8 +78,46 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /d/{token}/status", s.status)
 	mux.HandleFunc("POST /d/{token}/download", s.download)
 	mux.HandleFunc("GET /d/{token}/file", s.file)
+	mux.HandleFunc("POST /d/{token}/auth", s.authPost)
+	mux.HandleFunc("POST /d/{token}/logout", s.logout)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
-	return securityHeaders(mux)
+	return securityHeaders(s.checkOrigin(mux))
+}
+
+// checkOrigin rejects cross-site form posts (CSRF). Modern browsers send
+// Sec-Fetch-Site; older ones are checked via Origin. Requests carrying
+// neither (non-browser clients) are allowed.
+func (s *Server) checkOrigin(next http.Handler) http.Handler {
+	allowed := map[string]bool{}
+	if u, err := url.Parse(s.opts.PublicBaseURL); err == nil && u.Host != "" {
+		allowed[strings.ToLower(u.Host)] = true
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && !s.sameOrigin(r, allowed) {
+			http.Error(w, "cross-origin request rejected", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) sameOrigin(r *http.Request, allowed map[string]bool) bool {
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "same-origin", "none":
+		return true
+	case "":
+	default: // same-site, cross-site
+		return false
+	}
+	o := r.Header.Get("Origin")
+	if o == "" {
+		return true
+	}
+	u, err := url.Parse(o)
+	if err != nil || o == "null" {
+		return false
+	}
+	return allowed[strings.ToLower(u.Host)] || strings.EqualFold(u.Host, r.Host)
 }
 
 func securityHeaders(next http.Handler) http.Handler {
@@ -76,7 +125,7 @@ func securityHeaders(next http.Handler) http.Handler {
 		h := w.Header()
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
-		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Referrer-Policy", "same-origin") // never leak the token URL to other sites
 		h.Set("Cache-Control", "no-store")
 		h.Set("X-Robots-Tag", "noindex, nofollow")
 		next.ServeHTTP(w, r)
@@ -125,10 +174,20 @@ type pageData struct {
 	Expires    string
 	Message    string
 	Nonce      string
+	// Authentication-related fields.
+	User      string
+	Email     string
+	Error     string
+	Notice    string
+	CanLogout bool
 }
 
 func (s *Server) page(w http.ResponseWriter, r *http.Request) {
 	a, ok := s.lookup(w, r, false)
+	if !ok {
+		return
+	}
+	user, ok := s.authorize(w, r, a, false)
 	if !ok {
 		return
 	}
@@ -147,6 +206,8 @@ func (s *Server) page(w http.ResponseWriter, r *http.Request) {
 		Size:       a.Size,
 		ThreatName: a.ThreatName,
 		Expires:    a.ExpiresAt.In(s.opts.Location).Format("2006-01-02 15:04 MST"),
+		User:       user,
+		CanLogout:  user != "" && s.opts.Auth.Mode == "otp",
 	})
 }
 
@@ -163,6 +224,9 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if _, ok := s.authorize(w, r, a, true); !ok {
+		return
+	}
 	writeJSON(w, http.StatusOK, statusJSON{
 		Status: s.effectiveStatus(a), Filename: a.Filename, Size: a.Size,
 		ThreatName: a.ThreatName, ExpiresAt: a.ExpiresAt,
@@ -172,6 +236,9 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 	a, ok := s.lookup(w, r, false)
 	if !ok {
+		return
+	}
+	if _, ok := s.authorize(w, r, a, false); !ok {
 		return
 	}
 	if st := s.effectiveStatus(a); st != model.StatusClean {
@@ -190,6 +257,10 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) file(w http.ResponseWriter, r *http.Request) {
 	a, ok := s.lookup(w, r, false)
+	if !ok {
+		return
+	}
+	user, ok := s.authorize(w, r, a, false)
 	if !ok {
 		return
 	}
@@ -222,10 +293,12 @@ func (s *Server) file(w http.ResponseWriter, r *http.Request) {
 		s.log.Warn("portal: stream interrupted", "attachment", a.ID, "err", err)
 		return
 	}
-	if err := s.store.RecordDownload(r.Context(), a.ID, s.now().UTC()); err != nil {
+	ip := s.limiter.clientIP(r)
+	ev := model.DownloadEvent{AttachmentID: a.ID, User: user, RemoteIP: ip, UserAgent: r.UserAgent(), At: s.now().UTC()}
+	if err := s.store.RecordDownload(r.Context(), ev); err != nil {
 		s.log.Warn("portal: record download", "err", err)
 	}
-	s.log.Info("portal: downloaded", "attachment", a.ID, "ip", s.limiter.clientIP(r))
+	s.log.Info("portal: downloaded", "attachment", a.ID, "user", user, "ip", ip)
 }
 
 func (s *Server) fail(w http.ResponseWriter, _ *http.Request, code int, asJSON bool, msg string) {

@@ -1,0 +1,70 @@
+package queue
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
+
+	"github.com/yiyuhki/p2/internal/model"
+)
+
+// TestRedisQueue runs when SECMAIL_TEST_REDIS (host:port) is set.
+func TestRedisQueue(t *testing.T) {
+	addr := os.Getenv("SECMAIL_TEST_REDIS")
+	if addr == "" {
+		t.Skip("SECMAIL_TEST_REDIS not set")
+	}
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: addr})
+	defer rdb.Close()
+	prefix := "test-" + uuid.NewString()[:8]
+	q := NewRedis(rdb, prefix, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer rdb.Del(ctx, q.JobsKey(PriorityHigh), q.JobsKey(PriorityNormal), q.ResultsKey(), q.ResultsKey()+":dead")
+
+	q.Enqueue(ctx, model.Job{AttachmentID: "normal-1"}, PriorityNormal)
+	q.Enqueue(ctx, model.Job{AttachmentID: "high-1"}, PriorityHigh)
+	q.Enqueue(ctx, model.Job{AttachmentID: "high-2"}, PriorityHigh)
+
+	// An analyzer draining with BRPOP high normal must see high first, FIFO.
+	var order []string
+	for i := 0; i < 3; i++ {
+		res, err := rdb.BRPop(ctx, time.Second, q.JobsKey(PriorityHigh), q.JobsKey(PriorityNormal)).Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var j model.Job
+		json.Unmarshal([]byte(res[1]), &j)
+		order = append(order, j.AttachmentID)
+	}
+	if order[0] != "high-1" || order[1] != "high-2" || order[2] != "normal-1" {
+		t.Fatalf("priority order wrong: %v", order)
+	}
+
+	// Results: valid verdict delivered, garbage goes to the dead list.
+	rdb.LPush(ctx, q.ResultsKey(), `not json`)
+	b, _ := json.Marshal(model.Verdict{AttachmentID: "a1", Status: model.StatusClean})
+	rdb.LPush(ctx, q.ResultsKey(), b)
+
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	got := make(chan model.Verdict, 1)
+	go q.ConsumeResults(cctx, func(_ context.Context, v model.Verdict) error { got <- v; cancel(); return nil })
+	select {
+	case v := <-got:
+		if v.AttachmentID != "a1" || v.Status != model.StatusClean {
+			t.Fatalf("verdict %+v", v)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("verdict not consumed")
+	}
+	if n, _ := rdb.LLen(ctx, q.ResultsKey()+":dead").Result(); n != 1 {
+		t.Fatalf("dead letter count %d", n)
+	}
+}

@@ -85,7 +85,34 @@ type PortalConfig struct {
 	RateLimitRPS   float64       `yaml:"rate_limit_rps"`
 	RateLimitBurst int           `yaml:"rate_limit_burst"`
 	// TrustProxyHeaders makes the rate limiter key on X-Forwarded-For.
-	TrustProxyHeaders bool `yaml:"trust_proxy_headers"`
+	TrustProxyHeaders bool             `yaml:"trust_proxy_headers"`
+	Auth              PortalAuthConfig `yaml:"auth"`
+}
+
+// Recipient authentication modes for the download portal.
+const (
+	AuthNone   = "none"   // possession of the link is enough
+	AuthOTP    = "otp"    // one-time code mailed to a recipient address
+	AuthHeader = "header" // identity asserted by an SSO reverse proxy header
+)
+
+type PortalAuthConfig struct {
+	Mode string `yaml:"mode"`
+	// SessionSecret signs the session cookie (otp mode), >= 32 chars.
+	SessionSecret string        `yaml:"session_secret"`
+	SessionTTL    time.Duration `yaml:"session_ttl"`
+	// AllowDomainUsers lets any address in smtp.accepted_domains open the
+	// link, not only the envelope recipients. Needed when mail is addressed
+	// to distribution lists / aliases.
+	AllowDomainUsers bool `yaml:"allow_domain_users"`
+	// TrustedHeader carries the user's e-mail in header mode, e.g.
+	// X-Auth-Request-Email (oauth2-proxy) or X-Forwarded-Email.
+	TrustedHeader string `yaml:"trusted_header"`
+	// OTP settings.
+	OTPTTL         time.Duration `yaml:"otp_ttl"`
+	OTPMaxAttempts int           `yaml:"otp_max_attempts"`
+	OTPResendAfter time.Duration `yaml:"otp_resend_after"`
+	OTPFrom        string        `yaml:"otp_from"`
 }
 
 type InternalAPIConfig struct {
@@ -169,6 +196,13 @@ func Default() Config {
 			TicketTTL:      60 * time.Second,
 			RateLimitRPS:   5,
 			RateLimitBurst: 20,
+			Auth: PortalAuthConfig{
+				Mode:           AuthNone,
+				SessionTTL:     12 * time.Hour,
+				OTPTTL:         10 * time.Minute,
+				OTPMaxAttempts: 5,
+				OTPResendAfter: time.Minute,
+			},
 		},
 		InternalAPI: InternalAPIConfig{Listen: "127.0.0.1:8081"},
 		Storage:     StorageConfig{Type: "fs", FS: FSConfig{Dir: "./data/objects"}},
@@ -222,6 +256,22 @@ func (c *Config) Validate() error {
 	case PolicyPassthrough, PolicyReject:
 	default:
 		errs = append(errs, fmt.Errorf("rewrite.encrypted_policy: unknown value %q", c.Rewrite.EncryptedPolicy))
+	}
+	switch a := c.Portal.Auth; a.Mode {
+	case AuthNone:
+	case AuthOTP:
+		if len(a.SessionSecret) < 32 {
+			errs = append(errs, errors.New("portal.auth.session_secret must be at least 32 characters"))
+		}
+		if a.OTPFrom == "" {
+			errs = append(errs, errors.New("portal.auth.otp_from is required in otp mode"))
+		}
+	case AuthHeader:
+		if a.TrustedHeader == "" {
+			errs = append(errs, errors.New("portal.auth.trusted_header is required in header mode"))
+		}
+	default:
+		errs = append(errs, fmt.Errorf("portal.auth.mode: unknown value %q", a.Mode))
 	}
 	if c.DKIM.Sign && (c.DKIM.Domain == "" || c.DKIM.Selector == "" || c.DKIM.PrivateKeyFile == "") {
 		errs = append(errs, errors.New("dkim.sign requires domain, selector and private_key_file"))

@@ -38,6 +38,7 @@ import (
 	"github.com/yiyuhki/p2/internal/portal"
 	"github.com/yiyuhki/p2/internal/queue"
 	"github.com/yiyuhki/p2/internal/service"
+	"github.com/yiyuhki/p2/internal/smtpclient"
 	"github.com/yiyuhki/p2/internal/storage"
 	"github.com/yiyuhki/p2/internal/store"
 )
@@ -107,6 +108,7 @@ func run(cfgPath, components string, log *slog.Logger) error {
 	var rdb *redis.Client
 	var q queue.Queue
 	var tickets portal.Tickets
+	var codes portal.CodeStore
 	switch cfg.Queue.Type {
 	case "redis":
 		rdb = redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB})
@@ -116,10 +118,12 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		defer rdb.Close()
 		q = queue.NewRedis(rdb, cfg.Queue.KeyPrefix, log)
 		tickets = portal.NewRedisTickets(rdb, cfg.Queue.KeyPrefix)
+		codes = portal.NewRedisCodes(rdb, cfg.Queue.KeyPrefix)
 	case "memory":
 		log.Warn("using in-memory queue: jobs are not visible to an external analyzer")
 		q = queue.NewMemory()
 		tickets = portal.NewMemoryTickets()
+		codes = portal.NewMemoryCodes()
 	default:
 		return fmt.Errorf("queue.type: unknown %q", cfg.Queue.Type)
 	}
@@ -162,13 +166,7 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		}, log)
 		be := gateway.NewBackend(proc, gateway.BackendOptions{
 			AcceptedDomains: cfg.SMTP.AcceptedDomains,
-			Upstream: gateway.UpstreamOptions{
-				Addr:               cfg.Upstream.Addr,
-				HeloName:           cfg.Upstream.HeloName,
-				StartTLS:           cfg.Upstream.StartTLS,
-				InsecureSkipVerify: cfg.Upstream.InsecureSkipVerify,
-				Timeout:            cfg.Upstream.Timeout,
-			},
+			Upstream:        upstreamOpts(cfg),
 		}, log)
 		srv := smtp.NewServer(be)
 		srv.Addr = cfg.SMTP.Listen
@@ -204,7 +202,23 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			RateLimitBurst:    cfg.Portal.RateLimitBurst,
 			TrustProxyHeaders: cfg.Portal.TrustProxyHeaders,
 			Location:          loc,
+			PublicBaseURL:     cfg.Portal.PublicBaseURL,
+			Auth: portal.AuthOptions{
+				Mode:             cfg.Portal.Auth.Mode,
+				SessionSecret:    []byte(cfg.Portal.Auth.SessionSecret),
+				SessionTTL:       cfg.Portal.Auth.SessionTTL,
+				AllowDomainUsers: cfg.Portal.Auth.AllowDomainUsers,
+				AcceptedDomains:  cfg.SMTP.AcceptedDomains,
+				TrustedHeader:    cfg.Portal.Auth.TrustedHeader,
+				OTPTTL:           cfg.Portal.Auth.OTPTTL,
+				OTPMaxAttempts:   cfg.Portal.Auth.OTPMaxAttempts,
+				OTPResendAfter:   cfg.Portal.Auth.OTPResendAfter,
+				SecureCookie:     strings.HasPrefix(cfg.Portal.PublicBaseURL, "https://"),
+			},
+			Codes:  codes,
+			Mailer: portal.NewSMTPMailer(upstreamOpts(cfg), cfg.Portal.Auth.OTPFrom),
 		}, log)
+		log.Info("portal recipient authentication", "mode", cfg.Portal.Auth.Mode)
 		shutdowns = append(shutdowns, serveHTTP(&wg, errCh, log, "portal", cfg.Portal.Listen, p.Handler()))
 	}
 
@@ -242,6 +256,20 @@ func run(cfgPath, components string, log *slog.Logger) error {
 	}
 	wg.Wait()
 	return err
+}
+
+func upstreamOpts(cfg config.Config) smtpclient.Options {
+	helo := cfg.Upstream.HeloName
+	if helo == "" {
+		helo = cfg.SMTP.Hostname
+	}
+	return smtpclient.Options{
+		Addr:               cfg.Upstream.Addr,
+		HeloName:           helo,
+		StartTLS:           cfg.Upstream.StartTLS,
+		InsecureSkipVerify: cfg.Upstream.InsecureSkipVerify,
+		Timeout:            cfg.Upstream.Timeout,
+	}
 }
 
 func serveHTTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, name, addr string, h http.Handler) func(context.Context) error {
