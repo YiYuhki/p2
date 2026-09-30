@@ -18,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -221,30 +222,23 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			RecipientDomains: cfg.SMTP.AcceptedDomains,
 			Upstream:         upstreamOpts(cfg),
 		}, log)
-		srv := smtp.NewServer(be)
-		srv.Addr = cfg.SMTP.Listen
-		srv.Domain = cfg.SMTP.Hostname
-		srv.MaxMessageBytes = cfg.SMTP.MaxMessageBytes
-		srv.MaxRecipients = cfg.SMTP.MaxRecipients
-		srv.ReadTimeout = cfg.SMTP.ReadTimeout
-		srv.WriteTimeout = cfg.SMTP.WriteTimeout
-		srv.EnableSMTPUTF8 = true
+		var tlsConf *tls.Config
 		if cfg.SMTP.TLSCertFile != "" {
 			cert, err := tls.LoadX509KeyPair(cfg.SMTP.TLSCertFile, cfg.SMTP.TLSKeyFile)
 			if err != nil {
 				return fmt.Errorf("smtp tls: %w", err)
 			}
-			srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+			tlsConf = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			log.Info("smtp proxy listening", "addr", srv.Addr, "upstream", cfg.Upstream.Addr)
-			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, smtp.ErrServerClosed) {
-				errCh <- fmt.Errorf("smtp: %w", err)
-			}
-		}()
-		shutdowns = append(shutdowns, srv.Shutdown)
+		shut, err := startSMTP(&wg, errCh, log, smtpParams{
+			name: "inbound smtp proxy", addr: cfg.SMTP.Listen, backend: be, tls: tlsConf,
+			cfg: cfg, maxMessageBytes: cfg.SMTP.MaxMessageBytes,
+			maxConns: cfg.SMTP.MaxConnections, perIP: cfg.SMTP.MaxConnectionsPerIP,
+		})
+		if err != nil {
+			return err
+		}
+		shutdowns = append(shutdowns, shut)
 
 		if outSvc != nil {
 			clients, err := gateway.ParsePrefixes(cfg.Outbound.AllowedClients)
@@ -257,24 +251,16 @@ func run(cfgPath, components string, log *slog.Logger) error {
 				AllowedClients: clients,
 				Upstream:       nextHopOpts(cfg),
 			}, log)
-			osrv := smtp.NewServer(obe)
-			osrv.Addr = cfg.Outbound.Listen
-			osrv.Domain = cfg.SMTP.Hostname
-			osrv.MaxMessageBytes = cfg.Outbound.MaxMessageBytes
-			osrv.MaxRecipients = cfg.SMTP.MaxRecipients
-			osrv.ReadTimeout = cfg.SMTP.ReadTimeout
-			osrv.WriteTimeout = cfg.SMTP.WriteTimeout
-			osrv.EnableSMTPUTF8 = true
-			osrv.TLSConfig = srv.TLSConfig
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				log.Info("outbound DLP listener", "addr", osrv.Addr, "next_hop", cfg.Outbound.NextHop.Addr)
-				if err := osrv.ListenAndServe(); err != nil && !errors.Is(err, smtp.ErrServerClosed) {
-					errCh <- fmt.Errorf("outbound smtp: %w", err)
-				}
-			}()
-			shutdowns = append(shutdowns, osrv.Shutdown)
+			// No per-IP cap: clients are the allow-listed internal servers.
+			shut, err := startSMTP(&wg, errCh, log, smtpParams{
+				name: "outbound DLP listener", addr: cfg.Outbound.Listen, backend: obe, tls: tlsConf,
+				cfg: cfg, maxMessageBytes: cfg.Outbound.MaxMessageBytes,
+				maxConns: cfg.SMTP.MaxConnections, perIP: 0,
+			})
+			if err != nil {
+				return err
+			}
+			shutdowns = append(shutdowns, shut)
 		}
 	}
 
@@ -390,6 +376,48 @@ func holdReviewer(s *outbound.Service) portal.HoldReviewer {
 		return nil
 	}
 	return s
+}
+
+type smtpParams struct {
+	name            string
+	addr            string
+	backend         smtp.Backend
+	tls             *tls.Config
+	cfg             config.Config
+	maxMessageBytes int64
+	maxConns        int
+	perIP           int
+}
+
+// startSMTP configures a go-smtp server and serves it behind a connection
+// limiter. It returns the server's Shutdown function.
+func startSMTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, p smtpParams) (func(context.Context) error, error) {
+	srv := smtp.NewServer(p.backend)
+	srv.Addr = p.addr
+	srv.Domain = p.cfg.SMTP.Hostname
+	srv.MaxMessageBytes = p.maxMessageBytes
+	srv.MaxRecipients = p.cfg.SMTP.MaxRecipients
+	srv.MaxLineLength = p.cfg.SMTP.MaxLineLength
+	srv.ReadTimeout = p.cfg.SMTP.ReadTimeout
+	srv.WriteTimeout = p.cfg.SMTP.WriteTimeout
+	srv.EnableSMTPUTF8 = true
+	srv.TLSConfig = p.tls
+
+	ln, err := net.Listen("tcp", p.addr)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", p.name, err)
+	}
+	ln = gateway.NewLimitListener(ln, p.maxConns, p.perIP, log)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Info(p.name+" listening", "addr", p.addr, "max_conns", p.maxConns, "max_conns_per_ip", p.perIP)
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, smtp.ErrServerClosed) {
+			errCh <- fmt.Errorf("%s: %w", p.name, err)
+		}
+	}()
+	return srv.Shutdown, nil
 }
 
 func serveHTTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, name, addr string, h http.Handler) func(context.Context) error {

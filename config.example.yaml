@@ -11,6 +11,9 @@ smtp:
     - .example.com               # leading dot = any subdomain
   max_message_bytes: 52428800    # 50 MiB
   max_recipients: 100
+  max_line_length: 2000          # reject over-long SMTP lines
+  max_connections: 1024          # concurrent connections per listener (0 = unlimited)
+  max_connections_per_ip: 50     # concurrent connections per client IP on the inbound listener
   read_timeout: 60s
   write_timeout: 60s
   tls_cert_file: /etc/secmail/tls.crt   # enables inbound STARTTLS (recommended)

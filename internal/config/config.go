@@ -130,10 +130,18 @@ type SMTPConfig struct {
 	AcceptedDomains []string      `yaml:"accepted_domains"`
 	MaxMessageBytes int64         `yaml:"max_message_bytes"`
 	MaxRecipients   int           `yaml:"max_recipients"`
+	MaxLineLength   int           `yaml:"max_line_length"`
 	ReadTimeout     time.Duration `yaml:"read_timeout"`
 	WriteTimeout    time.Duration `yaml:"write_timeout"`
 	TLSCertFile     string        `yaml:"tls_cert_file"`
 	TLSKeyFile      string        `yaml:"tls_key_file"`
+	// MaxConnections caps concurrent connections on a listener (0 = unlimited).
+	MaxConnections int `yaml:"max_connections"`
+	// MaxConnectionsPerIP caps concurrent connections from one client IP on
+	// the inbound listener (0 = unlimited). The outbound listener does not
+	// apply a per-IP cap because its clients are the allow-listed internal
+	// mail servers.
+	MaxConnectionsPerIP int `yaml:"max_connections_per_ip"`
 }
 
 type UpstreamConfig struct {
@@ -272,12 +280,15 @@ func Default() Config {
 	return Config{
 		Timezone: "Asia/Seoul",
 		SMTP: SMTPConfig{
-			Listen:          ":2525",
-			Hostname:        "localhost",
-			MaxMessageBytes: 50 << 20,
-			MaxRecipients:   100,
-			ReadTimeout:     60 * time.Second,
-			WriteTimeout:    60 * time.Second,
+			Listen:              ":2525",
+			Hostname:            "localhost",
+			MaxMessageBytes:     50 << 20,
+			MaxRecipients:       100,
+			MaxLineLength:       2000,
+			ReadTimeout:         60 * time.Second,
+			WriteTimeout:        60 * time.Second,
+			MaxConnections:      1024,
+			MaxConnectionsPerIP: 50,
 		},
 		Upstream: UpstreamConfig{Timeout: 60 * time.Second},
 		Rewrite: RewriteConfig{
