@@ -74,7 +74,7 @@ func (c *Converter) acquire(ctx context.Context) (func(), error) {
 }
 
 func run(ctx context.Context, name string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := sandboxCmd(ctx, DefaultProcLimits, nil, name, args...)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {

@@ -187,7 +187,7 @@ func (x *extractor) sevenZip(loc, name string, data []byte, depth int) {
 	}
 	out := filepath.Join(dir, "out")
 	// -p (empty password), stdin from /dev/null: never wait for a prompt.
-	cmd := exec.CommandContext(ctx, at.SevenZip, "x", "-p", "-y", "-bd", "-snl-", "-o"+out, in)
+	cmd := sandboxCmd(ctx, DefaultProcLimits, nil, at.SevenZip, "x", "-p", "-y", "-bd", "-snl-", "-o"+out, in)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, io.Discard, io.Discard
 	if err := cmd.Run(); err != nil && ctx.Err() != nil {
 		x.problem(loc, "압축 해제 시간 초과")
@@ -243,7 +243,7 @@ func (at *ArchiveTools) acquire() (func(), error) {
 // "Encrypted = +" per entry; header-encrypted archives fail to list at all
 // without a password, which also counts as encrypted.
 func (at *ArchiveTools) encrypted(ctx context.Context, path string) bool {
-	cmd := exec.CommandContext(ctx, at.SevenZip, "l", "-slt", "-p", path)
+	cmd := sandboxCmd(ctx, DefaultProcLimits, nil, at.SevenZip, "l", "-slt", "-p", path)
 	cmd.Stdin = nil
 	out, err := cmd.CombinedOutput()
 	s := string(out)

@@ -188,10 +188,10 @@ func (t *Tesseract) Recognize(ctx context.Context, img []byte) (string, error) {
 	if psm == 0 {
 		psm = 4
 	}
-	cmd := exec.CommandContext(ctx, cmdName, "stdin", "stdout", "-l", lang, "--psm", fmt.Sprint(psm))
+	// One thread per process (OMP_THREAD_LIMIT set by sandboxCmd): we
+	// parallelise across images instead.
+	cmd := sandboxCmd(ctx, DefaultProcLimits, nil, cmdName, "stdin", "stdout", "-l", lang, "--psm", fmt.Sprint(psm))
 	cmd.Stdin = bytes.NewReader(pngData)
-	// One thread per process: we parallelise across images instead.
-	cmd.Env = append(cmd.Environ(), "OMP_THREAD_LIMIT=1")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
