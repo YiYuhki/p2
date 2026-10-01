@@ -1,8 +1,11 @@
 # syntax=docker/dockerfile:1
 FROM golang:1.26-alpine AS build
 WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
+# NB: we do NOT `go mod download` separately. go.mod has a local `replace` for
+# the malengine engine (../p1) that only the `malengine` build tag uses and that
+# is not in this build context; a bare `go mod download` would try to resolve it
+# and fail. The default build below does not import it, so `go build` fetches
+# exactly what it needs on its own.
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/secmail ./cmd/secmail \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/mock-analyzer ./cmd/mock-analyzer

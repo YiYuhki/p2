@@ -1,0 +1,45 @@
+# Extra Postfix services for the secmail demo, appended to master.cf by
+# entrypoint.sh. They wire the outbound DLP loop:
+#
+#   user --submit--> submission(587) --content_filter--> secmail:10025 (DLP)
+#                                                              |
+#                        secmail next_hop --> reinject(10026) --content_filter--> mailpit:1025 ("Internet")
+#
+# content_filter is a per-message attribute that propagates through the queue,
+# so overriding it on :10026 points the cleared mail at the Internet stand-in
+# instead of looping back into secmail.
+
+# Authenticated user submission. Everything sent here is forced through secmail
+# for DLP inspection before it can leave.
+submission inet n       -       n       -       -       smtpd
+  -o syslog_name=postfix/submission
+  -o smtpd_sasl_auth_enable=yes
+  -o smtpd_sasl_type=dovecot
+  -o smtpd_sasl_path=private/auth
+  -o smtpd_sasl_security_options=noanonymous
+  -o smtpd_client_restrictions=permit_sasl_authenticated,reject
+  -o smtpd_sender_restrictions=permit_sasl_authenticated,reject
+  -o smtpd_recipient_restrictions=permit_sasl_authenticated,reject
+  -o smtpd_reject_unlisted_recipient=no
+  -o content_filter=scan:[secmail]:10025
+
+# Re-injection hop: secmail delivers DLP-cleared outbound mail here, which then
+# relays it on to the Internet stand-in (mailpit). mynetworks is wide open
+# because this port is demo-internal only.
+10026     inet  n       -       n       -       -       smtpd
+  -o syslog_name=postfix/reinject
+  -o mynetworks=0.0.0.0/0
+  -o smtpd_client_restrictions=permit_mynetworks,reject
+  -o smtpd_recipient_restrictions=permit_mynetworks,reject
+  -o smtpd_reject_unlisted_recipient=no
+  -o content_filter=out:[mailpit]:1025
+
+# Delivery agent to secmail's outbound (DLP) listener.
+scan      unix  -       -       n       -       -       smtp
+  -o syslog_name=postfix/scan
+  -o smtp_tls_security_level=none
+
+# Delivery agent to the Internet stand-in.
+out       unix  -       -       n       -       -       smtp
+  -o syslog_name=postfix/out
+  -o smtp_tls_security_level=none

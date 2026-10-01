@@ -369,7 +369,7 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			DLPAdmins: cfg.DLP.Admins,
 		}, log)
 		log.Info("portal recipient authentication", "mode", cfg.Portal.Auth.Mode)
-		shutdowns = append(shutdowns, serveHTTP(&wg, errCh, log, "portal", cfg.Portal.Listen, p.Handler()))
+		shutdowns = append(shutdowns, serveHTTP(&wg, errCh, log, "portal", cfg.Portal.Listen, p.Handler(), cfg.Portal.TLSCertFile, cfg.Portal.TLSKeyFile))
 	}
 
 	// ---- internal API for the analyzer ----
@@ -378,7 +378,7 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		if outSvc != nil && cfg.InternalAPI.AdminToken != "" {
 			api.EnableDLPAdmin(cfg.InternalAPI.AdminToken, outSvc)
 		}
-		shutdowns = append(shutdowns, serveHTTP(&wg, errCh, log, "internal-api", cfg.InternalAPI.Listen, api.Handler()))
+		shutdowns = append(shutdowns, serveHTTP(&wg, errCh, log, "internal-api", cfg.InternalAPI.Listen, api.Handler(), "", ""))
 	}
 
 	// ---- background workers ----
@@ -507,7 +507,7 @@ func startSMTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, p smtpP
 	return srv.Shutdown, nil
 }
 
-func serveHTTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, name, addr string, h http.Handler) func(context.Context) error {
+func serveHTTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, name, addr string, h http.Handler, certFile, keyFile string) func(context.Context) error {
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           h,
@@ -518,11 +518,21 @@ func serveHTTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, name, a
 		ReadTimeout: 30 * time.Second,
 		IdleTimeout: 120 * time.Second,
 	}
+	tlsEnabled := certFile != ""
+	if tlsEnabled {
+		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		log.Info(name+" listening", "addr", addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Info(name+" listening", "addr", addr, "tls", tlsEnabled)
+		var err error
+		if tlsEnabled {
+			err = srv.ListenAndServeTLS(certFile, keyFile)
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("%s: %w", name, err)
 		}
 	}()

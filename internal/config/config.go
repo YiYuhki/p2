@@ -243,8 +243,12 @@ type PortalConfig struct {
 	EnumPerIPBurst int     `yaml:"enum_per_ip_burst"`
 	EnumGlobalRPS  float64 `yaml:"enum_global_rps"`
 	// TrustProxyHeaders makes the rate limiter key on X-Forwarded-For.
-	TrustProxyHeaders bool             `yaml:"trust_proxy_headers"`
-	Auth              PortalAuthConfig `yaml:"auth"`
+	TrustProxyHeaders bool `yaml:"trust_proxy_headers"`
+	// TLSCertFile / TLSKeyFile enable HTTPS on the portal listener directly
+	// (no reverse proxy). Empty serves plain HTTP (e.g. behind a TLS proxy).
+	TLSCertFile string           `yaml:"tls_cert_file"`
+	TLSKeyFile  string           `yaml:"tls_key_file"`
+	Auth        PortalAuthConfig `yaml:"auth"`
 }
 
 // Recipient authentication modes for the download portal.
@@ -435,6 +439,12 @@ func (c *Config) Validate() error {
 	}
 	for i, d := range c.SMTP.AcceptedDomains {
 		c.SMTP.AcceptedDomains[i] = strings.ToLower(strings.TrimSpace(d))
+	}
+	if (c.SMTP.TLSCertFile == "") != (c.SMTP.TLSKeyFile == "") {
+		errs = append(errs, errors.New("smtp.tls_cert_file and smtp.tls_key_file must be set together"))
+	}
+	if (c.Portal.TLSCertFile == "") != (c.Portal.TLSKeyFile == "") {
+		errs = append(errs, errors.New("portal.tls_cert_file and portal.tls_key_file must be set together"))
 	}
 	c.Portal.PublicBaseURL = strings.TrimRight(c.Portal.PublicBaseURL, "/")
 	c.InternalAPI.AdvertiseURL = strings.TrimRight(c.InternalAPI.AdvertiseURL, "/")
