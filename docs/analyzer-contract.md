@@ -99,4 +99,5 @@ PENDING ──CLEAN──────▶ 다운로드 허용
 (any)   ──link_ttl 경과──▶ EXPIRED (오브젝트 삭제)
 ```
 
-판정은 한 번만 반영됩니다 (`PENDING` 에서만 전이). 참고 구현: `cmd/mock-analyzer`.
+판정은 한 번만 반영됩니다 (`PENDING` 에서만 전이). 참고 구현: `cmd/mock-analyzer`(EICAR 대역).
+실제 구현: [`analyzer/`](../analyzer/) — malengine(`../../p1`) 엔진을 라이브러리로 임베드한 분석 워커.

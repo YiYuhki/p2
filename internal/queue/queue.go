@@ -37,6 +37,12 @@ const (
 // the consumer retries a few times before falling back to the stale-job sweep.
 type ResultHandler func(ctx context.Context, v model.Verdict) error
 
+// JobHandler analyzes one job. It is used by an in-process analyzer; the
+// standalone external worker consumes the Redis job queues on its own. A job
+// whose handler returns an error (or is never delivered) is left for the
+// stale-job sweep to re-enqueue, so a transient failure is not a lost job.
+type JobHandler func(ctx context.Context, job model.Job) error
+
 // PermanentError marks a verdict that must not be retried (malformed payload,
 // unknown attachment, or a duplicate for an already-decided attachment).
 type PermanentError struct{ Err error }
@@ -50,6 +56,10 @@ func Permanent(err error) error { return &PermanentError{Err: err} }
 
 type Queue interface {
 	Enqueue(ctx context.Context, job model.Job, p Priority) error
+	// ConsumeJobs blocks until ctx is cancelled, invoking h for each job
+	// (high priority first). It lets secmail analyze attachments in-process;
+	// the external worker consumes the Redis job lists directly instead.
+	ConsumeJobs(ctx context.Context, h JobHandler) error
 	// ConsumeResults blocks until ctx is cancelled.
 	ConsumeResults(ctx context.Context, h ResultHandler) error
 }
@@ -84,6 +94,39 @@ func (q *Redis) Enqueue(ctx context.Context, job model.Job, p Priority) error {
 		return err
 	}
 	return q.rdb.LPush(ctx, q.JobsKey(p), b).Err()
+}
+
+func (q *Redis) ConsumeJobs(ctx context.Context, h JobHandler) error {
+	high, normal := q.JobsKey(PriorityHigh), q.JobsKey(PriorityNormal)
+	for {
+		// BRPOP drains high before normal, so waiting users are served first.
+		res, err := q.rdb.BRPop(ctx, 5*time.Second, high, normal).Result()
+		if ctx.Err() != nil {
+			return nil
+		}
+		if errors.Is(err, redis.Nil) {
+			continue
+		}
+		if err != nil {
+			q.log.Error("jobs: brpop failed", "err", err)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(2 * time.Second):
+			}
+			continue
+		}
+		var job model.Job
+		if err := json.Unmarshal([]byte(res[1]), &job); err != nil {
+			q.log.Warn("jobs: undecodable job, dropped", "err", err)
+			continue
+		}
+		if err := h(ctx, job); err != nil {
+			// The attachment stays PENDING; the stale-job sweep re-enqueues it.
+			q.log.Warn("jobs: handler failed; stale-job sweep will re-queue",
+				"attachment", job.AttachmentID, "err", err)
+		}
+	}
 }
 
 func (q *Redis) ConsumeResults(ctx context.Context, h ResultHandler) error {
@@ -173,16 +216,38 @@ func deliverWithRetry(ctx context.Context, h ResultHandler, v model.Verdict, log
 type Memory struct {
 	mu      sync.Mutex
 	Jobs    []model.Job
+	jobs    chan model.Job
 	results chan model.Verdict
 }
 
-func NewMemory() *Memory { return &Memory{results: make(chan model.Verdict, 64)} }
+func NewMemory() *Memory {
+	return &Memory{jobs: make(chan model.Job, 1024), results: make(chan model.Verdict, 64)}
+}
 
 func (q *Memory) Enqueue(_ context.Context, job model.Job, _ Priority) error {
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	q.Jobs = append(q.Jobs, job)
+	q.mu.Unlock()
+	// Deliver to an in-process consumer if one is running; never block the
+	// enqueuer when none is (the job is still recorded in Jobs/Snapshot).
+	select {
+	case q.jobs <- job:
+	default:
+	}
 	return nil
+}
+
+// ConsumeJobs delivers enqueued jobs to h in FIFO order (priority is not
+// distinguished in the dev/in-memory queue).
+func (q *Memory) ConsumeJobs(ctx context.Context, h JobHandler) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case job := <-q.jobs:
+			_ = h(ctx, job)
+		}
+	}
 }
 
 func (q *Memory) Snapshot() []model.Job {

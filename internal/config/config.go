@@ -29,8 +29,34 @@ type Config struct {
 	Redis       RedisConfig       `yaml:"redis"`
 	Queue       QueueConfig       `yaml:"queue"`
 	Analysis    AnalysisConfig    `yaml:"analysis"`
+	Analyzer    AnalyzerConfig    `yaml:"analyzer"`
 	Outbound    OutboundConfig    `yaml:"outbound"`
 	DLP         DLPConfig         `yaml:"dlp"`
+}
+
+// AnalyzerConfig configures the OPTIONAL in-process attachment analyzer, which
+// embeds the malengine engine and so is compiled in only when secmail is built
+// with -tags malengine (the default build has no analyzer and relies on the
+// external worker). It consumes jobs from the queue and applies verdicts just
+// like the external worker, so it works with both the redis and memory queues.
+type AnalyzerConfig struct {
+	// Enabled turns the in-process analyzer on. It has no effect unless secmail
+	// was built with -tags malengine.
+	Enabled bool `yaml:"enabled"`
+	// YaraDir is the YARA rule directory (empty: skip YARA; other static
+	// detectors still run).
+	YaraDir string `yaml:"yara_dir"`
+	// BlockLevel is the lowest malengine verdict level mapped to MALICIOUS:
+	// clean | suspicious | likely | malicious. Empty defaults to suspicious.
+	BlockLevel string `yaml:"block_level"`
+	// ThreatIntel enables outbound reputation lookups; Sandbox enables the
+	// dynamic stage (needs Docker/Firecracker).
+	ThreatIntel bool `yaml:"threat_intel"`
+	Sandbox     bool `yaml:"sandbox"`
+	// MaxFileSize caps the analyzed input in bytes (0: engine default).
+	MaxFileSize int64 `yaml:"max_file_size"`
+	// Workers is the number of concurrent analysis goroutines (0: 1).
+	Workers int `yaml:"workers"`
 }
 
 // OutboundConfig enables the second SMTP listener that receives mail the

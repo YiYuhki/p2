@@ -119,6 +119,21 @@ analysis:
   verdict_reuse_window: 24h      # reuse verdicts for identical SHA-256 (0 disables)
   janitor_interval: 1m
 
+# Optional IN-PROCESS attachment analyzer (embeds the malengine engine). It is
+# compiled in only when secmail is built with `-tags malengine` (the default
+# build has no engine and relies on the external worker, analyzer/). It consumes
+# the queue and applies verdicts exactly like the external worker, so it works
+# with both the redis and memory queues — including single-process dev where no
+# external worker can attach. A tagged build links libyara via cgo.
+analyzer:
+  enabled: false                 # no effect unless built with -tags malengine
+  yara_dir: ""                   # YARA rule dir (empty: skip YARA, other detectors still run)
+  block_level: suspicious        # map this malengine level or worse to MALICIOUS: clean|suspicious|likely|malicious
+  threat_intel: false            # outbound reputation lookups (abuse.ch, VirusTotal)
+  sandbox: false                 # dynamic sandbox stage (needs Docker/Firecracker)
+  max_file_size: 0               # cap analyzed bytes (0: engine default)
+  workers: 1                     # concurrent analysis goroutines
+
 # ---- Outgoing mail inspection (DLP) — see docs/dlp.md ----
 outbound:
   enabled: true

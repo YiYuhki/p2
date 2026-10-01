@@ -1,0 +1,21 @@
+# Overlay that swaps the demo mock-analyzer for the real malengine-backed
+# worker (p2/analyzer). Use it on top of the base stack:
+#
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.analyzer.yml up --build
+#
+# The build context is the parent of p1/ and p2/ so the worker's `replace
+# ../../p1` resolves and malengine's source is available to cgo.
+services:
+  # Move the mock behind an opt-in profile so it no longer starts by default.
+  mock-analyzer:
+    profiles: ["mock"]
+
+  analyzer:
+    build:
+      context: ../..
+      dockerfile: p2/analyzer/Dockerfile
+    command: ["-redis", "redis:6379", "-yara-dir", "/rules/yara"]
+    environment:
+      SECMAIL_INTERNAL_TOKEN: demo-internal-token-change-me
+    depends_on: [redis, secmail]
+    restart: unless-stopped

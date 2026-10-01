@@ -401,6 +401,15 @@ func run(cfgPath, components string, log *slog.Logger) error {
 				outSvc.Janitor(ctx, cfg.Analysis.JanitorInterval)
 			}()
 		}
+		// Optional in-process attachment analyzer (only present in a
+		// -tags malengine build; startInProcAnalyzer is nil otherwise).
+		if cfg.Analyzer.Enabled {
+			if startInProcAnalyzer == nil {
+				log.Warn("analyzer.enabled is set but secmail was built without -tags malengine; ignoring (use the external worker)")
+			} else if err := startInProcAnalyzer(ctx, &wg, cfg.Analyzer, q, svc, obj, log); err != nil {
+				return fmt.Errorf("in-process analyzer: %w", err)
+			}
+		}
 	}
 
 	select {

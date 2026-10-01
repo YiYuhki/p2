@@ -94,7 +94,10 @@ swaks --server localhost:2525 --to user@example.com --attach @report.pdf
 swaks --server localhost:10025 --from kim@example.com --to partner@ext.org --body "고객 900101-1234567"
 ```
 S3는 RustFS(MinIO 호환) 컨테이너를 씁니다 (MinIO는 공식 이미지 배포를 중단). 운영에서는 MinIO/AWS S3를 그대로 쓰면 됩니다.
-`mock-analyzer`는 EICAR 문자열이 있으면 `MALICIOUS`, 아니면 `CLEAN`을 회신하는 참고 구현입니다. 실제 분석 프로젝트로 교체하세요.
+`mock-analyzer`는 EICAR 문자열이 있으면 `MALICIOUS`, 아니면 `CLEAN`을 회신하는 참고 구현입니다.
+실제 악성코드 분석은 malengine 엔진([`../p1`](../p1))을 임베드한 [`analyzer/`](analyzer/)로 하며, 두 형태를 지원합니다:
+- **독립 워커**(redis): `docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.analyzer.yml up --build`
+- **secmail 인프로세스**(`-tags malengine`, memory 큐 포함): config `analyzer.enabled: true` — 둘은 같은 `scan` 코드를 공유합니다.
 
 ## 직접 실행
 
@@ -117,6 +120,7 @@ cp config.example.yaml config.yaml   # 환경에 맞게 수정
 |---|---|
 | `cmd/secmail` | 메인 바이너리, `dkim-keygen` 서브커맨드 |
 | `cmd/mock-analyzer` | 분석 엔진 대역 (연동 참고용) |
+| `analyzer/` | 실제 첨부 분석 워커 — malengine(`../p1`) 임베드 (별도 모듈) |
 | `internal/gateway` | SMTP 세션/업스트림 릴레이, 메시지 처리, 배너 |
 | `internal/mimeproc` | MIME 트리 파싱 · 첨부 분리 · 배너 삽입 |
 | `internal/dkimutil` | DKIM 검증/재서명 |
