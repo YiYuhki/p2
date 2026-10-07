@@ -54,4 +54,25 @@
   button.danger { background:var(--bad); }
   .HELD .badge { background:var(--warn); } .RELEASED .badge { background:var(--ok); }
   .REJECTED .badge, .EXPIRED .badge { background:var(--muted); }
+  /* admin dashboard */
+  body.admin main { max-width:960px; }
+  .toolbar { display:flex; align-items:center; gap:12px; margin:8px 0 16px; flex-wrap:wrap; }
+  .toolbar label { display:inline; margin:0; }
+  .toolbar select { padding:8px 10px; border:1px solid var(--line); border-radius:8px;
+                    background:var(--bg); color:var(--fg); font-size:14px; }
+  .toolbar .count { color:var(--muted); font-size:13px; margin-left:auto; }
+  table.holds { width:100%; border-collapse:collapse; font-size:13px; }
+  table.holds th, table.holds td { text-align:left; padding:8px 6px; border-top:1px solid var(--line);
+                                   vertical-align:top; word-break:break-all; }
+  table.holds th { color:var(--muted); font-weight:normal; white-space:nowrap; }
+  table.holds tr.decided { opacity:.55; }
+  .acts { display:flex; gap:6px; white-space:nowrap; }
+  .acts button { width:auto; padding:6px 10px; font-size:12px; }
+  .reason { width:100%; margin:6px 0 0; padding:6px 8px; font-size:12px; }
+  .pill { display:inline-block; padding:1px 7px; border-radius:999px; font-size:11px; color:#fff; }
+  .pill.HELD { background:var(--warn); } .pill.RELEASED { background:var(--ok); }
+  .pill.REJECTED, .pill.EXPIRED { background:var(--muted); }
+  .more { width:auto; padding:8px 16px; margin:16px auto 0; display:block; background:transparent;
+          color:var(--accent); border:1px solid var(--line); }
+  .empty { color:var(--muted); text-align:center; padding:24px 0; }
 </style>{{end}}

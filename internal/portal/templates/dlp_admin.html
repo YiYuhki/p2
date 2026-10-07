@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>발송 보류 관리</title>
+{{template "style" .}}
+</head>
+<body class="admin">
+<main>
+<div class="card">
+  <h1>발송 보류 관리</h1>
+  {{if .Disabled}}
+  <div class="msg err">관리자 대시보드는 수신자 인증이 설정된 경우에만 사용할 수 있습니다
+    (<code>portal.auth.mode</code> = <code>otp</code> 또는 <code>header</code>).</div>
+  {{else}}
+  <p>외부 발송이 보류된 메일 목록입니다. 내용을 확인하고 승인(발송) 또는 반려하세요.</p>
+  <div class="toolbar">
+    <label for="st">상태</label>
+    <select id="st" aria-label="상태 필터">
+      <option value="HELD">검토 대기</option>
+      <option value="RELEASED">승인됨</option>
+      <option value="REJECTED">반려됨</option>
+      <option value="ALL">전체</option>
+    </select>
+    <span class="count" id="count"></span>
+  </div>
+  <table class="holds">
+    <thead><tr><th>접수</th><th>발신</th><th>수신</th><th>제목</th><th>탐지</th><th>상태</th><th></th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div id="empty" class="empty" hidden>표시할 보류 메일이 없습니다.</div>
+  <button class="more" id="more" hidden>더 보기</button>
+  {{if .User}}
+  <div class="userbar"><span>{{.User}}</span>
+  {{if .CanLogout}}<form method="post" action="/dlp/admin/logout"><button class="link" type="submit">로그아웃</button></form>{{end}}
+  </div>
+  {{end}}
+  <script nonce="{{.Nonce}}">
+  (function () {
+    var rows = document.getElementById('rows'), st = document.getElementById('st'),
+        more = document.getElementById('more'), empty = document.getElementById('empty'),
+        count = document.getElementById('count');
+    var cursor = null, loading = false;
+    var SEV = { high: '높음', medium: '중간', low: '낮음' };
+    var STATUS = { HELD: '검토 대기', RELEASED: '승인됨', REJECTED: '반려됨', EXPIRED: '만료' };
+
+    function cell(text) { var td = document.createElement('td'); td.textContent = text; return td; }
+
+    function render(h) {
+      var tr = document.createElement('tr');
+      if (h.status !== 'HELD') tr.className = 'decided';
+      tr.appendChild(cell(h.created));
+      tr.appendChild(cell(h.from));
+      tr.appendChild(cell((h.to || []).join(', ')));
+      tr.appendChild(cell(h.subject));
+      tr.appendChild(cell(h.findings ? ((SEV[h.severity] || '-') + ' · ' + h.findings + '건') : '-'));
+      var stTd = document.createElement('td');
+      var pill = document.createElement('span');
+      pill.className = 'pill ' + h.status; pill.textContent = STATUS[h.status] || h.status;
+      stTd.appendChild(pill); tr.appendChild(stTd);
+      var actTd = document.createElement('td');
+      if (h.status === 'HELD') {
+        var box = document.createElement('div'); box.className = 'acts';
+        var rel = document.createElement('button'); rel.textContent = '승인';
+        rel.addEventListener('click', function () { decide(tr, h.id, 'release'); });
+        var rej = document.createElement('button'); rej.className = 'danger'; rej.textContent = '반려';
+        rej.addEventListener('click', function () { decide(tr, h.id, 'reject'); });
+        box.appendChild(rel); box.appendChild(rej); actTd.appendChild(box);
+      }
+      tr.appendChild(actTd);
+      rows.appendChild(tr);
+    }
+
+    function decide(tr, id, action) {
+      var body = '';
+      if (action === 'reject') {
+        var reason = window.prompt('반려 사유 (선택, 발신자에게 전달):', '');
+        if (reason === null) return;
+        body = 'reason=' + encodeURIComponent(reason);
+      }
+      var btns = tr.querySelectorAll('button');
+      btns.forEach(function (b) { b.disabled = true; });
+      fetch('/dlp/admin/holds/' + encodeURIComponent(id) + '/' + action, {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body
+      }).then(function (r) {
+        return r.json().then(function (j) { return { ok: r.ok, status: r.status, j: j }; });
+      }).then(function (res) {
+        if (res.ok) {
+          tr.className = 'decided';
+          var p = tr.querySelector('.pill');
+          p.className = 'pill ' + res.j.status; p.textContent = STATUS[res.j.status] || res.j.status;
+          var a = tr.querySelector('.acts'); if (a) a.remove();
+        } else {
+          window.alert('처리 실패: ' + (res.j.error || res.status));
+          btns.forEach(function (b) { b.disabled = false; });
+        }
+      }).catch(function () {
+        window.alert('네트워크 오류가 발생했습니다.');
+        btns.forEach(function (b) { b.disabled = false; });
+      });
+    }
+
+    function load(reset) {
+      if (loading) return;
+      loading = true;
+      if (reset) { rows.innerHTML = ''; cursor = null; }
+      var url = '/dlp/admin/holds?status=' + encodeURIComponent(st.value);
+      if (cursor) url += '&cursor=' + encodeURIComponent(cursor);
+      fetch(url, { credentials: 'same-origin' }).then(function (r) {
+        if (!r.ok) throw new Error('http ' + r.status);
+        return r.json();
+      }).then(function (j) {
+        (j.holds || []).forEach(render);
+        cursor = j.next || null;
+        more.hidden = !cursor;
+        empty.hidden = rows.children.length > 0;
+        count.textContent = rows.children.length + '건 표시';
+        loading = false;
+      }).catch(function () { loading = false; });
+    }
+
+    st.addEventListener('change', function () { load(true); });
+    more.addEventListener('click', function () { load(false); });
+    load(true);
+  })();
+  </script>
+  {{end}}
+</div>
+<footer>보안 메일 게이트웨이 · DLP 관리자</footer>
+</main>
+</body>
+</html>
