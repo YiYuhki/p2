@@ -205,6 +205,9 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		AuditRetention:     cfg.Analysis.AuditRetention,
 		Webhook:            wh,
 		BlockedExtensions:  cfg.Rewrite.BlockedExtensions,
+		NotifyRecipients:   cfg.Analysis.NotifyRecipients,
+		Notifier:           notify.NewSMTPSender(upstreamOpts(cfg)),
+		NotifyFrom:         cfg.Analysis.NotifyFrom,
 	}, log)
 
 	// ---- outbound DLP ----
@@ -297,6 +300,7 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			VerifyDKIM:    cfg.DKIM.VerifyInbound,
 			VerifySPF:     cfg.SPF.VerifyInbound,
 			VerifyDMARC:   cfg.DMARC.VerifyInbound,
+			EnforceDMARC:  cfg.DMARC.Enforce,
 			StripOrigDKIM: cfg.DKIM.StripOriginal,
 			Signer:        signer,
 			SPF:           spfChecker,

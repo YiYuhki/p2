@@ -29,14 +29,17 @@ type Quarantiner interface {
 }
 
 type ProcessorOptions struct {
-	Hostname      string
-	GatewayID     string
-	Rewrite       mimeproc.Options
-	LinkTTL       time.Duration
-	Location      *time.Location
-	VerifyDKIM    bool
-	VerifySPF     bool
-	VerifyDMARC   bool
+	Hostname    string
+	GatewayID   string
+	Rewrite     mimeproc.Options
+	LinkTTL     time.Duration
+	Location    *time.Location
+	VerifyDKIM  bool
+	VerifySPF   bool
+	VerifyDMARC bool
+	// EnforceDMARC rejects (550) a message that DMARC-fails under a published
+	// p=reject policy. Off by default (evaluate-only; record in A-R).
+	EnforceDMARC  bool
 	StripOrigDKIM bool
 	Signer        *dkimutil.Signer // nil disables re-signing
 	// LookupTXT overrides DNS for DKIM verification (tests).
@@ -77,6 +80,8 @@ var (
 		Message: "Temporary failure while securing attachments, please retry"}
 	errEncrypted = &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 7, 1},
 		Message: "Encrypted messages are not accepted by policy"}
+	errDMARC = &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 7, 1},
+		Message: "Message rejected by DMARC policy (p=reject)"}
 	errMalformed = &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 6, 0},
 		Message: "Malformed message"}
 )
@@ -90,10 +95,16 @@ func (p *Processor) Process(ctx context.Context, env Envelope, raw []byte) ([]by
 	// raw, and the DNS lookups overlap with the CPU-bound MIME parse instead of
 	// adding to it. The buffered channel means the goroutine never leaks even on
 	// the early-return paths that do not consume the result.
-	authCh := make(chan string, 1)
+	authCh := make(chan authResult, 1)
 	go func() { authCh <- p.authenticate(ctx, env, raw) }()
 
 	root, err := mimeproc.Parse(raw)
+	auth := <-authCh
+	// DMARC enforcement rejects before any quarantine or relay.
+	if auth.dmarcRejects {
+		log.Info("rejected by DMARC policy")
+		return nil, errDMARC
+	}
 	if err != nil {
 		// Fail closed: anything we cannot parse is quarantined as a whole.
 		log.Warn("unparsable MIME structure, quarantining entire message", "err", err)
@@ -103,7 +114,7 @@ func (p *Processor) Process(ctx context.Context, env Envelope, raw []byte) ([]by
 		}
 		return p.finish(ctx, log, env, queueID, root, []*mimeproc.Extracted{{
 			Filename: "original-message.eml", ContentType: "message/rfc822", Data: raw,
-		}}, "원본 메일의 구조를 해석할 수 없어 메일 전체를 첨부파일로 보관했습니다.", <-authCh, true)
+		}}, "원본 메일의 구조를 해석할 수 없어 메일 전체를 첨부파일로 보관했습니다.", auth.results, true)
 	}
 
 	stripGatewayHeaders(&root.Header)
@@ -126,7 +137,7 @@ func (p *Processor) Process(ctx context.Context, env Envelope, raw []byte) ([]by
 		notice = "첨부파일 분리로 인해 원본 메일의 전자서명(S/MIME/PGP)이 제거되었습니다."
 		root.Header.Add("X-SecMail-Notice", "signature-removed")
 	}
-	return p.finish(ctx, log, env, queueID, root, res.Attachments, notice, <-authCh, len(res.Attachments) > 0)
+	return p.finish(ctx, log, env, queueID, root, res.Attachments, notice, auth.results, len(res.Attachments) > 0)
 }
 
 func (p *Processor) finish(ctx context.Context, log *slog.Logger, env Envelope, queueID string, root *mimeproc.Part,
@@ -190,11 +201,19 @@ func (p *Processor) finish(ctx context.Context, log *slog.Logger, env Envelope, 
 // the original message and returns the combined RFC 8601 method list. It reads
 // the From header straight from raw so DMARC can run here, concurrently with the
 // caller's MIME parse, rather than after it.
-func (p *Processor) authenticate(ctx context.Context, env Envelope, raw []byte) string {
+// authResult carries the rendered Authentication-Results and whether DMARC
+// enforcement wants the message rejected.
+type authResult struct {
+	results      string
+	dmarcRejects bool
+}
+
+func (p *Processor) authenticate(ctx context.Context, env Envelope, raw []byte) authResult {
 	var methods []string
 	var spf spfutil.Result
 	var spfOn bool
 	var dkim []dkimutil.Result
+	rejects := false
 
 	if p.opts.VerifySPF && p.opts.SPF != nil {
 		spf = p.opts.SPF.CheckResult(ctx, env.RemoteAddr, env.Helo, env.MailFrom)
@@ -211,12 +230,16 @@ func (p *Processor) authenticate(ctx context.Context, env Envelope, raw []byte) 
 		for i, r := range dkim {
 			sigs[i] = dmarc.Signature{Result: r.Value, Domain: r.Domain}
 		}
-		methods = append(methods, p.opts.DMARC.Evaluate(ctx, from, spf.Value, spf.Domain, sigs))
+		res := p.opts.DMARC.EvaluateResult(ctx, from, spf.Value, spf.Domain, sigs)
+		methods = append(methods, res.AuthResults)
+		// Enforce only an unambiguous fail under a reject policy, so a transient
+		// temperror or a quarantine policy never hard-bounces legitimate mail.
+		rejects = p.opts.EnforceDMARC && res.Verdict == "fail" && res.Policy == "reject"
 	}
 
 	joined := strings.Join(methods, "; ")
 	recordAuthMetrics(joined)
-	return joined
+	return authResult{results: joined, dmarcRejects: rejects}
 }
 
 // headerFrom reads just the From header from a raw message.

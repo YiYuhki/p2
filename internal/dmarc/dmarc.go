@@ -47,10 +47,29 @@ func New(resolver Resolver, timeout time.Duration) *Evaluator {
 // Evaluate computes the DMARC result for the From-header domain given the SPF
 // result (and the domain SPF authenticated) and the DKIM signatures. It returns
 // an RFC 8601 fragment: "dmarc=pass|fail|none|temperror header.from=<domain>".
+// Result is a structured DMARC outcome.
+type Result struct {
+	AuthResults string // RFC 8601 fragment, e.g. "dmarc=fail header.from=ex.org"
+	Verdict     string // pass | fail | none | temperror
+	Policy      string // none | quarantine | reject ("" when no record)
+}
+
+// Evaluate returns only the Authentication-Results fragment.
 func (e *Evaluator) Evaluate(ctx context.Context, fromDomain, spfResult, spfDomain string, dkim []Signature) string {
+	return e.EvaluateResult(ctx, fromDomain, spfResult, spfDomain, dkim).AuthResults
+}
+
+// EvaluateResult computes the DMARC verdict and the domain's published policy.
+func (e *Evaluator) EvaluateResult(ctx context.Context, fromDomain, spfResult, spfDomain string, dkim []Signature) Result {
 	fromDomain = strings.ToLower(authres.Sanitize(strings.TrimSpace(fromDomain)))
+	frag := func(verdict string) string {
+		if fromDomain == "" {
+			return "dmarc=" + verdict
+		}
+		return "dmarc=" + verdict + " header.from=" + fromDomain
+	}
 	if fromDomain == "" {
-		return "dmarc=none"
+		return Result{AuthResults: "dmarc=none", Verdict: "none"}
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, e.timeout)
@@ -58,32 +77,42 @@ func (e *Evaluator) Evaluate(ctx context.Context, fromDomain, spfResult, spfDoma
 
 	rec, temp, found := e.lookupPolicy(ctx, fromDomain)
 	if temp {
-		return "dmarc=temperror header.from=" + fromDomain
+		return Result{AuthResults: frag("temperror"), Verdict: "temperror"}
 	}
 	if !found {
-		return "dmarc=none header.from=" + fromDomain
+		return Result{AuthResults: frag("none"), Verdict: "none"}
 	}
 	adkim, aspf := alignmentModes(rec)
+	policy := policyOf(rec)
 
-	// DKIM-authenticated identifier alignment: a passing signature whose d=
-	// aligns with the From domain.
 	for _, s := range dkim {
 		if strings.EqualFold(s.Result, "pass") && aligned(s.Domain, fromDomain, adkim) {
-			return "dmarc=pass header.from=" + fromDomain
+			return Result{AuthResults: frag("pass"), Verdict: "pass", Policy: policy}
 		}
 	}
-	// SPF-authenticated identifier alignment: a pass whose MAIL FROM domain
-	// aligns with the From domain.
 	if strings.EqualFold(spfResult, "pass") && aligned(spfDomain, fromDomain, aspf) {
-		return "dmarc=pass header.from=" + fromDomain
+		return Result{AuthResults: frag("pass"), Verdict: "pass", Policy: policy}
 	}
-	// Nothing aligned as a pass. If an underlying mechanism could not complete
-	// (transient DNS), report temperror so the receiver retries instead of
-	// hard-failing legitimate mail.
+	// Nothing aligned. A transient underlying error → temperror (retry), not a
+	// hard fail of legitimate mail.
 	if isTemp(spfResult) || anyTemp(dkim) {
-		return "dmarc=temperror header.from=" + fromDomain
+		return Result{AuthResults: frag("temperror"), Verdict: "temperror", Policy: policy}
 	}
-	return "dmarc=fail header.from=" + fromDomain
+	return Result{AuthResults: frag("fail"), Verdict: "fail", Policy: policy}
+}
+
+// policyOf parses the p= tag (none|quarantine|reject); unknown/absent → none.
+func policyOf(rec string) string {
+	for _, tag := range strings.Split(rec, ";") {
+		kv := strings.SplitN(strings.TrimSpace(tag), "=", 2)
+		if len(kv) == 2 && strings.EqualFold(strings.TrimSpace(kv[0]), "p") {
+			switch v := strings.ToLower(strings.TrimSpace(kv[1])); v {
+			case "quarantine", "reject":
+				return v
+			}
+		}
+	}
+	return "none"
 }
 
 func isTemp(result string) bool { return strings.EqualFold(result, "temperror") }

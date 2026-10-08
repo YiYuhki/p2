@@ -50,9 +50,10 @@ spf:
 dmarc:
   verify_inbound: true           # evaluate DMARC alignment from the SPF+DKIM results
   timeout: 5s                    # DNS budget for the _dmarc policy lookup
+  enforce: false                 # true: reject (550) a DMARC-fail under the domain's p=reject policy
   # Adds "dmarc=pass|fail header.from=..." to Authentication-Results. Requires spf and/or
-  # dkim verify_inbound. Evaluation only — the gateway never rejects on DMARC (leave
-  # enforcement to the internal mail server's policy).
+  # dkim verify_inbound. With enforce=false the gateway only records the result (the internal
+  # mail server decides); enforce=true hard-rejects p=reject failures at the gateway.
 
 portal:
   listen: ":8080"

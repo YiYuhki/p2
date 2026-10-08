@@ -20,6 +20,7 @@ import (
 	"github.com/yiyuhki/p2/internal/metrics"
 	"github.com/yiyuhki/p2/internal/mimeproc"
 	"github.com/yiyuhki/p2/internal/model"
+	"github.com/yiyuhki/p2/internal/notify"
 	"github.com/yiyuhki/p2/internal/queue"
 	"github.com/yiyuhki/p2/internal/storage"
 	"github.com/yiyuhki/p2/internal/store"
@@ -44,6 +45,11 @@ type Options struct {
 	BlockedExtensions []string
 	// Webhook, when set, receives a JSON event when a verdict is MALICIOUS.
 	Webhook *webhook.Notifier
+	// NotifyRecipients emails the message recipients when an attachment verdict
+	// completes (CLEAN or MALICIOUS). Needs Notifier and NotifyFrom.
+	NotifyRecipients bool
+	Notifier         notify.Sender
+	NotifyFrom       string
 }
 
 type Service struct {
@@ -236,29 +242,61 @@ func (s *Service) ApplyVerdict(ctx context.Context, v model.Verdict) error {
 	if err == nil {
 		metrics.Verdicts.WithLabelValues(strings.ToLower(string(v.Status))).Inc()
 		s.log.Info("verdict applied", "attachment", v.AttachmentID, "status", v.Status, "threat", v.ThreatName)
-		if v.Status == model.StatusMalicious {
-			s.notifyVerdict(ctx, v)
-		}
+		s.afterVerdict(ctx, v)
 	}
 	return err
 }
 
-// notifyVerdict fires the security webhook for a malicious verdict, enriched
-// with the message envelope when it can be looked up (best-effort).
-func (s *Service) notifyVerdict(ctx context.Context, v model.Verdict) {
-	if s.opts.Webhook == nil {
+// afterVerdict fires the security webhook (MALICIOUS) and the recipient
+// completion notice (CLEAN/MALICIOUS), both enriched with the message envelope
+// from a single best-effort lookup. It only runs on the first (PENDING→final)
+// transition, so recipients are never notified twice.
+func (s *Service) afterVerdict(ctx context.Context, v model.Verdict) {
+	notifyRcpt := s.opts.NotifyRecipients && s.opts.Notifier != nil &&
+		(v.Status == model.StatusClean || v.Status == model.StatusMalicious)
+	if s.opts.Webhook == nil && !notifyRcpt {
 		return
 	}
-	ev := webhook.Event{
-		Type: "inbound_verdict", At: s.now().UTC(), Status: string(v.Status),
-		Threat: v.ThreatName, Attachment: v.AttachmentID,
-	}
+	var mailFrom, subject, filename string
+	var rcpt []string
 	if a, err := s.store.GetAttachment(ctx, v.AttachmentID); err == nil {
+		filename = a.Filename
 		if m, err := s.store.GetMessage(ctx, a.MessageID); err == nil {
-			ev.MailFrom, ev.RcptTo, ev.Subject = m.MailFrom, m.RcptTo, m.Subject
+			mailFrom, rcpt, subject = m.MailFrom, m.RcptTo, m.Subject
 		}
 	}
-	s.opts.Webhook.Send(ev)
+	if s.opts.Webhook != nil && v.Status == model.StatusMalicious {
+		s.opts.Webhook.Send(webhook.Event{
+			Type: "inbound_verdict", At: s.now().UTC(), Status: string(v.Status),
+			Threat: v.ThreatName, Attachment: v.AttachmentID,
+			MailFrom: mailFrom, RcptTo: rcpt, Subject: subject,
+		})
+	}
+	if notifyRcpt && len(rcpt) > 0 {
+		body := verdictBody(v.Status, filename, subject, v.ThreatName)
+		msg := notify.Build(s.opts.NotifyFrom, "보안 메일 게이트웨이", rcpt, verdictSubject(v.Status), body, s.now())
+		go func() {
+			if err := s.opts.Notifier.Send(context.WithoutCancel(ctx), s.opts.NotifyFrom, rcpt, msg); err != nil {
+				s.log.Warn("verdict notice send failed", "attachment", v.AttachmentID, "err", err)
+			}
+		}()
+	}
+}
+
+func verdictSubject(st model.Status) string {
+	if st == model.StatusMalicious {
+		return "[보안] 첨부파일이 차단되었습니다"
+	}
+	return "[보안] 첨부파일 검사 완료"
+}
+
+func verdictBody(st model.Status, filename, subject, threat string) string {
+	if st == model.StatusMalicious {
+		return fmt.Sprintf("받으신 메일(%q)의 첨부파일 '%s'이(가) 보안 검사에서 위협(%s)으로 판정되어 차단되었습니다.\n"+
+			"해당 파일은 내려받을 수 없습니다. 문의는 보안 담당자에게 연락하세요.", subject, filename, threat)
+	}
+	return fmt.Sprintf("받으신 메일(%q)의 첨부파일 '%s'이(가) 보안 검사를 통과했습니다.\n"+
+		"원본 메일 본문의 다운로드 링크에서 파일을 받으실 수 있습니다.", subject, filename)
 }
 
 // sanitizeThreatName strips control characters (the name is surfaced in the

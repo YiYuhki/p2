@@ -235,6 +235,9 @@ type SPFConfig struct {
 type DMARCConfig struct {
 	VerifyInbound bool          `yaml:"verify_inbound"`
 	Timeout       time.Duration `yaml:"timeout"` // DNS budget for the policy lookup (default 5s)
+	// Enforce rejects (550) a message that DMARC-fails under a published
+	// p=reject policy. Off by default (evaluate-only, record in A-R).
+	Enforce bool `yaml:"enforce"`
 }
 
 type DKIMConfig struct {
@@ -358,6 +361,10 @@ type AnalysisConfig struct {
 	// AuditRetention, when > 0, makes the janitor delete dlp_events and
 	// download_events older than this. 0 (default) keeps the audit log forever.
 	AuditRetention time.Duration `yaml:"audit_retention"`
+	// NotifyRecipients emails the message recipients when an attachment's
+	// analysis verdict completes (CLEAN or MALICIOUS). NotifyFrom is the sender.
+	NotifyRecipients bool   `yaml:"notify_recipients"`
+	NotifyFrom       string `yaml:"notify_from"`
 }
 
 func Default() Config {

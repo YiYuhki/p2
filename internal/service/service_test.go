@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -249,5 +250,54 @@ func TestBlockedExtensionQuarantine(t *testing.T) {
 	jobs := q.Snapshot()
 	if len(jobs) != 1 || jobs[0].Filename != "report.pdf" {
 		t.Fatalf("only the pdf should be queued, got %+v", jobs)
+	}
+}
+
+type capSender struct {
+	mu   sync.Mutex
+	sent []string // joined "to -> body-contains" records (raw msg)
+}
+
+func (c *capSender) Send(_ context.Context, _ string, to []string, msg []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sent = append(c.sent, strings.Join(to, ",")+"|"+string(msg))
+	return nil
+}
+func (c *capSender) wait(t *testing.T) []string {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		c.mu.Lock()
+		n := len(c.sent)
+		c.mu.Unlock()
+		if n > 0 {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			return append([]string(nil), c.sent...)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("no notification sent")
+	return nil
+}
+
+func TestRecipientVerdictNotification(t *testing.T) {
+	s, _, _, _, _ := newSvc(t)
+	cs := &capSender{}
+	s.opts.NotifyRecipients = true
+	s.opts.Notifier = cs
+	s.opts.NotifyFrom = "secmail@example.com"
+	ctx := context.Background()
+	links, err := s.Quarantine(ctx, &model.Message{RcptTo: []string{"user@corp.example"}, Subject: "청구서"},
+		[]*mimeproc.Extracted{{Filename: "invoice.pdf", ContentType: "application/pdf", Data: []byte("%PDF")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ApplyVerdict(ctx, model.Verdict{AttachmentID: links[0].AttachmentID, Status: model.StatusClean}); err != nil {
+		t.Fatal(err)
+	}
+	got := cs.wait(t)
+	if len(got) != 1 || !strings.Contains(got[0], "user@corp.example") {
+		t.Fatalf("recipient not notified: %v", got)
 	}
 }
