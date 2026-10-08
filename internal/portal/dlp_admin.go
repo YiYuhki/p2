@@ -3,6 +3,7 @@ package portal
 import (
 	"context"
 	"encoding/base64"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -108,6 +109,127 @@ func (s *Server) adminHolds(w http.ResponseWriter, r *http.Request) {
 		resp["next"] = encodeHoldCursor(last.CreatedAt, last.ID)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+type adminEventJSON struct {
+	ID       string   `json:"id"`
+	At       string   `json:"at"`
+	MailFrom string   `json:"mail_from"`
+	To       []string `json:"to"`
+	Subject  string   `json:"subject"`
+	Action   string   `json:"action"`
+	Severity string   `json:"severity"`
+	HoldID   string   `json:"hold_id,omitempty"`
+}
+
+// adminEvents serves the audit-log (dlp_events) view with action/severity
+// filters and cursor pagination.
+func (s *Server) adminEvents(w http.ResponseWriter, r *http.Request) {
+	if s.adminAuthDisabled() {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "admin dashboard requires recipient auth"})
+		return
+	}
+	if !s.limiter.Allow(r) {
+		w.Header().Set("Retry-After", "5")
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many requests"})
+		return
+	}
+	if _, ok := s.authorizeGuard(w, r, s.adminGuard(), true); !ok {
+		return
+	}
+	const limit = 50
+	filter := store.EventFilter{
+		Action:   strings.ToLower(strings.TrimSpace(r.URL.Query().Get("action"))),
+		Severity: strings.ToLower(strings.TrimSpace(r.URL.Query().Get("severity"))),
+	}
+	evs, err := s.store.ListDLPEvents(r.Context(), filter, limit, decodeHoldCursor(r.URL.Query().Get("cursor")))
+	if err != nil {
+		s.log.Error("portal: admin list events", "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	out := make([]adminEventJSON, 0, len(evs))
+	for _, e := range evs {
+		out = append(out, adminEventJSON{
+			ID: e.ID, At: e.At.In(s.opts.Location).Format("2006-01-02 15:04"), MailFrom: e.MailFrom,
+			To: e.RcptTo, Subject: e.Subject, Action: e.Action, Severity: e.Severity, HoldID: e.HoldID,
+		})
+	}
+	resp := map[string]any{"events": out}
+	if len(evs) == limit {
+		last := evs[len(evs)-1]
+		resp["next"] = encodeHoldCursor(last.At, last.ID)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// adminExport streams a CSV of holds or the audit log (?kind=holds|events),
+// paging through the store up to a safety cap.
+func (s *Server) adminExport(w http.ResponseWriter, r *http.Request) {
+	if s.adminAuthDisabled() {
+		http.NotFound(w, r)
+		return
+	}
+	if _, ok := s.authorizeGuard(w, r, s.adminGuard(), true); !ok {
+		return
+	}
+	kind := r.URL.Query().Get("kind")
+	if kind != "holds" && kind != "events" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "kind must be holds or events"})
+		return
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="dlp-`+kind+`.csv"`)
+	cw := csv.NewWriter(w)
+	defer cw.Flush()
+	const cap = 50000
+	page := store.Page{}
+	n := 0
+	if kind == "holds" {
+		cw.Write([]string{"id", "created_at", "expires_at", "status", "mail_from", "rcpt_to", "subject", "decided_by", "reason"})
+		st := model.HoldStatus(strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("status"))))
+		if st == "ALL" {
+			st = ""
+		}
+		for n < cap {
+			hs, err := s.store.ListHolds(r.Context(), st, 500, page)
+			if err != nil || len(hs) == 0 {
+				return
+			}
+			for _, h := range hs {
+				cw.Write([]string{h.ID, h.CreatedAt.Format(time.RFC3339), h.ExpiresAt.Format(time.RFC3339),
+					string(h.Status), h.MailFrom, strings.Join(h.RcptTo, " "), h.Subject, h.DecidedBy, h.Reason})
+				n++
+			}
+			if len(hs) < 500 {
+				return
+			}
+			last := hs[len(hs)-1]
+			page = store.Page{Before: last.CreatedAt, BeforeID: last.ID}
+		}
+		return
+	}
+	cw.Write([]string{"id", "at", "action", "severity", "mail_from", "rcpt_to", "subject", "hold_id"})
+	filter := store.EventFilter{
+		Action:   strings.ToLower(strings.TrimSpace(r.URL.Query().Get("action"))),
+		Severity: strings.ToLower(strings.TrimSpace(r.URL.Query().Get("severity"))),
+	}
+	for n < cap {
+		evs, err := s.store.ListDLPEvents(r.Context(), filter, 500, page)
+		if err != nil || len(evs) == 0 {
+			return
+		}
+		for _, e := range evs {
+			cw.Write([]string{e.ID, e.At.Format(time.RFC3339), e.Action, e.Severity, e.MailFrom,
+				strings.Join(e.RcptTo, " "), e.Subject, e.HoldID})
+			n++
+		}
+		if len(evs) < 500 {
+			return
+		}
+		last := evs[len(evs)-1]
+		page = store.Page{Before: last.At, BeforeID: last.ID}
+	}
 }
 
 // adminDecide releases or rejects a hold by id (admin dashboard action).

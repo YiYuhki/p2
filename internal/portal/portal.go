@@ -109,6 +109,8 @@ func (s *Server) Handler() http.Handler {
 		// Admin dashboard (identifiable admins only; see dlp_admin.go).
 		mux.HandleFunc("GET /dlp/admin", s.adminDashboard)
 		mux.HandleFunc("GET /dlp/admin/holds", s.adminHolds)
+		mux.HandleFunc("GET /dlp/admin/events", s.adminEvents)
+		mux.HandleFunc("GET /dlp/admin/export", s.adminExport)
 		mux.HandleFunc("POST /dlp/admin/auth", s.adminAuth)
 		mux.HandleFunc("POST /dlp/admin/logout", s.adminLogout)
 		mux.HandleFunc("POST /dlp/admin/holds/{id}/release", s.adminDecide(true))

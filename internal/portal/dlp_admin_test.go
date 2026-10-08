@@ -84,7 +84,7 @@ func TestAdminDashboardListAndDecide(t *testing.T) {
 
 	// The dashboard shell renders for the logged-in admin.
 	if resp, body := fetch(t, c, "GET", base+"/dlp/admin", nil); resp.StatusCode != 200 ||
-		!strings.Contains(body, "발송 보류 관리") || !strings.Contains(body, `id="rows"`) ||
+		!strings.Contains(body, "발송 보류 관리") || !strings.Contains(body, `id="hrows"`) ||
 		!strings.Contains(body, "sec@example.com") {
 		t.Fatalf("dashboard shell: %d\n%s", resp.StatusCode, body)
 	}
@@ -135,5 +135,42 @@ func TestAdminDashboardNonAdminForbidden(t *testing.T) {
 	// Without a valid session the holds API stays challenged.
 	if resp, _ := fetch(t, c, "GET", base+"/dlp/admin/holds", nil); resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("non-admin holds API should 401, got %d", resp.StatusCode)
+	}
+}
+
+func TestAdminEventsAndExport(t *testing.T) {
+	base, rv, m, _ := adminFixture(t, AuthOptions{Mode: "otp"})
+	// Seed a couple of audit events.
+	rv.st.RecordDLPEvent(context.Background(), &model.DLPEvent{ID: "ev-a", MailFrom: "kim@example.com",
+		RcptTo: []string{"p@ext.org"}, Subject: "유출 의심", Action: "block", Severity: "high",
+		Findings: []byte(`{}`), At: time.Now()})
+	rv.st.RecordDLPEvent(context.Background(), &model.DLPEvent{ID: "ev-b", MailFrom: "lee@example.com",
+		RcptTo: []string{"q@ext.org"}, Subject: "알림건", Action: "notify", Severity: "medium",
+		Findings: []byte(`{}`), At: time.Now()})
+	c := browser(t)
+	adminLogin(t, c, base, "sec@example.com", m)
+
+	// Events JSON, filtered to block.
+	resp, body := fetch(t, c, "GET", base+"/dlp/admin/events?action=block", nil)
+	if resp.StatusCode != 200 || !strings.Contains(body, `"action":"block"`) || strings.Contains(body, "notify") {
+		t.Fatalf("events filter: %d %s", resp.StatusCode, body)
+	}
+
+	// CSV export (events).
+	resp, body = fetch(t, c, "GET", base+"/dlp/admin/export?kind=events", nil)
+	if resp.StatusCode != 200 || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/csv") {
+		t.Fatalf("events csv content-type: %d %q", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+	if !strings.Contains(body, "id,at,action,severity") || !strings.Contains(body, "ev-a") || !strings.Contains(body, "ev-b") {
+		t.Fatalf("events csv body:\n%s", body)
+	}
+
+	// CSV export (holds) includes the seeded held hold.
+	resp, body = fetch(t, c, "GET", base+"/dlp/admin/export?kind=holds", nil)
+	if resp.StatusCode != 200 || !strings.Contains(body, "mail_from") || !strings.Contains(body, "kim@example.com") {
+		t.Fatalf("holds csv: %d\n%s", resp.StatusCode, body)
+	}
+	if resp, _ := fetch(t, c, "GET", base+"/dlp/admin/export?kind=bogus", nil); resp.StatusCode != 400 {
+		t.Fatalf("bad kind should 400, got %d", resp.StatusCode)
 	}
 }

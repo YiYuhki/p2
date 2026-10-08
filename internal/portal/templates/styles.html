@@ -75,4 +75,12 @@
   .more { width:auto; padding:8px 16px; margin:16px auto 0; display:block; background:transparent;
           color:var(--accent); border:1px solid var(--line); }
   .empty { color:var(--muted); text-align:center; padding:24px 0; }
+  .tabs { display:flex; gap:4px; margin:4px 0 16px; border-bottom:1px solid var(--line); }
+  .tab { width:auto; background:transparent; color:var(--muted); border:0; border-bottom:2px solid transparent;
+         border-radius:0; padding:8px 14px; font-weight:normal; }
+  .tab.active { color:var(--fg); border-bottom-color:var(--accent); font-weight:bold; }
+  .btnlink { font-size:13px; color:var(--accent); text-decoration:underline; }
+  .bulk { display:flex; gap:8px; margin:0 0 10px; }
+  .bulk button { width:auto; padding:6px 12px; font-size:13px; }
+  table.holds td input[type=checkbox], table.holds th input[type=checkbox] { width:auto; margin:0; }
 </style>{{end}}
