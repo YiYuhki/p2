@@ -213,3 +213,28 @@ func TestDLPEventsFilteredPaginationKeepsFilter(t *testing.T) {
 		t.Fatalf("page2 should have the last block event only, got %d", n2)
 	}
 }
+
+func TestDLPRuleTestEndpoint(t *testing.T) {
+	st := store.NewMemory()
+	obj, _ := storage.NewFS(t.TempDir())
+	api := New(st, obj, nil, secret, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	const admin = "admin-token-0123456789"
+	api.EnableDLPAdmin(admin, reviewer{st})
+	srv := httptest.NewServer(api.Handler())
+	defer srv.Close()
+	base := srv.URL + "/internal/v1/dlp/rules/test"
+
+	code, body := do(t, "POST", base, admin, `{"pattern":"ORD-[0-9]{6}","text":"ORD-123456 and ORD-654321"}`)
+	if code != 200 || !strings.Contains(body, `"count":2`) {
+		t.Fatalf("rule test: %d %s", code, body)
+	}
+	if strings.Contains(body, "123456") {
+		t.Fatalf("matches not masked: %s", body)
+	}
+	if code, _ := do(t, "POST", base, admin, `{"pattern":"(","text":"x"}`); code != 400 {
+		t.Fatalf("bad regex should 400, got %d", code)
+	}
+	if code, _ := do(t, "POST", base, secret, `{"pattern":"x","text":"x"}`); code != 401 {
+		t.Fatalf("analyzer token must not reach admin endpoint: %d", code)
+	}
+}

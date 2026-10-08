@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/yiyuhki/p2/internal/dlp"
 	"github.com/yiyuhki/p2/internal/model"
 	"github.com/yiyuhki/p2/internal/store"
 )
@@ -45,6 +46,32 @@ func (a *API) mountDLP(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/v1/dlp/holds/{id}/release", a.admin(a.decide(true)))
 	mux.HandleFunc("POST /internal/v1/dlp/holds/{id}/reject", a.admin(a.decide(false)))
 	mux.HandleFunc("GET /internal/v1/dlp/events", a.admin(a.listEvents))
+	mux.HandleFunc("POST /internal/v1/dlp/rules/test", a.admin(a.testRule))
+}
+
+// testRule compiles a candidate dlp.rules pattern and returns what it would
+// match (masked) in the supplied sample text — a tuning aid for custom rules.
+//
+//	POST /internal/v1/dlp/rules/test  {"pattern":"...","text":"..."}
+func (a *API) testRule(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Pattern string `json:"pattern"`
+		Text    string `json:"text"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, errBody("invalid JSON"))
+		return
+	}
+	if body.Pattern == "" {
+		writeJSON(w, http.StatusBadRequest, errBody("pattern is required"))
+		return
+	}
+	matches, err := dlp.TestRule(body.Pattern, body.Text, 50)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errBody("invalid pattern: "+err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"matches": matches, "count": len(matches)})
 }
 
 func (a *API) admin(next http.HandlerFunc) http.HandlerFunc {
