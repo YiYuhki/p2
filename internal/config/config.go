@@ -311,6 +311,11 @@ type StorageConfig struct {
 	Type string   `yaml:"type"` // s3 | fs
 	S3   S3Config `yaml:"s3"`
 	FS   FSConfig `yaml:"fs"`
+	// EncryptionKey enables AES-256-GCM at-rest encryption of stored
+	// attachments. It is 64 hex characters (32 bytes); empty disables it. With
+	// encryption on, analyzers must read attachments through the content API
+	// (a direct object-store read sees ciphertext).
+	EncryptionKey string `yaml:"encryption_key"`
 }
 
 type S3Config struct {

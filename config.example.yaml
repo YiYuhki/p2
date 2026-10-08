@@ -86,6 +86,8 @@ internal_api:                    # used by the external analysis engine only
 
 storage:
   type: s3                       # s3 (AWS S3 / MinIO / RustFS / Ceph RGW) | fs
+  encryption_key: ${SECMAIL_STORAGE_KEY}   # 64 hex chars (32 bytes) → AES-256-GCM at rest; empty disables
+  # With encryption on, analyzers must read attachments via the content API (direct reads see ciphertext).
   s3:
     endpoint: minio.internal.example.com:9000
     region: us-east-1

@@ -13,6 +13,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"flag"
@@ -160,6 +161,16 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		return nil
 	}); err != nil {
 		return err
+	}
+	if cfg.Storage.EncryptionKey != "" {
+		key, err := hex.DecodeString(cfg.Storage.EncryptionKey)
+		if err != nil {
+			return fmt.Errorf("storage.encryption_key: must be hex: %w", err)
+		}
+		if obj, err = storage.NewEncrypted(obj, key); err != nil {
+			return err
+		}
+		log.Info("attachment at-rest encryption enabled (AES-256-GCM)")
 	}
 
 	var rdb *redis.Client
