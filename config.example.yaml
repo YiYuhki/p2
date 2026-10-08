@@ -31,6 +31,7 @@ rewrite:
   keep_inline_images: true       # keep image/* parts with Content-ID (HTML-embedded images)
   signed_policy: rewrite         # rewrite | passthrough  (rewrite removes the S/MIME/PGP signature)
   encrypted_policy: passthrough  # passthrough | reject    (encrypted content cannot be inspected)
+  # blocked_extensions: [exe, scr, bat, cmd, com, pif, js, jse, vbs, wsf, hta]  # refused up front (never released)
 
 dkim:
   verify_inbound: true           # verify original signatures and record them in Authentication-Results

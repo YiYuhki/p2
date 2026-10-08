@@ -36,19 +36,40 @@ type Options struct {
 	// AuditRetention, when > 0, makes the janitor delete dlp_events and
 	// download_events older than this. 0 keeps the audit log forever.
 	AuditRetention time.Duration
+	// BlockedExtensions are file extensions (without dot) that are refused up
+	// front: the attachment is marked blocked without waiting for the analyzer,
+	// so the portal never releases it. Matched on the final extension, so
+	// "invoice.pdf.exe" is caught.
+	BlockedExtensions []string
 }
 
 type Service struct {
-	store   store.Store
-	storage storage.Storage
-	queue   queue.Queue
-	opts    Options
-	log     *slog.Logger
-	now     func() time.Time
+	store      store.Store
+	storage    storage.Storage
+	queue      queue.Queue
+	opts       Options
+	blockedExt map[string]bool
+	log        *slog.Logger
+	now        func() time.Time
 }
 
 func New(st store.Store, obj storage.Storage, q queue.Queue, opts Options, log *slog.Logger) *Service {
-	return &Service{store: st, storage: obj, queue: q, opts: opts, log: log, now: time.Now}
+	blocked := map[string]bool{}
+	for _, e := range opts.BlockedExtensions {
+		if e = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(e), ".")); e != "" {
+			blocked[e] = true
+		}
+	}
+	return &Service{store: st, storage: obj, queue: q, opts: opts, blockedExt: blocked, log: log, now: time.Now}
+}
+
+// fileExt returns the lower-cased extension of name without the dot ("" if none).
+func fileExt(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if i := strings.LastIndexByte(name, '.'); i >= 0 && i < len(name)-1 {
+		return name[i+1:]
+	}
+	return ""
 }
 
 // Link is the per-attachment information rendered into the mail banner.
@@ -74,6 +95,7 @@ func (s *Service) Quarantine(ctx context.Context, msg *model.Message, extracted 
 
 	atts := make([]*model.Attachment, 0, len(extracted))
 	links := make([]Link, 0, len(extracted))
+	blocked := map[string]bool{}
 	var stored []string
 	cleanup := func() {
 		for _, k := range stored {
@@ -103,7 +125,12 @@ func (s *Service) Quarantine(ctx context.Context, msg *model.Message, extracted 
 		tok := token.New()
 		a.TokenHash = token.Hash(tok)
 
-		if s.opts.VerdictReuseWindow > 0 {
+		if ext := fileExt(e.Filename); ext != "" && s.blockedExt[ext] {
+			// Refused by file-type policy: block without analysis.
+			a.Status, a.ThreatName, a.AnalyzedAt = model.StatusMalicious, "차단된 파일 형식 (."+ext+")", &now
+			a.VerdictDetail = json.RawMessage(`{"reason":"blocked_extension","ext":"` + ext + `"}`)
+			blocked[a.ID] = true
+		} else if s.opts.VerdictReuseWindow > 0 {
 			prev, err := s.store.FindReusableVerdict(ctx, a.SHA256, now.Add(-s.opts.VerdictReuseWindow))
 			if err == nil {
 				a.Status, a.ThreatName, a.AnalyzedAt = prev.Status, prev.ThreatName, &now
@@ -134,6 +161,11 @@ func (s *Service) Quarantine(ctx context.Context, msg *model.Message, extracted 
 	}
 
 	for _, a := range atts {
+		if blocked[a.ID] {
+			metrics.Attachments.WithLabelValues("blocked").Inc()
+			s.log.Info("attachment blocked by file-type policy", "attachment", a.ID, "filename", a.Filename, "threat", a.ThreatName)
+			continue
+		}
 		if a.Status != model.StatusPending {
 			metrics.Attachments.WithLabelValues("reused-" + strings.ToLower(string(a.Status))).Inc()
 			s.log.Info("verdict reused", "attachment", a.ID, "sha256", a.SHA256, "status", a.Status)

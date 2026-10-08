@@ -203,6 +203,10 @@ type RewriteConfig struct {
 	EncryptedPolicy string `yaml:"encrypted_policy"`
 	// GatewayID is stamped into X-SecMail-* headers.
 	GatewayID string `yaml:"gateway_id"`
+	// BlockedExtensions are inbound attachment file extensions refused up front
+	// (marked blocked without analysis; the portal never releases them). Matched
+	// on the final extension, e.g. "exe", "scr", "js".
+	BlockedExtensions []string `yaml:"blocked_extensions"`
 }
 
 // SPFConfig controls inbound SPF verification. The result is added to

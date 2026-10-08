@@ -222,3 +222,32 @@ func TestAuditRetentionPrune(t *testing.T) {
 		t.Fatalf("stale download event not pruned: %+v", st.Downloads)
 	}
 }
+
+func TestBlockedExtensionQuarantine(t *testing.T) {
+	s, st, q, _, _ := newSvc(t)
+	s.blockedExt = map[string]bool{"exe": true, "js": true}
+	ctx := context.Background()
+	links, err := s.Quarantine(ctx, &model.Message{}, []*mimeproc.Extracted{
+		{Filename: "invoice.pdf.exe", ContentType: "application/octet-stream", Data: []byte("MZ...")},
+		{Filename: "report.pdf", ContentType: "application/pdf", Data: []byte("%PDF-1.4")},
+	})
+	if err != nil || len(links) != 2 {
+		t.Fatalf("quarantine: %v %d", err, len(links))
+	}
+	// The .exe is blocked immediately (MALICIOUS), the pdf stays PENDING.
+	if links[0].Status != model.StatusMalicious {
+		t.Fatalf("blocked attachment status = %v, want MALICIOUS", links[0].Status)
+	}
+	if links[1].Status != model.StatusPending {
+		t.Fatalf("pdf status = %v, want PENDING", links[1].Status)
+	}
+	a0, _ := st.GetAttachment(ctx, links[0].AttachmentID)
+	if a0.ThreatName == "" || a0.AnalyzedAt == nil {
+		t.Fatalf("blocked attachment not finalized: %+v", a0)
+	}
+	// Only the pdf is queued for analysis; the blocked file is not.
+	jobs := q.Snapshot()
+	if len(jobs) != 1 || jobs[0].Filename != "report.pdf" {
+		t.Fatalf("only the pdf should be queued, got %+v", jobs)
+	}
+}

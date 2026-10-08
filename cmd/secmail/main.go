@@ -200,6 +200,7 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		MaxAttempts:        cfg.Analysis.MaxAttempts,
 		VerdictReuseWindow: cfg.Analysis.VerdictReuseWindow,
 		AuditRetention:     cfg.Analysis.AuditRetention,
+		BlockedExtensions:  cfg.Rewrite.BlockedExtensions,
 	}, log)
 
 	// ---- outbound DLP ----
