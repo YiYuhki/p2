@@ -47,6 +47,7 @@ import (
 	"github.com/yiyuhki/p2/internal/spfutil"
 	"github.com/yiyuhki/p2/internal/storage"
 	"github.com/yiyuhki/p2/internal/store"
+	"github.com/yiyuhki/p2/internal/webhook"
 )
 
 func main() {
@@ -192,6 +193,8 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		return fmt.Errorf("queue.type: unknown %q", cfg.Queue.Type)
 	}
 
+	wh := webhook.New(cfg.Webhook.URL, cfg.Webhook.Secret, cfg.Webhook.Timeout, log)
+
 	svc := service.New(st, obj, q, service.Options{
 		PublicBaseURL:      cfg.Portal.PublicBaseURL,
 		InternalBaseURL:    cfg.InternalAPI.AdvertiseURL,
@@ -200,6 +203,7 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		MaxAttempts:        cfg.Analysis.MaxAttempts,
 		VerdictReuseWindow: cfg.Analysis.VerdictReuseWindow,
 		AuditRetention:     cfg.Analysis.AuditRetention,
+		Webhook:            wh,
 		BlockedExtensions:  cfg.Rewrite.BlockedExtensions,
 	}, log)
 
@@ -253,6 +257,7 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			ExemptRecipientDomains: cfg.DLP.ExemptRecipientDomains,
 			ScanInternal:           cfg.DLP.ScanInternal,
 			DryRun:                 cfg.DLP.DryRun,
+			Webhook:                wh,
 			NextHop:                nextHopOpts(cfg),
 			Location:               loc,
 		}, log)

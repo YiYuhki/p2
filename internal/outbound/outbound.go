@@ -27,6 +27,7 @@ import (
 	"github.com/yiyuhki/p2/internal/storage"
 	"github.com/yiyuhki/p2/internal/store"
 	"github.com/yiyuhki/p2/internal/token"
+	"github.com/yiyuhki/p2/internal/webhook"
 )
 
 type Options struct {
@@ -42,7 +43,9 @@ type Options struct {
 	ScanInternal           bool
 	// DryRun records decisions and emits metrics but relays mail regardless
 	// (no holds, blocks, or notices) so a policy can be tuned safely.
-	DryRun   bool
+	DryRun bool
+	// Webhook, when set, receives a JSON event for every non-allow decision.
+	Webhook  *webhook.Notifier
 	NextHop  smtpclient.Options // relay target when a hold is released
 	Location *time.Location
 }
@@ -222,6 +225,14 @@ func (s *Service) Process(ctx context.Context, env gateway.Envelope, raw []byte)
 		log.Error("record dlp event", "err", err)
 	}
 	log.Info("outbound message inspected", "severity", ev.Severity, "exempt_recipients", exempt, "dry_run", dryRun)
+
+	if action != config.ActionAllow {
+		s.opts.Webhook.Send(webhook.Event{
+			Type: "dlp_outbound", At: ev.At, Action: action, Severity: ev.Severity,
+			MailFrom: env.MailFrom, RcptTo: env.RcptTo, Subject: subject, HoldID: ev.HoldID,
+			Summary: rep.Summary(), DryRun: dryRun,
+		})
+	}
 
 	if dryRun {
 		// Would have acted, but dry-run relays regardless (no notices, no hold).

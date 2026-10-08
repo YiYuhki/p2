@@ -32,6 +32,15 @@ type Config struct {
 	Analyzer    AnalyzerConfig    `yaml:"analyzer"`
 	Outbound    OutboundConfig    `yaml:"outbound"`
 	DLP         DLPConfig         `yaml:"dlp"`
+	Webhook     WebhookConfig     `yaml:"webhook"`
+}
+
+// WebhookConfig posts security events (DLP decisions, malware verdicts) to an
+// external endpoint as JSON. Disabled when URL is empty.
+type WebhookConfig struct {
+	URL     string        `yaml:"url"`
+	Secret  string        `yaml:"secret"` // optional HMAC-SHA256 signing secret
+	Timeout time.Duration `yaml:"timeout"`
 }
 
 // AnalyzerConfig configures the OPTIONAL in-process attachment analyzer, which

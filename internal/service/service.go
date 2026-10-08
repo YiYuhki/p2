@@ -24,6 +24,7 @@ import (
 	"github.com/yiyuhki/p2/internal/storage"
 	"github.com/yiyuhki/p2/internal/store"
 	"github.com/yiyuhki/p2/internal/token"
+	"github.com/yiyuhki/p2/internal/webhook"
 )
 
 type Options struct {
@@ -41,6 +42,8 @@ type Options struct {
 	// so the portal never releases it. Matched on the final extension, so
 	// "invoice.pdf.exe" is caught.
 	BlockedExtensions []string
+	// Webhook, when set, receives a JSON event when a verdict is MALICIOUS.
+	Webhook *webhook.Notifier
 }
 
 type Service struct {
@@ -233,8 +236,29 @@ func (s *Service) ApplyVerdict(ctx context.Context, v model.Verdict) error {
 	if err == nil {
 		metrics.Verdicts.WithLabelValues(strings.ToLower(string(v.Status))).Inc()
 		s.log.Info("verdict applied", "attachment", v.AttachmentID, "status", v.Status, "threat", v.ThreatName)
+		if v.Status == model.StatusMalicious {
+			s.notifyVerdict(ctx, v)
+		}
 	}
 	return err
+}
+
+// notifyVerdict fires the security webhook for a malicious verdict, enriched
+// with the message envelope when it can be looked up (best-effort).
+func (s *Service) notifyVerdict(ctx context.Context, v model.Verdict) {
+	if s.opts.Webhook == nil {
+		return
+	}
+	ev := webhook.Event{
+		Type: "inbound_verdict", At: s.now().UTC(), Status: string(v.Status),
+		Threat: v.ThreatName, Attachment: v.AttachmentID,
+	}
+	if a, err := s.store.GetAttachment(ctx, v.AttachmentID); err == nil {
+		if m, err := s.store.GetMessage(ctx, a.MessageID); err == nil {
+			ev.MailFrom, ev.RcptTo, ev.Subject = m.MailFrom, m.RcptTo, m.Subject
+		}
+	}
+	s.opts.Webhook.Send(ev)
 }
 
 // sanitizeThreatName strips control characters (the name is surfaced in the
