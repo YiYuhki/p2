@@ -118,6 +118,7 @@ analysis:
   max_attempts: 3                # then marked ERROR (download blocked, fail-closed)
   verdict_reuse_window: 24h      # reuse verdicts for identical SHA-256 (0 disables)
   janitor_interval: 1m
+  audit_retention: 0             # delete dlp_events/download_events older than this (0 = keep forever, e.g. 2160h = 90d)
 
 # Optional IN-PROCESS attachment analyzer (embeds the malengine engine). It is
 # compiled in only when secmail is built with `-tags malengine` (the default

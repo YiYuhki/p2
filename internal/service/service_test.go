@@ -198,3 +198,27 @@ func TestResultHandlerClassification(t *testing.T) {
 		t.Fatalf("unknown attachment should be permanent, got %v", err)
 	}
 }
+
+func TestAuditRetentionPrune(t *testing.T) {
+	s, st, _, _, c := newSvc(t)
+	s.opts.AuditRetention = 24 * time.Hour
+	ctx := context.Background()
+	old := c.t.Add(-48 * time.Hour)
+	recent := c.t.Add(-1 * time.Hour)
+	// Two DLP events and two download events, one old + one recent each.
+	st.RecordDLPEvent(ctx, &model.DLPEvent{ID: "old-dlp", MailFrom: "a@x", RcptTo: []string{"b@y"}, Action: "notify", Severity: "low", At: old})
+	st.RecordDLPEvent(ctx, &model.DLPEvent{ID: "new-dlp", MailFrom: "a@x", RcptTo: []string{"b@y"}, Action: "notify", Severity: "low", At: recent})
+	l := quarantine(t, s, "dl")
+	st.RecordDownload(ctx, model.DownloadEvent{AttachmentID: l.AttachmentID, User: "u", At: old})
+	st.RecordDownload(ctx, model.DownloadEvent{AttachmentID: l.AttachmentID, User: "u", At: recent})
+
+	s.SweepOnce(ctx)
+
+	evs, _ := st.ListDLPEvents(ctx, store.EventFilter{}, 100, store.Page{})
+	if len(evs) != 1 || evs[0].ID != "new-dlp" {
+		t.Fatalf("stale dlp event not pruned: %+v", evs)
+	}
+	if len(st.Downloads) != 1 || !st.Downloads[0].At.Equal(recent) {
+		t.Fatalf("stale download event not pruned: %+v", st.Downloads)
+	}
+}

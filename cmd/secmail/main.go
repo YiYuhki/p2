@@ -199,6 +199,7 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		AnalysisTimeout:    cfg.Analysis.Timeout,
 		MaxAttempts:        cfg.Analysis.MaxAttempts,
 		VerdictReuseWindow: cfg.Analysis.VerdictReuseWindow,
+		AuditRetention:     cfg.Analysis.AuditRetention,
 	}, log)
 
 	// ---- outbound DLP ----

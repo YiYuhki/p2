@@ -339,6 +339,9 @@ type AnalysisConfig struct {
 	VerdictReuseWindow time.Duration `yaml:"verdict_reuse_window"`
 	// JanitorInterval controls the expiry / stale-job sweep.
 	JanitorInterval time.Duration `yaml:"janitor_interval"`
+	// AuditRetention, when > 0, makes the janitor delete dlp_events and
+	// download_events older than this. 0 (default) keeps the audit log forever.
+	AuditRetention time.Duration `yaml:"audit_retention"`
 }
 
 func Default() Config {

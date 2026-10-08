@@ -33,6 +33,9 @@ type Options struct {
 	AnalysisTimeout    time.Duration
 	MaxAttempts        int
 	VerdictReuseWindow time.Duration
+	// AuditRetention, when > 0, makes the janitor delete dlp_events and
+	// download_events older than this. 0 keeps the audit log forever.
+	AuditRetention time.Duration
 }
 
 type Service struct {
@@ -296,6 +299,14 @@ func (s *Service) SweepOnce(ctx context.Context) {
 		}
 		if err := s.store.MarkExpired(ctx, a.ID, now); err != nil {
 			s.log.Error("janitor: mark expired", "attachment", a.ID, "err", err)
+		}
+	}
+
+	if s.opts.AuditRetention > 0 {
+		if n, err := s.store.PruneAuditEvents(ctx, now.Add(-s.opts.AuditRetention)); err != nil {
+			s.log.Error("janitor: prune audit events", "err", err)
+		} else if n > 0 {
+			s.log.Info("janitor: pruned audit events", "rows", n, "older_than", s.opts.AuditRetention)
 		}
 	}
 }
