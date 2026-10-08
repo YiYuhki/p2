@@ -252,6 +252,7 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			ExemptSenders:          cfg.DLP.ExemptSenders,
 			ExemptRecipientDomains: cfg.DLP.ExemptRecipientDomains,
 			ScanInternal:           cfg.DLP.ScanInternal,
+			DryRun:                 cfg.DLP.DryRun,
 			NextHop:                nextHopOpts(cfg),
 			Location:               loc,
 		}, log)

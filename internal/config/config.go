@@ -146,6 +146,9 @@ type DLPConfig struct {
 	// domains (off by default: only mail leaving the organisation).
 	ScanInternal           bool     `yaml:"scan_internal"`
 	ExemptRecipientDomains []string `yaml:"exempt_recipient_domains"`
+	// DryRun records decisions and metrics but relays mail regardless (no
+	// holds/blocks/notices) — use to tune a policy before enforcing it.
+	DryRun bool `yaml:"dry_run"`
 	// CombinePII escalates a location that holds several distinct personal-data
 	// types, or a bulk list, to high severity (an identity-revealing dataset
 	// is riskier than an isolated value).

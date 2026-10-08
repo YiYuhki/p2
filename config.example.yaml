@@ -153,6 +153,7 @@ dlp:
   scan_attachments: true           # docx/xlsx/pptx, hwp/hwpx, pdf, zip/gzip/tar/7z/rar (nested), csv/txt, legacy doc/xls
   # sevenzip_command: 7z           # 7z/rar/xz/zstd extraction (auto-detected on PATH; "none" disables)
   scan_internal: false             # true: also inspect mail between internal addresses
+  dry_run: false                 # true: record decisions + metrics but relay anyway (tune before enforcing)
   actions:                         # allow | notify | hold | block
     high: hold                     # resident/alien reg. no., card no., API keys, private keys, DB credentials
     medium: notify                 # passport, licence, business/corp reg. no., bank account, IBAN, bulk phones, JWT, passwords

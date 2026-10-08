@@ -40,8 +40,11 @@ type Options struct {
 	ExemptSenders          []string
 	ExemptRecipientDomains []string
 	ScanInternal           bool
-	NextHop                smtpclient.Options // relay target when a hold is released
-	Location               *time.Location
+	// DryRun records decisions and emits metrics but relays mail regardless
+	// (no holds, blocks, or notices) so a policy can be tuned safely.
+	DryRun   bool
+	NextHop  smtpclient.Options // relay target when a hold is released
+	Location *time.Location
 }
 
 // Relayer delivers a released message (smtpclient.Send in production).
@@ -184,10 +187,16 @@ func (s *Service) Process(ctx context.Context, env gateway.Envelope, raw []byte)
 	for _, r := range env.RcptTo {
 		exempt = exempt && domainMatch(r, s.opts.ExemptRecipientDomains)
 	}
-	if exempt {
+	// Dry-run records the decision and relays anyway, so a policy can be tuned
+	// before it blocks or holds real mail.
+	dryRun := s.opts.DryRun && !exempt && action != config.ActionAllow
+	switch {
+	case exempt:
 		action = config.ActionAllow
 		metrics.OutboundMessages.WithLabelValues("exempt").Inc()
-	} else {
+	case dryRun:
+		metrics.OutboundMessages.WithLabelValues("dryrun").Inc()
+	default:
 		metrics.OutboundMessages.WithLabelValues(action).Inc()
 	}
 
@@ -199,7 +208,7 @@ func (s *Service) Process(ctx context.Context, env gateway.Envelope, raw []byte)
 
 	var hold *model.Hold
 	var reviewURL string
-	if action == config.ActionHold {
+	if action == config.ActionHold && !dryRun {
 		var err error
 		hold, reviewURL, err = s.createHold(ctx, env, subject, raw, findings)
 		if err != nil {
@@ -212,7 +221,13 @@ func (s *Service) Process(ctx context.Context, env gateway.Envelope, raw []byte)
 		// Audit only; the decision itself does not depend on it.
 		log.Error("record dlp event", "err", err)
 	}
-	log.Info("outbound message inspected", "severity", ev.Severity, "exempt_recipients", exempt)
+	log.Info("outbound message inspected", "severity", ev.Severity, "exempt_recipients", exempt, "dry_run", dryRun)
+
+	if dryRun {
+		// Would have acted, but dry-run relays regardless (no notices, no hold).
+		log.Warn("dlp dry-run: decision not enforced", "would", action)
+		return raw, nil
+	}
 
 	if action != config.ActionAllow {
 		n := notice{env: env, subject: subject, rep: rep, action: action, reviewURL: reviewURL}
