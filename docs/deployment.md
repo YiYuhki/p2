@@ -210,3 +210,6 @@ Internal API 리스너(`internal_api.listen`, 기본 8081)에서 다음을 인�
 | `secmail_inbound_auth_total{method,result}` | 인바운드 인증 결과(spf/dkim × pass/fail/none/…) — fail·none 급증은 스푸핑 신호 |
 
 Kubernetes 예: livenessProbe → `/healthz`, readinessProbe → `/readyz`. Prometheus scrape 대상은 `<secmail>:8081/metrics`.
+
+- 경보 규칙: [`deploy/prometheus-alerts.yml`](../deploy/prometheus-alerts.yml) (다운/임시실패 급증/분석 오류/보류 적체/토큰 열거/인증 실패 급증 등)을 `rule_files`에 추가.
+- 대시보드: [`deploy/grafana-dashboard.json`](../deploy/grafana-dashboard.json)을 Grafana에서 Import(Prometheus 데이터소스).
