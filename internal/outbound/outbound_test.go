@@ -432,3 +432,23 @@ func TestDryRunRelaysButRecords(t *testing.T) {
 		t.Fatalf("dry-run should still record the intended action: %+v", evs)
 	}
 }
+
+func TestReloadPolicyExemptsSender(t *testing.T) {
+	e := setup(t, nil)
+	acts := config.DLPActions{High: config.ActionHold, Medium: config.ActionNotify,
+		Low: config.ActionAllow, Uninspectable: config.ActionNotify}
+	// Reload adds kim to the exempt senders (keeping the same actions).
+	e.svc.ReloadPolicy(Options{Actions: acts, ExemptSenders: []string{"kim@example.com"}})
+	if err := e.send("kim@example.com", []string{"partner@ext.org"}, mail("x", "주민번호 900101-1234567")); err != nil {
+		t.Fatal(err)
+	}
+	if e.next.count() != 1 {
+		t.Fatalf("exempt sender should be relayed after reload, relayed=%d", e.next.count())
+	}
+	if holds, _ := e.store.ListHolds(context.Background(), model.HoldHeld, 10, store.Page{}); len(holds) != 0 {
+		t.Fatalf("exempt sender must not be held, holds=%d", len(holds))
+	}
+	if _, es, _, _, _ := e.svc.Policy(); len(es) != 1 || es[0] != "kim@example.com" {
+		t.Fatalf("Policy() should reflect reload: %v", es)
+	}
+}

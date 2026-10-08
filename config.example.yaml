@@ -1,5 +1,11 @@
 # secmail example configuration.
 # ${VAR} references are expanded from the environment at load time.
+#
+# Hot reload: send SIGHUP to re-read this file and atomically swap the tunable
+# DLP policy without restarting listeners or connections — outbound dlp.actions,
+# dlp.exempt_senders, dlp.exempt_recipient_domains, dlp.dry_run, dlp.scan_internal
+# and rewrite.blocked_extensions. Everything else (listen addresses, DSNs, TLS)
+# needs a restart. Inspect the live policy with GET /internal/v1/dlp/policy.
 
 timezone: Asia/Seoul            # used for dates shown in banners / portal
 

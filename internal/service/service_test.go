@@ -226,7 +226,7 @@ func TestAuditRetentionPrune(t *testing.T) {
 
 func TestBlockedExtensionQuarantine(t *testing.T) {
 	s, st, q, _, _ := newSvc(t)
-	s.blockedExt = map[string]bool{"exe": true, "js": true}
+	s.SetBlockedExtensions([]string{"exe", "js"})
 	ctx := context.Background()
 	links, err := s.Quarantine(ctx, &model.Message{}, []*mimeproc.Extracted{
 		{Filename: "invoice.pdf.exe", ContentType: "application/octet-stream", Data: []byte("MZ...")},

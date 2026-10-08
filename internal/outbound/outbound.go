@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/emersion/go-smtp"
@@ -60,8 +61,20 @@ type Service struct {
 	notifier notify.Sender
 	relay    Relayer
 	opts     Options
+	dyn      atomic.Pointer[dynPolicy]
 	log      *slog.Logger
 	now      func() time.Time
+}
+
+// dynPolicy is the subset of options that can be hot-reloaded (SIGHUP) without
+// restarting listeners. It is swapped atomically and read as an immutable
+// snapshot per message.
+type dynPolicy struct {
+	Actions                config.DLPActions
+	ExemptSenders          []string
+	ExemptRecipientDomains []string
+	DryRun                 bool
+	ScanInternal           bool
 }
 
 func New(sc *dlp.Scanner, st store.Store, obj storage.Storage, n notify.Sender, opts Options, log *slog.Logger) *Service {
@@ -70,10 +83,27 @@ func New(sc *dlp.Scanner, st store.Store, obj storage.Storage, n notify.Sender, 
 	}
 	s := &Service{scanner: sc, store: st, storage: obj, notifier: n, opts: opts,
 		log: log.With("component", "dlp"), now: time.Now}
+	s.dyn.Store(policyFrom(opts))
 	s.relay = func(from string, to []string, msg []byte) error {
 		return smtpclient.Send(opts.NextHop, from, to, msg)
 	}
 	return s
+}
+
+func policyFrom(o Options) *dynPolicy {
+	return &dynPolicy{Actions: o.Actions, ExemptSenders: o.ExemptSenders,
+		ExemptRecipientDomains: o.ExemptRecipientDomains, DryRun: o.DryRun, ScanInternal: o.ScanInternal}
+}
+
+// ReloadPolicy hot-swaps the tunable DLP policy (actions, exempt lists,
+// dry-run, scan-internal) from a freshly loaded Options. Safe for concurrent
+// use with in-flight messages.
+func (s *Service) ReloadPolicy(o Options) { s.dyn.Store(policyFrom(o)) }
+
+// Policy returns the current effective tunable policy (for the admin view).
+func (s *Service) Policy() (actions config.DLPActions, exemptSenders, exemptRecipientDomains []string, dryRun, scanInternal bool) {
+	p := s.dyn.Load()
+	return p.Actions, p.ExemptSenders, p.ExemptRecipientDomains, p.DryRun, p.ScanInternal
 }
 
 var actionRank = map[string]int{config.ActionAllow: 0, config.ActionNotify: 1, config.ActionHold: 2, config.ActionBlock: 3}
@@ -87,24 +117,25 @@ func stricter(a, b string) string {
 
 // Decide maps a report to the configured action.
 func (s *Service) Decide(rep *dlp.Report) string {
+	actions := s.dyn.Load().Actions
 	act := config.ActionAllow
 	for _, f := range rep.Findings {
 		switch f.Sev() {
 		case dlp.SeverityHigh:
-			act = stricter(act, s.opts.Actions.High)
+			act = stricter(act, actions.High)
 		case dlp.SeverityMedium:
-			act = stricter(act, s.opts.Actions.Medium)
+			act = stricter(act, actions.Medium)
 		case dlp.SeverityLow:
-			act = stricter(act, s.opts.Actions.Low)
+			act = stricter(act, actions.Low)
 		}
 	}
 	if len(rep.Uninspectable) > 0 {
-		act = stricter(act, s.opts.Actions.Uninspectable)
+		act = stricter(act, actions.Uninspectable)
 	}
 	if rep.HasEncrypted() {
-		enc := s.opts.Actions.Encrypted
+		enc := actions.Encrypted
 		if enc == "" {
-			enc = s.opts.Actions.Uninspectable
+			enc = actions.Uninspectable
 		}
 		act = stricter(act, enc)
 	}
@@ -160,10 +191,11 @@ var errTemp = &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 3, 0
 
 // Process implements gateway.MessageProcessor for the outbound listener.
 func (s *Service) Process(ctx context.Context, env gateway.Envelope, raw []byte) ([]byte, error) {
-	if addrIn(env.MailFrom, s.opts.ExemptSenders) {
+	pol := s.dyn.Load()
+	if addrIn(env.MailFrom, pol.ExemptSenders) {
 		return raw, nil
 	}
-	if !s.opts.ScanInternal && len(env.RcptTo) > 0 {
+	if !pol.ScanInternal && len(env.RcptTo) > 0 {
 		internal := true
 		for _, r := range env.RcptTo {
 			internal = internal && domainMatch(r, s.opts.OwnDomains)
@@ -186,13 +218,13 @@ func (s *Service) Process(ctx context.Context, env gateway.Envelope, raw []byte)
 		metrics.DLPFindings.WithLabelValues(f.Sev().String()).Add(float64(f.Count))
 	}
 	action := s.Decide(rep)
-	exempt := len(s.opts.ExemptRecipientDomains) > 0
+	exempt := len(pol.ExemptRecipientDomains) > 0
 	for _, r := range env.RcptTo {
-		exempt = exempt && domainMatch(r, s.opts.ExemptRecipientDomains)
+		exempt = exempt && domainMatch(r, pol.ExemptRecipientDomains)
 	}
 	// Dry-run records the decision and relays anyway, so a policy can be tuned
 	// before it blocks or holds real mail.
-	dryRun := s.opts.DryRun && !exempt && action != config.ActionAllow
+	dryRun := pol.DryRun && !exempt && action != config.ActionAllow
 	switch {
 	case exempt:
 		action = config.ActionAllow

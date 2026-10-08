@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/yiyuhki/p2/internal/config"
 	"github.com/yiyuhki/p2/internal/dlp"
 	"github.com/yiyuhki/p2/internal/model"
 	"github.com/yiyuhki/p2/internal/store"
@@ -47,6 +48,30 @@ func (a *API) mountDLP(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/v1/dlp/holds/{id}/reject", a.admin(a.decide(false)))
 	mux.HandleFunc("GET /internal/v1/dlp/events", a.admin(a.listEvents))
 	mux.HandleFunc("POST /internal/v1/dlp/rules/test", a.admin(a.testRule))
+	if _, ok := a.holds.(PolicyViewer); ok {
+		mux.HandleFunc("GET /internal/v1/dlp/policy", a.admin(a.dlpPolicy))
+	}
+}
+
+// PolicyViewer exposes the effective (hot-reloadable) DLP policy for the
+// read-only admin view. outbound.Service implements it.
+type PolicyViewer interface {
+	Policy() (actions config.DLPActions, exemptSenders, exemptRecipientDomains []string, dryRun, scanInternal bool)
+}
+
+// dlpPolicy returns the currently effective tunable DLP policy. Edits are made
+// in the config file and applied with SIGHUP.
+func (a *API) dlpPolicy(w http.ResponseWriter, _ *http.Request) {
+	pv, ok := a.holds.(PolicyViewer)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, errBody("not available"))
+		return
+	}
+	actions, es, erd, dry, si := pv.Policy()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"actions": actions, "exempt_senders": es, "exempt_recipient_domains": erd,
+		"dry_run": dry, "scan_internal": si,
+	})
 }
 
 // testRule compiles a candidate dlp.rules pattern and returns what it would

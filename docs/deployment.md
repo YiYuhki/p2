@@ -111,6 +111,7 @@ portal:
 - `worker`(판정 소비 + janitor)는 여러 대 떠도 안전하지만(판정은 `PENDING`에서 한 번만 반영) 1~2대면 충분합니다.
 - MX를 여러 게이트웨이에 걸어 두면 한 대가 죽어도 발신 MTA가 다른 MX로 재시도합니다. 게이트웨이는 업스트림이 수락해야만 250을 응답하므로 메일이 유실되지 않습니다.
 - **의존성 기동 대기**: 부팅 시 DB·스토리지·Redis가 아직 준비되지 않았으면 최대 30초(지수 백오프)까지 재시도한 뒤 실패합니다. compose/k8s에서 컨테이너 기동 순서가 어긋나도 게이트웨이가 스스로 붙습니다.
+- **설정 핫리로드**: `SIGHUP`을 보내면 리스너·DB 재시작 없이 설정 파일을 다시 읽어 **조정 가능한 DLP 정책**(발신 예외 `exempt_senders`/`exempt_recipient_domains`, 등급별 `actions`, `dry_run`, `scan_internal`, 인바운드 `blocked_extensions`)만 원자적으로 교체합니다. 리스너 주소·DSN·TLS 등 그 외 설정은 재시작이 필요합니다. 현재 적용 중인 정책은 관리 API `GET /internal/v1/dlp/policy`로 확인합니다.
 - **커넥션 풀**: `database.max_conns`/`min_conns`/`conn_max_lifetime`로 PostgreSQL 풀을, `redis.pool_size`로 Redis 풀을 인스턴스별로 조정합니다. 수평 확장 시 인스턴스 수 × `max_conns` 가 PostgreSQL `max_connections`를 넘지 않게 하세요. Redis 명령은 go-redis 기본 정책상 3회 재시도되며, 명령 타임아웃(dial 5s, read/write 3s)이 설정돼 있어 장애 시 무한 대기하지 않습니다.
 
 ## 6. 운영 점검 항목

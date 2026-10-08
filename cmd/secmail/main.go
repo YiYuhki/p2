@@ -277,6 +277,38 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		}, log)
 	}
 
+	// SIGHUP hot-reloads the tunable DLP policy (exempt lists, actions,
+	// dry-run, scan-internal, blocked extensions) from the config file without
+	// restarting listeners or reconnecting storage/DB.
+	go func() {
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		defer signal.Stop(hup)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hup:
+				newCfg, err := config.Load(cfgPath)
+				if err != nil {
+					log.Error("config reload failed; keeping current policy", "err", err)
+					continue
+				}
+				svc.SetBlockedExtensions(newCfg.Rewrite.BlockedExtensions)
+				if outSvc != nil {
+					outSvc.ReloadPolicy(outbound.Options{
+						Actions:                newCfg.DLP.Actions,
+						ExemptSenders:          newCfg.DLP.ExemptSenders,
+						ExemptRecipientDomains: newCfg.DLP.ExemptRecipientDomains,
+						DryRun:                 newCfg.DLP.DryRun,
+						ScanInternal:           newCfg.DLP.ScanInternal,
+					})
+				}
+				log.Info("config reloaded (dynamic DLP policy)", "path", cfgPath)
+			}
+		}
+	}()
+
 	var wg sync.WaitGroup
 	errCh := make(chan error, 4)
 	var shutdowns []func(context.Context) error

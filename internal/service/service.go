@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -57,19 +58,26 @@ type Service struct {
 	storage    storage.Storage
 	queue      queue.Queue
 	opts       Options
-	blockedExt map[string]bool
+	blockedExt atomic.Pointer[map[string]bool] // hot-swappable
 	log        *slog.Logger
 	now        func() time.Time
 }
 
 func New(st store.Store, obj storage.Storage, q queue.Queue, opts Options, log *slog.Logger) *Service {
-	blocked := map[string]bool{}
-	for _, e := range opts.BlockedExtensions {
+	s := &Service{store: st, storage: obj, queue: q, opts: opts, log: log, now: time.Now}
+	s.SetBlockedExtensions(opts.BlockedExtensions)
+	return s
+}
+
+// SetBlockedExtensions hot-swaps the blocked file-extension set (SIGHUP reload).
+func (s *Service) SetBlockedExtensions(exts []string) {
+	m := map[string]bool{}
+	for _, e := range exts {
 		if e = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(e), ".")); e != "" {
-			blocked[e] = true
+			m[e] = true
 		}
 	}
-	return &Service{store: st, storage: obj, queue: q, opts: opts, blockedExt: blocked, log: log, now: time.Now}
+	s.blockedExt.Store(&m)
 }
 
 // fileExt returns the lower-cased extension of name without the dot ("" if none).
@@ -134,7 +142,7 @@ func (s *Service) Quarantine(ctx context.Context, msg *model.Message, extracted 
 		tok := token.New()
 		a.TokenHash = token.Hash(tok)
 
-		if ext := fileExt(e.Filename); ext != "" && s.blockedExt[ext] {
+		if ext := fileExt(e.Filename); ext != "" && (*s.blockedExt.Load())[ext] {
 			// Refused by file-type policy: block without analysis.
 			a.Status, a.ThreatName, a.AnalyzedAt = model.StatusMalicious, "차단된 파일 형식 (."+ext+")", &now
 			a.VerdictDetail = json.RawMessage(`{"reason":"blocked_extension","ext":"` + ext + `"}`)
