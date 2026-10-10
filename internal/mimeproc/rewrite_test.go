@@ -382,6 +382,9 @@ func TestSanitizeFilename(t *testing.T) {
 		"...hidden":                       "hidden",
 		"a\x00b\r\n.txt":                  "ab.txt",
 		"quote\".pdf":                     "quote.pdf",
+		"evil.exe.":                       "evil.exe",
+		"evil.exe. ":                      "evil.exe",
+		"report.pdf...":                   "report.pdf",
 		strings.Repeat("가", 300) + ".pdf": "",
 	}
 	for in, want := range cases {

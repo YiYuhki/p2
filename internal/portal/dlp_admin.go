@@ -236,7 +236,7 @@ func (s *Server) adminExport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, e := range evs {
-			cw.Write([]string{e.ID, e.At.Format(time.RFC3339), e.Action, e.Severity, csvSafe(e.MailFrom),
+			cw.Write([]string{e.ID, e.At.Format(time.RFC3339), csvSafe(e.Action), csvSafe(e.Severity), csvSafe(e.MailFrom),
 				csvSafe(strings.Join(e.RcptTo, " ")), csvSafe(e.Subject), e.HoldID})
 			n++
 		}
