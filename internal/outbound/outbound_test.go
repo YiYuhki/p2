@@ -412,3 +412,43 @@ func TestEncryptedAttachmentPolicy(t *testing.T) {
 		t.Fatalf("want 550 with encrypted, got %v", err)
 	}
 }
+
+func TestDryRunRelaysButRecords(t *testing.T) {
+	e := setup(t, func(o *Options) { o.DryRun = true })
+	// RRN is high severity -> would be held, but dry-run relays it.
+	msg := mail("고객 정보", "고객 주민번호 900101-1234567 입니다.")
+	if err := e.send("kim@example.com", []string{"partner@ext.org"}, msg); err != nil {
+		t.Fatalf("dry-run mail should be accepted: %v", err)
+	}
+	if e.next.count() != 1 {
+		t.Fatalf("dry-run should relay the mail, relayed=%d", e.next.count())
+	}
+	holds, _ := e.store.ListHolds(context.Background(), model.HoldHeld, 10, store.Page{})
+	if len(holds) != 0 {
+		t.Fatalf("dry-run must not create holds, got %d", len(holds))
+	}
+	evs, _ := e.store.ListDLPEvents(context.Background(), store.EventFilter{}, 10, store.Page{})
+	if len(evs) != 1 || evs[0].Action != "hold" {
+		t.Fatalf("dry-run should still record the intended action: %+v", evs)
+	}
+}
+
+func TestReloadPolicyExemptsSender(t *testing.T) {
+	e := setup(t, nil)
+	acts := config.DLPActions{High: config.ActionHold, Medium: config.ActionNotify,
+		Low: config.ActionAllow, Uninspectable: config.ActionNotify}
+	// Reload adds kim to the exempt senders (keeping the same actions).
+	e.svc.ReloadPolicy(Options{Actions: acts, ExemptSenders: []string{"kim@example.com"}})
+	if err := e.send("kim@example.com", []string{"partner@ext.org"}, mail("x", "주민번호 900101-1234567")); err != nil {
+		t.Fatal(err)
+	}
+	if e.next.count() != 1 {
+		t.Fatalf("exempt sender should be relayed after reload, relayed=%d", e.next.count())
+	}
+	if holds, _ := e.store.ListHolds(context.Background(), model.HoldHeld, 10, store.Page{}); len(holds) != 0 {
+		t.Fatalf("exempt sender must not be held, holds=%d", len(holds))
+	}
+	if _, es, _, _, _ := e.svc.Policy(); len(es) != 1 || es[0] != "kim@example.com" {
+		t.Fatalf("Policy() should reflect reload: %v", es)
+	}
+}

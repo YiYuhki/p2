@@ -95,6 +95,20 @@ func (p *Postgres) ListExpiredHolds(ctx context.Context, now time.Time, limit in
 		WHERE status='HELD' AND expires_at < $1 ORDER BY expires_at LIMIT $2`, now, limit)
 }
 
+func (p *Postgres) PruneAuditEvents(ctx context.Context, cutoff time.Time) (int64, error) {
+	var total int64
+	tag, err := p.pool.Exec(ctx, `DELETE FROM dlp_events WHERE at < $1`, cutoff)
+	if err != nil {
+		return total, err
+	}
+	total += tag.RowsAffected()
+	tag, err = p.pool.Exec(ctx, `DELETE FROM download_events WHERE at < $1`, cutoff)
+	if err != nil {
+		return total, err
+	}
+	return total + tag.RowsAffected(), nil
+}
+
 func (p *Postgres) RecordDLPEvent(ctx context.Context, ev *model.DLPEvent) error {
 	var hold any
 	if ev.HoldID != "" {

@@ -154,7 +154,9 @@ Go로 바로 디코딩하는 형식과, 외부 도구로 변환한 뒤 OCR하는
    - `hold_ttl`(기본 72시간)이 지나면 **발송하지 않고 폐기**합니다 (fail-closed).
 4. 원본 메일은 결정 즉시 저장소에서 삭제되고, DB에는 마스킹된 탐지 내역만 남습니다.
 
-관리 API (`internal_api.admin_token`, 분석 엔진 토큰과 별도):
+관리자는 포털의 **대시보드**(`/dlp/admin`)에서 보류 메일을 한 화면에 모아 봅니다. **보류 메일** 탭은 상태 필터·커서 페이지네이션·행별 및 **일괄 승인/반려**를, **감사 로그** 탭은 동작/등급 필터로 `dlp_events`를 보여주며, 양쪽 모두 현재 필터 그대로 **CSV 내보내기**를 제공합니다. **수신자 인증(`portal.auth.mode` = `otp` 또는 `header`)이 설정된 경우에만** 열립니다(인증이 `none`이면 관리자를 식별할 수 없어 비활성). 접근은 `dlp.admins`에 등록된 주소로 제한됩니다.
+
+프로그램 연동용 관리 API (`internal_api.admin_token`, 분석 엔진 토큰과 별도):
 ```bash
 curl -H "Authorization: Bearer $ADMIN" http://secmail:8081/internal/v1/dlp/holds?status=HELD
 curl -H "Authorization: Bearer $ADMIN" -d '{"by":"sec@example.com"}' \

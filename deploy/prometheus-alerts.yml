@@ -1,0 +1,67 @@
+# Prometheus alerting rules for secmail. Load via rule_files in prometheus.yml.
+# Scrape target: <secmail-internal>:8081/metrics
+groups:
+  - name: secmail
+    rules:
+      - alert: SecmailDown
+        expr: up{job="secmail"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "secmail target {{ $labels.instance }} is down"
+
+      - alert: SecmailInboundTempfailSpike
+        expr: sum(rate(secmail_inbound_messages_total{result="tempfail"}[5m])) > 0.2
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Inbound mail is tempfailing (storage/DB/queue trouble)"
+          description: "Senders are being asked to retry; check PostgreSQL/S3/Redis."
+
+      - alert: SecmailAnalysisErrors
+        expr: sum(rate(secmail_verdicts_total{status="error"}[15m])) > 0
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Attachments are failing analysis (fail-closed to ERROR)"
+          description: "The analyzer may be down; PENDING items hit max_attempts and block downloads."
+
+      - alert: SecmailHoldsBacklog
+        # Pending = created - released - rejected - expired, over a long window.
+        expr: >
+          sum(secmail_holds_total{event="created"})
+          - sum(secmail_holds_total{event=~"released|rejected|expired"}) > 20
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "DLP holds are piling up ({{ $value }} undecided)"
+          description: "Admins are not reviewing held mail; it is discarded after hold_ttl."
+
+      - alert: SecmailTokenEnumeration
+        expr: sum(rate(secmail_portal_requests_total{outcome=~"notfound|throttled"}[5m])) > 1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Download-token guessing in progress"
+          description: "A spike of not-found/throttled portal lookups indicates enumeration."
+
+      - alert: SecmailInboundAuthFailSpike
+        expr: sum(rate(secmail_inbound_auth_total{result="fail"}[10m])) > 0.5
+        for: 15m
+        labels: { severity: info }
+        annotations:
+          summary: "Many inbound SPF/DKIM/DMARC failures (possible spoofing)"
+
+      - alert: SecmailDLPHighFindings
+        expr: sum(rate(secmail_dlp_findings_total{severity="high"}[15m])) > 0
+        for: 15m
+        labels: { severity: info }
+        annotations:
+          summary: "High-severity DLP findings on outbound mail"
+
+      - alert: SecmailExternalToolSlow
+        expr: histogram_quantile(0.95, sum(rate(secmail_external_tool_seconds_bucket[10m])) by (le, tool)) > 15
+        for: 15m
+        labels: { severity: info }
+        annotations:
+          summary: "External tool {{ $labels.tool }} p95 runtime is high"

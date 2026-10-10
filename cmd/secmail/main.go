@@ -13,6 +13,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"flag"
@@ -47,6 +48,7 @@ import (
 	"github.com/yiyuhki/p2/internal/spfutil"
 	"github.com/yiyuhki/p2/internal/storage"
 	"github.com/yiyuhki/p2/internal/store"
+	"github.com/yiyuhki/p2/internal/webhook"
 )
 
 func main() {
@@ -160,6 +162,16 @@ func run(cfgPath, components string, log *slog.Logger) error {
 	}); err != nil {
 		return err
 	}
+	if cfg.Storage.EncryptionKey != "" {
+		key, err := hex.DecodeString(cfg.Storage.EncryptionKey)
+		if err != nil {
+			return fmt.Errorf("storage.encryption_key: must be hex: %w", err)
+		}
+		if obj, err = storage.NewEncrypted(obj, key); err != nil {
+			return err
+		}
+		log.Info("attachment at-rest encryption enabled (AES-256-GCM)")
+	}
 
 	var rdb *redis.Client
 	var q queue.Queue
@@ -192,6 +204,8 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		return fmt.Errorf("queue.type: unknown %q", cfg.Queue.Type)
 	}
 
+	wh := webhook.New(cfg.Webhook.URL, cfg.Webhook.Secret, cfg.Webhook.Timeout, log)
+
 	svc := service.New(st, obj, q, service.Options{
 		PublicBaseURL:      cfg.Portal.PublicBaseURL,
 		InternalBaseURL:    cfg.InternalAPI.AdvertiseURL,
@@ -199,6 +213,12 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		AnalysisTimeout:    cfg.Analysis.Timeout,
 		MaxAttempts:        cfg.Analysis.MaxAttempts,
 		VerdictReuseWindow: cfg.Analysis.VerdictReuseWindow,
+		AuditRetention:     cfg.Analysis.AuditRetention,
+		Webhook:            wh,
+		BlockedExtensions:  cfg.Rewrite.BlockedExtensions,
+		NotifyRecipients:   cfg.Analysis.NotifyRecipients,
+		Notifier:           notify.NewSMTPSender(upstreamOpts(cfg)),
+		NotifyFrom:         cfg.Analysis.NotifyFrom,
 	}, log)
 
 	// ---- outbound DLP ----
@@ -250,10 +270,44 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			ExemptSenders:          cfg.DLP.ExemptSenders,
 			ExemptRecipientDomains: cfg.DLP.ExemptRecipientDomains,
 			ScanInternal:           cfg.DLP.ScanInternal,
+			DryRun:                 cfg.DLP.DryRun,
+			Webhook:                wh,
 			NextHop:                nextHopOpts(cfg),
 			Location:               loc,
 		}, log)
 	}
+
+	// SIGHUP hot-reloads the tunable DLP policy (exempt lists, actions,
+	// dry-run, scan-internal, blocked extensions) from the config file without
+	// restarting listeners or reconnecting storage/DB.
+	go func() {
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		defer signal.Stop(hup)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hup:
+				newCfg, err := config.Load(cfgPath)
+				if err != nil {
+					log.Error("config reload failed; keeping current policy", "err", err)
+					continue
+				}
+				svc.SetBlockedExtensions(newCfg.Rewrite.BlockedExtensions)
+				if outSvc != nil {
+					outSvc.ReloadPolicy(outbound.Options{
+						Actions:                newCfg.DLP.Actions,
+						ExemptSenders:          newCfg.DLP.ExemptSenders,
+						ExemptRecipientDomains: newCfg.DLP.ExemptRecipientDomains,
+						DryRun:                 newCfg.DLP.DryRun,
+						ScanInternal:           newCfg.DLP.ScanInternal,
+					})
+				}
+				log.Info("config reloaded (dynamic DLP policy)", "path", cfgPath)
+			}
+		}
+	}()
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, 4)
@@ -289,6 +343,7 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			VerifyDKIM:    cfg.DKIM.VerifyInbound,
 			VerifySPF:     cfg.SPF.VerifyInbound,
 			VerifyDMARC:   cfg.DMARC.VerifyInbound,
+			EnforceDMARC:  cfg.DMARC.Enforce,
 			StripOrigDKIM: cfg.DKIM.StripOriginal,
 			Signer:        signer,
 			SPF:           spfChecker,
@@ -369,7 +424,7 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			DLPAdmins: cfg.DLP.Admins,
 		}, log)
 		log.Info("portal recipient authentication", "mode", cfg.Portal.Auth.Mode)
-		shutdowns = append(shutdowns, serveHTTP(&wg, errCh, log, "portal", cfg.Portal.Listen, p.Handler()))
+		shutdowns = append(shutdowns, serveHTTP(&wg, errCh, log, "portal", cfg.Portal.Listen, p.Handler(), cfg.Portal.TLSCertFile, cfg.Portal.TLSKeyFile))
 	}
 
 	// ---- internal API for the analyzer ----
@@ -378,7 +433,7 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		if outSvc != nil && cfg.InternalAPI.AdminToken != "" {
 			api.EnableDLPAdmin(cfg.InternalAPI.AdminToken, outSvc)
 		}
-		shutdowns = append(shutdowns, serveHTTP(&wg, errCh, log, "internal-api", cfg.InternalAPI.Listen, api.Handler()))
+		shutdowns = append(shutdowns, serveHTTP(&wg, errCh, log, "internal-api", cfg.InternalAPI.Listen, api.Handler(), "", ""))
 	}
 
 	// ---- background workers ----
@@ -507,7 +562,7 @@ func startSMTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, p smtpP
 	return srv.Shutdown, nil
 }
 
-func serveHTTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, name, addr string, h http.Handler) func(context.Context) error {
+func serveHTTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, name, addr string, h http.Handler, certFile, keyFile string) func(context.Context) error {
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           h,
@@ -518,11 +573,21 @@ func serveHTTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, name, a
 		ReadTimeout: 30 * time.Second,
 		IdleTimeout: 120 * time.Second,
 	}
+	tlsEnabled := certFile != ""
+	if tlsEnabled {
+		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		log.Info(name+" listening", "addr", addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Info(name+" listening", "addr", addr, "tls", tlsEnabled)
+		var err error
+		if tlsEnabled {
+			err = srv.ListenAndServeTLS(certFile, keyFile)
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("%s: %w", name, err)
 		}
 	}()

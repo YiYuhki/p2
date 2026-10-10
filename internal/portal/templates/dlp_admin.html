@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>발송 보류 관리</title>
+{{template "style" .}}
+</head>
+<body class="admin">
+<main>
+<div class="card">
+  <h1>발송 보류 관리</h1>
+  {{if .Disabled}}
+  <div class="msg err">관리자 대시보드는 수신자 인증이 설정된 경우에만 사용할 수 있습니다
+    (<code>portal.auth.mode</code> = <code>otp</code> 또는 <code>header</code>).</div>
+  {{else}}
+  <div class="tabs">
+    <button id="tab-holds" class="tab active" type="button">보류 메일</button>
+    <button id="tab-events" class="tab" type="button">감사 로그</button>
+  </div>
+
+  <section id="pane-holds">
+    <div class="toolbar">
+      <label for="hstatus">상태</label>
+      <select id="hstatus" aria-label="상태 필터">
+        <option value="HELD">검토 대기</option>
+        <option value="RELEASED">승인됨</option>
+        <option value="REJECTED">반려됨</option>
+        <option value="ALL">전체</option>
+      </select>
+      <a id="hexport" class="btnlink" href="#">CSV 내보내기</a>
+      <span class="count" id="hcount"></span>
+    </div>
+    <div class="bulk" id="hbulk" hidden>
+      <button id="bulkRelease" type="button">선택 승인</button>
+      <button id="bulkReject" class="danger" type="button">선택 반려</button>
+    </div>
+    <table class="holds">
+      <thead><tr><th><input type="checkbox" id="hall" aria-label="전체 선택"></th>
+        <th>접수</th><th>발신</th><th>수신</th><th>제목</th><th>탐지</th><th>상태</th><th></th></tr></thead>
+      <tbody id="hrows"></tbody>
+    </table>
+    <div id="hempty" class="empty" hidden>표시할 보류 메일이 없습니다.</div>
+    <button class="more" id="hmore" hidden>더 보기</button>
+  </section>
+
+  <section id="pane-events" hidden>
+    <div class="toolbar">
+      <label for="eaction">동작</label>
+      <select id="eaction" aria-label="동작 필터">
+        <option value="">전체</option><option value="block">차단</option><option value="hold">보류</option>
+        <option value="notify">알림</option><option value="allow">허용</option>
+      </select>
+      <label for="eseverity">등급</label>
+      <select id="eseverity" aria-label="등급 필터">
+        <option value="">전체</option><option value="high">높음</option><option value="medium">중간</option><option value="low">낮음</option>
+      </select>
+      <a id="eexport" class="btnlink" href="#">CSV 내보내기</a>
+      <span class="count" id="ecount"></span>
+    </div>
+    <table class="holds">
+      <thead><tr><th>시각</th><th>동작</th><th>등급</th><th>발신</th><th>수신</th><th>제목</th></tr></thead>
+      <tbody id="erows"></tbody>
+    </table>
+    <div id="eempty" class="empty" hidden>표시할 이벤트가 없습니다.</div>
+    <button class="more" id="emore" hidden>더 보기</button>
+  </section>
+
+  {{if .User}}
+  <div class="userbar"><span>{{.User}}</span>
+  {{if .CanLogout}}<form method="post" action="/dlp/admin/logout"><button class="link" type="submit">로그아웃</button></form>{{end}}
+  </div>
+  {{end}}
+  <script nonce="{{.Nonce}}">
+  (function () {
+    var SEV = { high: '높음', medium: '중간', low: '낮음' };
+    var STATUS = { HELD: '검토 대기', RELEASED: '승인됨', REJECTED: '반려됨', EXPIRED: '만료' };
+    var ACTION = { block: '차단', hold: '보류', notify: '알림', allow: '허용', exempt: '예외' };
+    function $(id) { return document.getElementById(id); }
+    function cell(t) { var td = document.createElement('td'); td.textContent = t; return td; }
+    function qs(obj) { return Object.keys(obj).filter(function (k) { return obj[k]; })
+      .map(function (k) { return k + '=' + encodeURIComponent(obj[k]); }).join('&'); }
+
+    // ---------- holds ----------
+    var hrows = $('hrows'), hcursor = null, hloading = false;
+    function hFilters() { return { status: $('hstatus').value }; }
+    function renderHold(h) {
+      var tr = document.createElement('tr'); tr.dataset.id = h.id;
+      if (h.status !== 'HELD') tr.className = 'decided';
+      var cbTd = document.createElement('td');
+      if (h.status === 'HELD') {
+        var cb = document.createElement('input'); cb.type = 'checkbox'; cb.className = 'sel';
+        cbTd.appendChild(cb);
+      }
+      tr.appendChild(cbTd);
+      tr.appendChild(cell(h.created)); tr.appendChild(cell(h.from));
+      tr.appendChild(cell((h.to || []).join(', '))); tr.appendChild(cell(h.subject));
+      tr.appendChild(cell(h.findings ? ((SEV[h.severity] || '-') + ' · ' + h.findings + '건') : '-'));
+      var st = document.createElement('td');
+      var pill = document.createElement('span'); pill.className = 'pill ' + h.status;
+      pill.textContent = STATUS[h.status] || h.status; st.appendChild(pill); tr.appendChild(st);
+      var act = document.createElement('td');
+      if (h.status === 'HELD') {
+        var box = document.createElement('div'); box.className = 'acts';
+        var rel = document.createElement('button'); rel.textContent = '승인';
+        rel.addEventListener('click', function () { decide(tr, h.id, 'release'); });
+        var rej = document.createElement('button'); rej.className = 'danger'; rej.textContent = '반려';
+        rej.addEventListener('click', function () { decide(tr, h.id, 'reject'); });
+        box.appendChild(rel); box.appendChild(rej); act.appendChild(box);
+      }
+      tr.appendChild(act); hrows.appendChild(tr);
+    }
+    function decide(tr, id, action, reason) {
+      var body = '';
+      if (action === 'reject') {
+        if (reason === undefined) { reason = window.prompt('반려 사유 (선택, 발신자에게 전달):', ''); if (reason === null) return; }
+        body = 'reason=' + encodeURIComponent(reason);
+      }
+      var btns = tr.querySelectorAll('button'); btns.forEach(function (b) { b.disabled = true; });
+      return fetch('/dlp/admin/holds/' + encodeURIComponent(id) + '/' + action,
+        { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
+        .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, status: r.status, j: j }; }); })
+        .then(function (res) {
+          if (res.ok) {
+            tr.className = 'decided';
+            var p = tr.querySelector('.pill'); p.className = 'pill ' + res.j.status; p.textContent = STATUS[res.j.status] || res.j.status;
+            var a = tr.querySelector('.acts'); if (a) a.remove();
+            var c = tr.querySelector('.sel'); if (c) c.remove();
+          } else {
+            window.alert('처리 실패: ' + (res.j.error || res.status));
+            btns.forEach(function (b) { b.disabled = false; });
+          }
+        }).catch(function () { window.alert('네트워크 오류'); btns.forEach(function (b) { b.disabled = false; }); });
+    }
+    function bulk(action) {
+      var checked = hrows.querySelectorAll('.sel:checked');
+      if (!checked.length) { window.alert('선택된 항목이 없습니다.'); return; }
+      var reason;
+      if (action === 'reject') { reason = window.prompt('반려 사유 (선택, 모든 선택 항목에 적용):', ''); if (reason === null) return; }
+      checked.forEach(function (cb) { decide(cb.closest('tr'), cb.closest('tr').dataset.id, action, reason); });
+    }
+    function loadHolds(reset) {
+      if (hloading) return; hloading = true;
+      if (reset) { hrows.innerHTML = ''; hcursor = null; $('hall').checked = false; }
+      var f = hFilters(); if (hcursor) f.cursor = hcursor;
+      fetch('/dlp/admin/holds?' + qs(f), { credentials: 'same-origin' })
+        .then(function (r) { if (!r.ok) throw 0; return r.json(); })
+        .then(function (j) {
+          (j.holds || []).forEach(renderHold);
+          hcursor = j.next || null; $('hmore').hidden = !hcursor;
+          $('hempty').hidden = hrows.children.length > 0;
+          $('hbulk').hidden = hrows.querySelectorAll('.sel').length === 0;
+          $('hcount').textContent = hrows.children.length + '건 표시';
+          hloading = false;
+        }).catch(function () { hloading = false; });
+    }
+
+    // ---------- events ----------
+    var erows = $('erows'), ecursor = null, eloading = false;
+    function eFilters() { return { action: $('eaction').value, severity: $('eseverity').value }; }
+    function renderEvent(e) {
+      var tr = document.createElement('tr');
+      tr.appendChild(cell(e.at)); tr.appendChild(cell(ACTION[e.action] || e.action));
+      tr.appendChild(cell(SEV[e.severity] || e.severity || '-'));
+      tr.appendChild(cell(e.mail_from)); tr.appendChild(cell((e.to || []).join(', '))); tr.appendChild(cell(e.subject));
+      erows.appendChild(tr);
+    }
+    function loadEvents(reset) {
+      if (eloading) return; eloading = true;
+      if (reset) { erows.innerHTML = ''; ecursor = null; }
+      var f = eFilters(); if (ecursor) f.cursor = ecursor;
+      fetch('/dlp/admin/events?' + qs(f), { credentials: 'same-origin' })
+        .then(function (r) { if (!r.ok) throw 0; return r.json(); })
+        .then(function (j) {
+          (j.events || []).forEach(renderEvent);
+          ecursor = j.next || null; $('emore').hidden = !ecursor;
+          $('eempty').hidden = erows.children.length > 0;
+          $('ecount').textContent = erows.children.length + '건 표시';
+          eloading = false;
+        }).catch(function () { eloading = false; });
+    }
+    function syncExports() {
+      $('hexport').href = '/dlp/admin/export?kind=holds&' + qs(hFilters());
+      $('eexport').href = '/dlp/admin/export?kind=events&' + qs(eFilters());
+    }
+
+    // ---------- wiring ----------
+    $('hstatus').addEventListener('change', function () { loadHolds(true); syncExports(); });
+    $('hmore').addEventListener('click', function () { loadHolds(false); });
+    $('hall').addEventListener('change', function () {
+      hrows.querySelectorAll('.sel').forEach(function (c) { c.checked = $('hall').checked; });
+    });
+    $('bulkRelease').addEventListener('click', function () { bulk('release'); });
+    $('bulkReject').addEventListener('click', function () { bulk('reject'); });
+    $('eaction').addEventListener('change', function () { loadEvents(true); syncExports(); });
+    $('eseverity').addEventListener('change', function () { loadEvents(true); syncExports(); });
+    $('emore').addEventListener('click', function () { loadEvents(false); });
+
+    var eventsLoaded = false;
+    $('tab-holds').addEventListener('click', function () {
+      $('tab-holds').classList.add('active'); $('tab-events').classList.remove('active');
+      $('pane-holds').hidden = false; $('pane-events').hidden = true;
+    });
+    $('tab-events').addEventListener('click', function () {
+      $('tab-events').classList.add('active'); $('tab-holds').classList.remove('active');
+      $('pane-events').hidden = false; $('pane-holds').hidden = true;
+      if (!eventsLoaded) { eventsLoaded = true; loadEvents(true); }
+    });
+
+    syncExports();
+    loadHolds(true);
+  })();
+  </script>
+  {{end}}
+</div>
+<footer>보안 메일 게이트웨이 · DLP 관리자</footer>
+</main>
+</body>
+</html>

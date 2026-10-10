@@ -53,6 +53,10 @@ type Store interface {
 	ListExpiredHolds(ctx context.Context, now time.Time, limit int) ([]*model.Hold, error)
 	RecordDLPEvent(ctx context.Context, ev *model.DLPEvent) error
 	ListDLPEvents(ctx context.Context, filter EventFilter, limit int, page Page) ([]*model.DLPEvent, error)
+	// PruneAuditEvents deletes dlp_events and download_events recorded before
+	// cutoff and returns how many rows were removed in total. Used for audit-log
+	// retention.
+	PruneAuditEvents(ctx context.Context, cutoff time.Time) (int64, error)
 	Close()
 }
 

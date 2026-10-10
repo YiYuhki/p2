@@ -115,6 +115,31 @@ func (s *Memory) RecordDLPEvent(_ context.Context, ev *model.DLPEvent) error {
 	return nil
 }
 
+func (s *Memory) PruneAuditEvents(_ context.Context, cutoff time.Time) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int64
+	de := s.dlpEvents[:0]
+	for _, e := range s.dlpEvents {
+		if e.At.Before(cutoff) {
+			n++
+		} else {
+			de = append(de, e)
+		}
+	}
+	s.dlpEvents = de
+	dl := s.Downloads[:0]
+	for _, e := range s.Downloads {
+		if e.At.Before(cutoff) {
+			n++
+		} else {
+			dl = append(dl, e)
+		}
+	}
+	s.Downloads = dl
+	return n, nil
+}
+
 func (s *Memory) ListDLPEvents(_ context.Context, f EventFilter, limit int, page Page) ([]*model.DLPEvent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

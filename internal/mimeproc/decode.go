@@ -143,6 +143,11 @@ func SanitizeFilename(name string) string {
 	}, name)
 	name = strings.TrimSpace(name)
 	name = strings.TrimLeft(name, ".")
+	// Strip trailing dots/spaces: Windows and many mail clients drop them on
+	// save, so "evil.exe." becomes "evil.exe". Normalizing here means every
+	// consumer (storage, banner, analyzer, download Content-Disposition, the
+	// blocked-extension gate) sees the name the OS will actually resolve.
+	name = strings.TrimRight(name, ". ")
 	if name == "" || name == "." {
 		return ""
 	}

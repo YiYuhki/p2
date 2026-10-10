@@ -106,6 +106,15 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("POST /dlp/{token}/logout", s.logout)
 		mux.HandleFunc("POST /dlp/{token}/release", s.holdRelease)
 		mux.HandleFunc("POST /dlp/{token}/reject", s.holdReject)
+		// Admin dashboard (identifiable admins only; see dlp_admin.go).
+		mux.HandleFunc("GET /dlp/admin", s.adminDashboard)
+		mux.HandleFunc("GET /dlp/admin/holds", s.adminHolds)
+		mux.HandleFunc("GET /dlp/admin/events", s.adminEvents)
+		mux.HandleFunc("GET /dlp/admin/export", s.adminExport)
+		mux.HandleFunc("POST /dlp/admin/auth", s.adminAuth)
+		mux.HandleFunc("POST /dlp/admin/logout", s.adminLogout)
+		mux.HandleFunc("POST /dlp/admin/holds/{id}/release", s.adminDecide(true))
+		mux.HandleFunc("POST /dlp/admin/holds/{id}/reject", s.adminDecide(false))
 	}
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	return securityHeaders(s.checkOrigin(mux))

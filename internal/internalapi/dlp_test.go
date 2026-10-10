@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/yiyuhki/p2/internal/config"
 	"github.com/yiyuhki/p2/internal/model"
 	"github.com/yiyuhki/p2/internal/storage"
 	"github.com/yiyuhki/p2/internal/store"
@@ -211,5 +212,51 @@ func TestDLPEventsFilteredPaginationKeepsFilter(t *testing.T) {
 	_, n2 := get(srv.URL + "/internal/v1/dlp/events?limit=2&cursor=" + cursor)
 	if n2 != 1 {
 		t.Fatalf("page2 should have the last block event only, got %d", n2)
+	}
+}
+
+func TestDLPRuleTestEndpoint(t *testing.T) {
+	st := store.NewMemory()
+	obj, _ := storage.NewFS(t.TempDir())
+	api := New(st, obj, nil, secret, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	const admin = "admin-token-0123456789"
+	api.EnableDLPAdmin(admin, reviewer{st})
+	srv := httptest.NewServer(api.Handler())
+	defer srv.Close()
+	base := srv.URL + "/internal/v1/dlp/rules/test"
+
+	code, body := do(t, "POST", base, admin, `{"pattern":"ORD-[0-9]{6}","text":"ORD-123456 and ORD-654321"}`)
+	if code != 200 || !strings.Contains(body, `"count":2`) {
+		t.Fatalf("rule test: %d %s", code, body)
+	}
+	if strings.Contains(body, "123456") {
+		t.Fatalf("matches not masked: %s", body)
+	}
+	if code, _ := do(t, "POST", base, admin, `{"pattern":"(","text":"x"}`); code != 400 {
+		t.Fatalf("bad regex should 400, got %d", code)
+	}
+	if code, _ := do(t, "POST", base, secret, `{"pattern":"x","text":"x"}`); code != 401 {
+		t.Fatalf("analyzer token must not reach admin endpoint: %d", code)
+	}
+}
+
+type polReviewer struct{ reviewer }
+
+func (polReviewer) Policy() (config.DLPActions, []string, []string, bool, bool) {
+	return config.DLPActions{High: "block", Medium: "notify", Low: "allow"},
+		[]string{"payroll@example.com"}, []string{"partner.example"}, true, false
+}
+
+func TestDLPPolicyEndpoint(t *testing.T) {
+	st := store.NewMemory()
+	obj, _ := storage.NewFS(t.TempDir())
+	api := New(st, obj, nil, secret, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	const admin = "admin-token-0123456789"
+	api.EnableDLPAdmin(admin, polReviewer{reviewer{st}})
+	srv := httptest.NewServer(api.Handler())
+	defer srv.Close()
+	code, body := do(t, "GET", srv.URL+"/internal/v1/dlp/policy", admin, "")
+	if code != 200 || !strings.Contains(body, "payroll@example.com") || !strings.Contains(body, `"dry_run":true`) {
+		t.Fatalf("policy endpoint: %d %s", code, body)
 	}
 }

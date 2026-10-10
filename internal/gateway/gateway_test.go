@@ -455,3 +455,47 @@ func TestFromHeaderDomain(t *testing.T) {
 		}
 	}
 }
+
+func TestDMARCEnforceRejects(t *testing.T) {
+	res := spfResolver{txt: map[string][]string{
+		"ext.org":        {"v=spf1 ip4:198.51.100.0/24 -all"}, // sender IP not listed → SPF fail
+		"_dmarc.ext.org": {"v=DMARC1; p=reject"},
+	}}
+	proc := NewProcessor(stubQ{}, ProcessorOptions{
+		Hostname: "gw.example.com", GatewayID: "test-gw", LinkTTL: time.Hour,
+		VerifySPF: true, VerifyDMARC: true, EnforceDMARC: true,
+		SPF:   spfutil.New(res, 0),
+		DMARC: dmarc.New(res, 0),
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	raw := "From: sender@ext.org\r\nTo: user@example.com\r\nSubject: hi\r\n\r\nbody\r\n"
+	_, err := proc.Process(context.Background(), Envelope{
+		MailFrom: "sender@ext.org", RcptTo: []string{"user@example.com"}, RemoteAddr: "203.0.113.9:2500", Helo: "mail.ext.org",
+	}, []byte(raw))
+	var se *smtp.SMTPError
+	if !errors.As(err, &se) || se.Code != 550 {
+		t.Fatalf("DMARC fail under p=reject should 550, got %v", err)
+	}
+}
+
+func TestDMARCEnforceOffRelays(t *testing.T) {
+	res := spfResolver{txt: map[string][]string{
+		"ext.org":        {"v=spf1 ip4:198.51.100.0/24 -all"},
+		"_dmarc.ext.org": {"v=DMARC1; p=reject"},
+	}}
+	proc := NewProcessor(stubQ{}, ProcessorOptions{
+		Hostname: "gw.example.com", GatewayID: "test-gw", LinkTTL: time.Hour,
+		VerifySPF: true, VerifyDMARC: true, EnforceDMARC: false,
+		SPF:   spfutil.New(res, 0),
+		DMARC: dmarc.New(res, 0),
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	raw := "From: sender@ext.org\r\nTo: user@example.com\r\nSubject: hi\r\n\r\nbody\r\n"
+	out, err := proc.Process(context.Background(), Envelope{
+		MailFrom: "sender@ext.org", RcptTo: []string{"user@example.com"}, RemoteAddr: "203.0.113.9:2500", Helo: "mail.ext.org",
+	}, []byte(raw))
+	if err != nil {
+		t.Fatalf("evaluate-only must not reject: %v", err)
+	}
+	if parsed, _ := mimeproc.Parse(out); !strings.Contains(parsed.Header.Get("Authentication-Results"), "dmarc=fail") {
+		t.Fatal("A-R should record dmarc=fail")
+	}
+}

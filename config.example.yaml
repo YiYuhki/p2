@@ -1,5 +1,11 @@
 # secmail example configuration.
 # ${VAR} references are expanded from the environment at load time.
+#
+# Hot reload: send SIGHUP to re-read this file and atomically swap the tunable
+# DLP policy without restarting listeners or connections — outbound dlp.actions,
+# dlp.exempt_senders, dlp.exempt_recipient_domains, dlp.dry_run, dlp.scan_internal
+# and rewrite.blocked_extensions. Everything else (listen addresses, DSNs, TLS)
+# needs a restart. Inspect the live policy with GET /internal/v1/dlp/policy.
 
 timezone: Asia/Seoul            # used for dates shown in banners / portal
 
@@ -31,6 +37,7 @@ rewrite:
   keep_inline_images: true       # keep image/* parts with Content-ID (HTML-embedded images)
   signed_policy: rewrite         # rewrite | passthrough  (rewrite removes the S/MIME/PGP signature)
   encrypted_policy: passthrough  # passthrough | reject    (encrypted content cannot be inspected)
+  # blocked_extensions: [exe, scr, bat, cmd, com, pif, js, jse, vbs, wsf, hta]  # refused up front (never released)
 
 dkim:
   verify_inbound: true           # verify original signatures and record them in Authentication-Results
@@ -49,9 +56,10 @@ spf:
 dmarc:
   verify_inbound: true           # evaluate DMARC alignment from the SPF+DKIM results
   timeout: 5s                    # DNS budget for the _dmarc policy lookup
+  enforce: false                 # true: reject (550) a DMARC-fail under the domain's p=reject policy
   # Adds "dmarc=pass|fail header.from=..." to Authentication-Results. Requires spf and/or
-  # dkim verify_inbound. Evaluation only — the gateway never rejects on DMARC (leave
-  # enforcement to the internal mail server's policy).
+  # dkim verify_inbound. With enforce=false the gateway only records the result (the internal
+  # mail server decides); enforce=true hard-rejects p=reject failures at the gateway.
 
 portal:
   listen: ":8080"
@@ -84,6 +92,8 @@ internal_api:                    # used by the external analysis engine only
 
 storage:
   type: s3                       # s3 (AWS S3 / MinIO / RustFS / Ceph RGW) | fs
+  encryption_key: ${SECMAIL_STORAGE_KEY}   # 64 hex chars (32 bytes) → AES-256-GCM at rest; empty disables
+  # With encryption on, analyzers must read attachments via the content API (direct reads see ciphertext).
   s3:
     endpoint: minio.internal.example.com:9000
     region: us-east-1
@@ -118,6 +128,7 @@ analysis:
   max_attempts: 3                # then marked ERROR (download blocked, fail-closed)
   verdict_reuse_window: 24h      # reuse verdicts for identical SHA-256 (0 disables)
   janitor_interval: 1m
+  audit_retention: 0s            # delete dlp_events/download_events older than this (0 = keep forever, e.g. 2160h = 90d)
 
 # Optional IN-PROCESS attachment analyzer (embeds the malengine engine). It is
 # compiled in only when secmail is built with `-tags malengine` (the default
@@ -151,6 +162,7 @@ dlp:
   scan_attachments: true           # docx/xlsx/pptx, hwp/hwpx, pdf, zip/gzip/tar/7z/rar (nested), csv/txt, legacy doc/xls
   # sevenzip_command: 7z           # 7z/rar/xz/zstd extraction (auto-detected on PATH; "none" disables)
   scan_internal: false             # true: also inspect mail between internal addresses
+  dry_run: false                 # true: record decisions + metrics but relay anyway (tune before enforcing)
   actions:                         # allow | notify | hold | block
     high: hold                     # resident/alien reg. no., card no., API keys, private keys, DB credentials
     medium: notify                 # passport, licence, business/corp reg. no., bank account, IBAN, bulk phones, JWT, passwords
@@ -191,3 +203,8 @@ dlp:
   #     pattern: 'PRJ-(ORION-\d{3})'
   #     severity: high
   #     category: confidential
+
+webhook:                         # optional: POST security events (DLP decisions, malware verdicts) as JSON
+  url: ""                        # e.g. https://siem.internal/secmail ; empty disables
+  secret: ${SECMAIL_WEBHOOK_SECRET}   # optional HMAC-SHA256 signing secret (X-Secmail-Signature header)
+  timeout: 5s
