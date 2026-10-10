@@ -147,6 +147,10 @@ func TestAdminEventsAndExport(t *testing.T) {
 	rv.st.RecordDLPEvent(context.Background(), &model.DLPEvent{ID: "ev-b", MailFrom: "lee@example.com",
 		RcptTo: []string{"q@ext.org"}, Subject: "알림건", Action: "notify", Severity: "medium",
 		Findings: []byte(`{}`), At: time.Now()})
+	// A formula-injection subject must be neutralized in the export.
+	rv.st.RecordDLPEvent(context.Background(), &model.DLPEvent{ID: "ev-x", MailFrom: "evil@ext.org",
+		RcptTo: []string{"r@ext.org"}, Subject: `=HYPERLINK("http://evil","x")`, Action: "block", Severity: "high",
+		Findings: []byte(`{}`), At: time.Now()})
 	c := browser(t)
 	adminLogin(t, c, base, "sec@example.com", m)
 
@@ -164,6 +168,10 @@ func TestAdminEventsAndExport(t *testing.T) {
 	if !strings.Contains(body, "id,at,action,severity") || !strings.Contains(body, "ev-a") || !strings.Contains(body, "ev-b") {
 		t.Fatalf("events csv body:\n%s", body)
 	}
+	// The =HYPERLINK subject must be prefixed with ' so Excel treats it as text.
+	if !strings.Contains(body, `'=HYPERLINK`) || strings.Contains(body, `,=HYPERLINK`) {
+		t.Fatalf("formula not neutralized in events csv:\n%s", body)
+	}
 
 	// CSV export (holds) includes the seeded held hold.
 	resp, body = fetch(t, c, "GET", base+"/dlp/admin/export?kind=holds", nil)
@@ -172,5 +180,23 @@ func TestAdminEventsAndExport(t *testing.T) {
 	}
 	if resp, _ := fetch(t, c, "GET", base+"/dlp/admin/export?kind=bogus", nil); resp.StatusCode != 400 {
 		t.Fatalf("bad kind should 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestCSVSafe(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"", ""},
+		{"kim@example.com", "kim@example.com"},
+		{"유출 의심", "유출 의심"},
+		{`=HYPERLINK("http://evil","x")`, `'=HYPERLINK("http://evil","x")`},
+		{"+1234", "'+1234"},
+		{"-cmd", "'-cmd"},
+		{"@SUM(A1)", "'@SUM(A1)"},
+		{"\tx", "'\tx"},
+		{"\rx", "'\rx"},
+	} {
+		if got := csvSafe(tc.in); got != tc.want {
+			t.Errorf("csvSafe(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

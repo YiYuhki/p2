@@ -163,6 +163,22 @@ func (s *Server) adminEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// csvSafe neutralizes spreadsheet formula injection (CWE-1236). encoding/csv
+// quotes commas/quotes/newlines but leaves a leading =, +, -, @, tab or CR
+// intact, so a mail field like `=HYPERLINK(...)` would run as a formula when an
+// admin opens the export in Excel/LibreOffice. Prefix any such field with a
+// single quote, which spreadsheets treat as a literal-text marker.
+func csvSafe(v string) string {
+	if v == "" {
+		return v
+	}
+	switch v[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + v
+	}
+	return v
+}
+
 // adminExport streams a CSV of holds or the audit log (?kind=holds|events),
 // paging through the store up to a safety cap.
 func (s *Server) adminExport(w http.ResponseWriter, r *http.Request) {
@@ -198,7 +214,7 @@ func (s *Server) adminExport(w http.ResponseWriter, r *http.Request) {
 			}
 			for _, h := range hs {
 				cw.Write([]string{h.ID, h.CreatedAt.Format(time.RFC3339), h.ExpiresAt.Format(time.RFC3339),
-					string(h.Status), h.MailFrom, strings.Join(h.RcptTo, " "), h.Subject, h.DecidedBy, h.Reason})
+					string(h.Status), csvSafe(h.MailFrom), csvSafe(strings.Join(h.RcptTo, " ")), csvSafe(h.Subject), csvSafe(h.DecidedBy), csvSafe(h.Reason)})
 				n++
 			}
 			if len(hs) < 500 {
@@ -220,8 +236,8 @@ func (s *Server) adminExport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, e := range evs {
-			cw.Write([]string{e.ID, e.At.Format(time.RFC3339), e.Action, e.Severity, e.MailFrom,
-				strings.Join(e.RcptTo, " "), e.Subject, e.HoldID})
+			cw.Write([]string{e.ID, e.At.Format(time.RFC3339), e.Action, e.Severity, csvSafe(e.MailFrom),
+				csvSafe(strings.Join(e.RcptTo, " ")), csvSafe(e.Subject), e.HoldID})
 			n++
 		}
 		if len(evs) < 500 {

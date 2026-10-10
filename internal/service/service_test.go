@@ -253,6 +253,29 @@ func TestBlockedExtensionQuarantine(t *testing.T) {
 	}
 }
 
+// A trailing dot (or trailing whitespace) must not let a blocked extension slip
+// past the up-front gate: Windows saves/executes "evil.exe." as "evil.exe".
+func TestBlockedExtensionTrailingDot(t *testing.T) {
+	s, _, q, _, _ := newSvc(t)
+	s.SetBlockedExtensions([]string{"exe"})
+	ctx := context.Background()
+	links, err := s.Quarantine(ctx, &model.Message{}, []*mimeproc.Extracted{
+		{Filename: "payload.exe.", ContentType: "application/octet-stream", Data: []byte("MZ")},
+		{Filename: "payload2.exe ", ContentType: "application/octet-stream", Data: []byte("MZ")},
+	})
+	if err != nil || len(links) != 2 {
+		t.Fatalf("quarantine: %v %d", err, len(links))
+	}
+	for i, l := range links {
+		if l.Status != model.StatusMalicious {
+			t.Fatalf("link[%d] status = %v, want MALICIOUS (trailing-dot bypass)", i, l.Status)
+		}
+	}
+	if jobs := q.Snapshot(); len(jobs) != 0 {
+		t.Fatalf("blocked files must not be queued, got %+v", jobs)
+	}
+}
+
 type capSender struct {
 	mu   sync.Mutex
 	sent []string // joined "to -> body-contains" records (raw msg)

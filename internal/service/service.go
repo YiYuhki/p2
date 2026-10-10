@@ -81,8 +81,12 @@ func (s *Service) SetBlockedExtensions(exts []string) {
 }
 
 // fileExt returns the lower-cased extension of name without the dot ("" if none).
+// Trailing dots and whitespace are stripped first so a name like "evil.exe."
+// (which Windows and many mail clients save/execute as "evil.exe") is classified
+// by its real final extension and cannot slip past the blocked-extension gate.
 func fileExt(name string) string {
 	name = strings.ToLower(strings.TrimSpace(name))
+	name = strings.TrimRight(name, ". ")
 	if i := strings.LastIndexByte(name, '.'); i >= 0 && i < len(name)-1 {
 		return name[i+1:]
 	}
