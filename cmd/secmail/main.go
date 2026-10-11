@@ -213,7 +213,15 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		return fmt.Errorf("queue.type: unknown %q", cfg.Queue.Type)
 	}
 
-	wh := webhook.New(cfg.Webhook.URL, cfg.Webhook.Secret, cfg.Webhook.Timeout, log)
+	whOpts := webhook.Options{
+		Timeout: cfg.Webhook.Timeout,
+		Retries: cfg.Webhook.Retries,
+		Backoff: cfg.Webhook.Backoff,
+	}
+	if dlq := webhook.NewFileDeadLetter(cfg.Webhook.DeadLetterFile); dlq != nil {
+		whOpts.DeadLetter = dlq
+	}
+	wh := webhook.NewWithOptions(cfg.Webhook.URL, cfg.Webhook.Secret, whOpts, log)
 
 	svc := service.New(st, obj, q, service.Options{
 		PublicBaseURL:      cfg.Portal.PublicBaseURL,

@@ -208,3 +208,6 @@ webhook:                         # optional: POST security events (DLP decisions
   url: ""                        # e.g. https://siem.internal/secmail ; empty disables
   secret: ${SECMAIL_WEBHOOK_SECRET}   # optional HMAC-SHA256 signing secret (X-Secmail-Signature header)
   timeout: 5s
+  retries: 0                     # extra attempts after the first on a network error or 429/5xx (0 = fire-and-forget)
+  backoff: 1s                    # initial retry delay, doubled each attempt
+  dead_letter_file: ""           # append permanently-failed events here as JSON lines (empty = drop after retries)

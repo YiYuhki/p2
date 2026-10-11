@@ -41,6 +41,14 @@ type WebhookConfig struct {
 	URL     string        `yaml:"url"`
 	Secret  string        `yaml:"secret"` // optional HMAC-SHA256 signing secret
 	Timeout time.Duration `yaml:"timeout"`
+	// Retries is the number of extra delivery attempts after the first on a
+	// network error or 5xx/429 response (0 = fire-and-forget, the default).
+	// Backoff is the initial delay, doubled each retry (default 1s).
+	Retries int           `yaml:"retries"`
+	Backoff time.Duration `yaml:"backoff"`
+	// DeadLetterFile, when set, receives one JSON line per permanently-failed
+	// event (all attempts exhausted) so nothing is lost silently.
+	DeadLetterFile string `yaml:"dead_letter_file"`
 }
 
 // AnalyzerConfig configures the OPTIONAL in-process attachment analyzer, which

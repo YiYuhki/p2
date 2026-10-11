@@ -9,9 +9,78 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func quiet() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+func TestRetryThenSucceed(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable) // 503 -> retryable
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	n := NewWithOptions(srv.URL, "", Options{Timeout: time.Second, Retries: 3, Backoff: time.Millisecond}, quiet())
+	n.sleep = func(time.Duration) {} // no real backoff in tests
+	n.deliver(Event{Type: "t"}, []byte(`{"type":"t"}`))
+	if got := atomic.LoadInt32(&hits); got != 3 {
+		t.Fatalf("hits = %d, want 3 (2 failures + 1 success)", got)
+	}
+}
+
+func TestExhaustedGoesToDeadLetter(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusBadGateway) // always 502
+	}))
+	defer srv.Close()
+
+	dlq := &capDLQ{}
+	n := NewWithOptions(srv.URL, "", Options{Timeout: time.Second, Retries: 2, Backoff: time.Millisecond, DeadLetter: dlq}, quiet())
+	n.sleep = func(time.Duration) {}
+	n.deliver(Event{Type: "t", Action: "block"}, []byte(`{"type":"t"}`))
+
+	if got := atomic.LoadInt32(&hits); got != 3 {
+		t.Fatalf("hits = %d, want 3 (1 + 2 retries)", got)
+	}
+	if dlq.n != 1 || dlq.last.Action != "block" {
+		t.Fatalf("dead-letter = %d %+v, want 1 with the event", dlq.n, dlq.last)
+	}
+}
+
+func TestClientErrorNotRetried(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusBadRequest) // 400 -> not retryable
+	}))
+	defer srv.Close()
+	dlq := &capDLQ{}
+	n := NewWithOptions(srv.URL, "", Options{Timeout: time.Second, Retries: 5, Backoff: time.Millisecond, DeadLetter: dlq}, quiet())
+	n.sleep = func(time.Duration) {}
+	n.deliver(Event{Type: "t"}, []byte(`{}`))
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("hits = %d, want 1 (4xx is terminal)", got)
+	}
+	if dlq.n != 1 {
+		t.Fatalf("a terminal failure should still dead-letter, got %d", dlq.n)
+	}
+}
+
+type capDLQ struct {
+	n    int
+	last Event
+}
+
+func (c *capDLQ) Fail(ev Event, _ []byte, _ string) { c.n++; c.last = ev }
 
 func TestNilNotifierIsNoop(t *testing.T) {
 	var n *Notifier
