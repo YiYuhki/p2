@@ -20,6 +20,8 @@ smtp:
   max_line_length: 2000          # reject over-long SMTP lines
   max_connections: 1024          # concurrent connections per listener (0 = unlimited)
   max_connections_per_ip: 50     # concurrent connections per client IP on the inbound listener
+  rate_limit_per_ip_rps: 0       # sustained MAIL/sec per client IP (0 = unlimited); over the cap MAIL gets 451
+  rate_limit_per_ip_burst: 0     # token-bucket burst size for the per-IP message rate
   read_timeout: 60s
   write_timeout: 60s
   tls_cert_file: /etc/secmail/tls.crt   # enables inbound STARTTLS (recommended)

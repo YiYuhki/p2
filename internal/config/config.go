@@ -227,6 +227,11 @@ type SMTPConfig struct {
 	// apply a per-IP cap because its clients are the allow-listed internal
 	// mail servers.
 	MaxConnectionsPerIP int `yaml:"max_connections_per_ip"`
+	// RateLimitPerIPRPS caps the sustained message (MAIL) rate from one client
+	// IP on the inbound listener (0 = unlimited); RateLimitPerIPBurst is the
+	// bucket size. Over the cap, MAIL is tempfailed with 451.
+	RateLimitPerIPRPS   float64 `yaml:"rate_limit_per_ip_rps"`
+	RateLimitPerIPBurst int     `yaml:"rate_limit_per_ip_burst"`
 }
 
 type UpstreamConfig struct {

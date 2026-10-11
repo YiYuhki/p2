@@ -49,6 +49,7 @@ import (
 	"github.com/yiyuhki/p2/internal/outbound"
 	"github.com/yiyuhki/p2/internal/portal"
 	"github.com/yiyuhki/p2/internal/queue"
+	"github.com/yiyuhki/p2/internal/ratelimit"
 	"github.com/yiyuhki/p2/internal/service"
 	"github.com/yiyuhki/p2/internal/smtpclient"
 	"github.com/yiyuhki/p2/internal/spfutil"
@@ -386,6 +387,15 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			go func() {
 				defer wg.Done()
 				sweepEvery(ctx, time.Hour, gl.Sweep)
+			}()
+		}
+		if rl := ratelimit.New(cfg.SMTP.RateLimitPerIPRPS, cfg.SMTP.RateLimitPerIPBurst); rl != nil {
+			beOpts.RateLimit = rl
+			log.Info("inbound per-IP rate limit enabled", "rps", cfg.SMTP.RateLimitPerIPRPS, "burst", cfg.SMTP.RateLimitPerIPBurst)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				sweepEvery(ctx, 10*time.Minute, func() { rl.Sweep(time.Hour) })
 			}()
 		}
 		be := gateway.NewBackend(proc, beOpts, log)

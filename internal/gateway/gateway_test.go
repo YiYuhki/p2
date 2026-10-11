@@ -561,3 +561,33 @@ func TestGreylistAllowsRelays(t *testing.T) {
 		t.Fatalf("allowed mail should relay: %v", err)
 	}
 }
+
+// denyAll / allowAllRL implement RateLimiter for the gate test.
+type denyAllRL struct{}
+
+func (denyAllRL) Allow(string) bool { return false }
+
+func TestRateLimitTempfailsMail(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	up := &upstream{}
+	upAddr := serve(t, up)
+	be := NewBackend(passthroughProc{}, BackendOptions{
+		RecipientDomains: []string{"example.com"},
+		Upstream:         UpstreamOptions{Addr: upAddr, Timeout: 5 * time.Second},
+		RateLimit:        denyAllRL{},
+	}, log)
+	addr := serve(t, be)
+	c, err := smtp.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	err = c.Mail("sender@ext.org", nil)
+	if err == nil {
+		t.Fatal("rate-limited MAIL should be tempfailed")
+	}
+	var se *smtp.SMTPError
+	if !errors.As(err, &se) || se.Code != 451 {
+		t.Fatalf("want 451, got %v", err)
+	}
+}

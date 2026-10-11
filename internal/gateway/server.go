@@ -54,6 +54,12 @@ type Greylister interface {
 	Allow(ip, from, to string) bool
 }
 
+// RateLimiter reports whether an event for key (the client IP) may proceed now.
+// false means rate-exceeded (the transaction is tempfailed). nil disables it.
+type RateLimiter interface {
+	Allow(key string) bool
+}
+
 type BackendOptions struct {
 	// RecipientDomains restricts RCPT TO (inbound: our domains). Empty = any.
 	RecipientDomains []string
@@ -70,6 +76,9 @@ type BackendOptions struct {
 	// Greylist, if set, defers the first delivery of each unseen triplet. nil
 	// disables it.
 	Greylist Greylister
+	// RateLimit, if set, caps the per-client-IP message rate at MAIL. nil
+	// disables it.
+	RateLimit RateLimiter
 }
 
 type Backend struct {
@@ -164,6 +173,8 @@ var (
 		Message: "Need MAIL command"}
 	errGreylisted = &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 7, 1},
 		Message: "Greylisted, please retry shortly"}
+	errRateLimited = &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 7, 0},
+		Message: "Message rate limit exceeded, please slow down"}
 )
 
 // hostOnly strips the port from a host:port remote address, returning the input
@@ -184,6 +195,10 @@ var errSenderDenied = &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode
 
 func (s *session) Mail(from string, opts *smtp.MailOptions) error {
 	s.resetState()
+	// Per-IP message-rate cap, checked before the upstream is dialled.
+	if s.b.opts.RateLimit != nil && !s.b.opts.RateLimit.Allow(hostOnly(s.remote)) {
+		return errRateLimited
+	}
 	// Null sender (bounces) is allowed; otherwise enforce SenderDomains.
 	if from != "" && len(s.b.opts.SenderDomains) > 0 && !domainIn(from, s.b.opts.SenderDomains) {
 		return errSenderDenied
