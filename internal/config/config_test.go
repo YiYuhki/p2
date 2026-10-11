@@ -45,6 +45,12 @@ func TestValidation(t *testing.T) {
 		"weak api token":    "upstream: {addr: 'mx:25'}\nsmtp: {accepted_domains: [a.com]}\ninternal_api: {listen: ':8081', token: x}\n",
 		"bad encrypted action": base + "outbound: {enabled: true, allowed_clients: [10.0.0.1]}\n" +
 			"dlp: {notify_from: a@b.c, admins: [s@b.c], actions: {high: hold, medium: notify, low: allow, uninspectable: notify, encrypted: magic}}\n",
+		"require_tls without starttls": "upstream: {addr: 'mx:25', require_tls: true}\nsmtp: {accepted_domains: [a.com]}\ninternal_api: {listen: ''}\n",
+		"require_tls insecure":         "upstream: {addr: 'mx:25', starttls: true, require_tls: true, insecure_skip_verify: true}\nsmtp: {accepted_domains: [a.com]}\ninternal_api: {listen: ''}\n",
+	}
+	// require_tls with verified starttls is valid.
+	if _, err := Load(write("upstream: {addr: 'mx:25', starttls: true, require_tls: true}\nsmtp: {accepted_domains: [a.com]}\ninternal_api: {listen: ''}\n")); err != nil {
+		t.Fatalf("require_tls with verified starttls should be valid: %v", err)
 	}
 	for name, body := range bad {
 		if _, err := Load(write(body)); err == nil {

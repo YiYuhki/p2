@@ -1,5 +1,11 @@
 # secmail example configuration.
 # ${VAR} references are expanded from the environment at load time.
+#
+# Hot reload: send SIGHUP to re-read this file and atomically swap the tunable
+# DLP policy without restarting listeners or connections — outbound dlp.actions,
+# dlp.exempt_senders, dlp.exempt_recipient_domains, dlp.dry_run, dlp.scan_internal
+# and rewrite.blocked_extensions. Everything else (listen addresses, DSNs, TLS)
+# needs a restart. Inspect the live policy with GET /internal/v1/dlp/policy.
 
 timezone: Asia/Seoul            # used for dates shown in banners / portal
 
@@ -14,6 +20,8 @@ smtp:
   max_line_length: 2000          # reject over-long SMTP lines
   max_connections: 1024          # concurrent connections per listener (0 = unlimited)
   max_connections_per_ip: 50     # concurrent connections per client IP on the inbound listener
+  rate_limit_per_ip_rps: 0       # sustained MAIL/sec per client IP (0 = unlimited); over the cap MAIL gets 451
+  rate_limit_per_ip_burst: 0     # token-bucket burst size for the per-IP message rate
   read_timeout: 60s
   write_timeout: 60s
   tls_cert_file: /etc/secmail/tls.crt   # enables inbound STARTTLS (recommended)
@@ -24,13 +32,18 @@ upstream:                        # the real mail server (Exchange, Postfix, ...)
   helo_name: secmail.example.com
   starttls: true
   insecure_skip_verify: false
+  require_tls: false             # safety rail: reject startup unless the relay uses verified STARTTLS
   timeout: 60s
+  # External-delivery TLS policy (MTA-STS, DANE/TLSA, TLS-RPT) is enforced by
+  # the backend MTA that performs MX delivery, not by secmail — secmail only
+  # relays to that MTA. See docs/deployment.md.
 
 rewrite:
   gateway_id: secmail-01
   keep_inline_images: true       # keep image/* parts with Content-ID (HTML-embedded images)
   signed_policy: rewrite         # rewrite | passthrough  (rewrite removes the S/MIME/PGP signature)
   encrypted_policy: passthrough  # passthrough | reject    (encrypted content cannot be inspected)
+  # blocked_extensions: [exe, scr, bat, cmd, com, pif, js, jse, vbs, wsf, hta]  # refused up front (never released)
 
 dkim:
   verify_inbound: true           # verify original signatures and record them in Authentication-Results
@@ -39,6 +52,13 @@ dkim:
   domain: example.com
   selector: secmail
   private_key_file: /etc/secmail/dkim.key   # generate with: secmail dkim-keygen
+
+arc:                             # optional: ARC-seal rewritten inbound mail (RFC 8617)
+  sign: false                    # add an ARC set recording the authentication the gateway observed
+  # domain/selector/private_key_file default to the dkim.* values above when empty.
+  # authserv_id: ""              # defaults to smtp.hostname
+  # Because the gateway rewrites mail (banner/attachments) it breaks the original DKIM/SPF
+  # alignment; an ARC seal lets a downstream ARC-aware receiver still trust what the gateway saw.
 
 spf:
   verify_inbound: true           # check the sending IP against the MAIL FROM domain's SPF record
@@ -49,9 +69,20 @@ spf:
 dmarc:
   verify_inbound: true           # evaluate DMARC alignment from the SPF+DKIM results
   timeout: 5s                    # DNS budget for the _dmarc policy lookup
+  enforce: false                 # true: reject (550) a DMARC-fail under the domain's p=reject policy
   # Adds "dmarc=pass|fail header.from=..." to Authentication-Results. Requires spf and/or
-  # dkim verify_inbound. Evaluation only — the gateway never rejects on DMARC (leave
-  # enforcement to the internal mail server's policy).
+  # dkim verify_inbound. With enforce=false the gateway only records the result (the internal
+  # mail server decides); enforce=true hard-rejects p=reject failures at the gateway.
+
+dnsbl:                           # optional: refuse inbound connections from listed client IPs
+  zones: []                      # e.g. [zen.spamhaus.org, bl.spamcop.net]; empty disables
+  timeout: 3s                    # per-zone DNS lookup budget
+  # Loopback/private clients are never queried. A listed IP is refused with 554 before MAIL.
+
+greylist:                        # optional: defer first delivery from an unseen (ip, from, rcpt) triplet
+  enabled: false
+  delay: 1m                      # retries sooner than this are deferred (451); legit MTAs retry
+  expiry: 36h                    # how long a triplet that passed is remembered
 
 portal:
   listen: ":8080"
@@ -84,6 +115,8 @@ internal_api:                    # used by the external analysis engine only
 
 storage:
   type: s3                       # s3 (AWS S3 / MinIO / RustFS / Ceph RGW) | fs
+  encryption_key: ${SECMAIL_STORAGE_KEY}   # 64 hex chars (32 bytes) → AES-256-GCM at rest; empty disables
+  # With encryption on, analyzers must read attachments via the content API (direct reads see ciphertext).
   s3:
     endpoint: minio.internal.example.com:9000
     region: us-east-1
@@ -118,6 +151,7 @@ analysis:
   max_attempts: 3                # then marked ERROR (download blocked, fail-closed)
   verdict_reuse_window: 24h      # reuse verdicts for identical SHA-256 (0 disables)
   janitor_interval: 1m
+  audit_retention: 0s            # delete dlp_events/download_events older than this (0 = keep forever, e.g. 2160h = 90d)
 
 # Optional IN-PROCESS attachment analyzer (embeds the malengine engine). It is
 # compiled in only when secmail is built with `-tags malengine` (the default
@@ -151,6 +185,7 @@ dlp:
   scan_attachments: true           # docx/xlsx/pptx, hwp/hwpx, pdf, zip/gzip/tar/7z/rar (nested), csv/txt, legacy doc/xls
   # sevenzip_command: 7z           # 7z/rar/xz/zstd extraction (auto-detected on PATH; "none" disables)
   scan_internal: false             # true: also inspect mail between internal addresses
+  dry_run: false                 # true: record decisions + metrics but relay anyway (tune before enforcing)
   actions:                         # allow | notify | hold | block
     high: hold                     # resident/alien reg. no., card no., API keys, private keys, DB credentials
     medium: notify                 # passport, licence, business/corp reg. no., bank account, IBAN, bulk phones, JWT, passwords
@@ -162,6 +197,11 @@ dlp:
   combine_bulk: 20                 # >= this many records of a single type in one place -> high
   notify_sender: true
   admins: [security@example.com]   # receive notices; approve/reject holds on the portal
+  auditors: []                     # read-only dashboard role: view/export holds, events, audit log; cannot release/reject
+  digest:                          # optional: periodic reminder of the held-mail backlog
+    enabled: false
+    interval: 24h
+    recipients: []                 # default: dlp.admins ; from = dlp.notify_from
   notify_from: dlp-noreply@example.com
   hold_ttl: 72h                    # undecided holds are discarded (not sent) after this
   ocr:                             # read text in images: screenshots, photos, scanned PDFs,
@@ -191,3 +231,11 @@ dlp:
   #     pattern: 'PRJ-(ORION-\d{3})'
   #     severity: high
   #     category: confidential
+
+webhook:                         # optional: POST security events (DLP decisions, malware verdicts) as JSON
+  url: ""                        # e.g. https://siem.internal/secmail ; empty disables
+  secret: ${SECMAIL_WEBHOOK_SECRET}   # optional HMAC-SHA256 signing secret (X-Secmail-Signature header)
+  timeout: 5s
+  retries: 0                     # extra attempts after the first on a network error or 429/5xx (0 = fire-and-forget)
+  backoff: 1s                    # initial retry delay, doubled each attempt
+  dead_letter_file: ""           # append permanently-failed events here as JSON lines (empty = drop after retries)

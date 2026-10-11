@@ -111,6 +111,7 @@ portal:
 - `worker`(판정 소비 + janitor)는 여러 대 떠도 안전하지만(판정은 `PENDING`에서 한 번만 반영) 1~2대면 충분합니다.
 - MX를 여러 게이트웨이에 걸어 두면 한 대가 죽어도 발신 MTA가 다른 MX로 재시도합니다. 게이트웨이는 업스트림이 수락해야만 250을 응답하므로 메일이 유실되지 않습니다.
 - **의존성 기동 대기**: 부팅 시 DB·스토리지·Redis가 아직 준비되지 않았으면 최대 30초(지수 백오프)까지 재시도한 뒤 실패합니다. compose/k8s에서 컨테이너 기동 순서가 어긋나도 게이트웨이가 스스로 붙습니다.
+- **설정 핫리로드**: `SIGHUP`을 보내면 리스너·DB 재시작 없이 설정 파일을 다시 읽어 **조정 가능한 DLP 정책**(발신 예외 `exempt_senders`/`exempt_recipient_domains`, 등급별 `actions`, `dry_run`, `scan_internal`, 인바운드 `blocked_extensions`)만 원자적으로 교체합니다. 리스너 주소·DSN·TLS 등 그 외 설정은 재시작이 필요합니다. 현재 적용 중인 정책은 관리 API `GET /internal/v1/dlp/policy`로 확인합니다.
 - **커넥션 풀**: `database.max_conns`/`min_conns`/`conn_max_lifetime`로 PostgreSQL 풀을, `redis.pool_size`로 Redis 풀을 인스턴스별로 조정합니다. 수평 확장 시 인스턴스 수 × `max_conns` 가 PostgreSQL `max_connections`를 넘지 않게 하세요. Redis 명령은 go-redis 기본 정책상 3회 재시도되며, 명령 타임아웃(dial 5s, read/write 3s)이 설정돼 있어 장애 시 무한 대기하지 않습니다.
 
 ## 6. 운영 점검 항목
@@ -129,6 +130,14 @@ portal:
 - 과도하게 긴 SMTP 라인(`smtp.max_line_length`), 메시지 크기(`smtp.max_message_bytes`, SIZE로 광고), 읽기/쓰기 타임아웃(slow-loris 방지)을 적용합니다.
 - MIME 구조 자체도 제한합니다: 중첩 깊이 32단계, 전체 파트 수 10,000개를 넘으면 파싱을 거부하고 메일 전체를 통째로 격리합니다(작은 파트 수백만 개로 메모리를 소진시키는 증폭 공격 방어). 메일은 유실되지 않고 그대로 배달됩니다.
 - 부하가 큰 환경에서는 `smtp.max_connections`를 파일 디스크립터 한도(`ulimit -n`)와 함께 조정하세요.
+- **DNSBL**: `dnsbl.zones`에 블록리스트(zen.spamhaus.org 등)를 지정하면 연결 클라이언트 IP를 조회해 등재된 발신지를 `554`로 즉시 거부합니다(루프백·사설 IP는 조회하지 않음).
+- **그레이리스팅**: `greylist.enabled`로 (클라이언트 IP, 발신자, 수신자) 트리플릿의 첫 시도를 `451`로 유예하고, `delay` 이후 재시도를 수락합니다. 정상 MTA는 재시도하지만 상당수 스팸웨어는 재시도하지 않습니다.
+- **발신 속도 제한**: `smtp.rate_limit_per_ip_rps`/`_burst`로 한 클라이언트 IP의 메시지(MAIL) 속도를 토큰버킷으로 제한합니다(초과 시 `451`).
+
+### 전송 구간 TLS
+
+- secmail는 MX 직접 배달을 하지 않고 **고정 upstream MTA로 중계**합니다. 따라서 외부 수신지에 대한 **MTA-STS / DANE(TLSA) / TLS-RPT**는 실제 MX 배달을 수행하는 그 백엔드 MTA에서 설정합니다(예: Postfix `smtp_tls_security_level`, `smtp_dns_support_level=dnssec`, `smtp_tls_policy_maps`).
+- upstream 중계 구간은 `upstream.starttls`로 STARTTLS를, `require_tls: true`로 **검증된 TLS 강제**를 겁니다. `require_tls`는 `starttls:false`이거나 `insecure_skip_verify:true`이면 기동을 거부해, 백엔드로 평문·무검증 전송되는 설정 실수를 막는 안전장치입니다.
 
 ## 7. 발신 메일 DLP 연동
 
@@ -210,3 +219,6 @@ Internal API 리스너(`internal_api.listen`, 기본 8081)에서 다음을 인�
 | `secmail_inbound_auth_total{method,result}` | 인바운드 인증 결과(spf/dkim × pass/fail/none/…) — fail·none 급증은 스푸핑 신호 |
 
 Kubernetes 예: livenessProbe → `/healthz`, readinessProbe → `/readyz`. Prometheus scrape 대상은 `<secmail>:8081/metrics`.
+
+- 경보 규칙: [`deploy/prometheus-alerts.yml`](../deploy/prometheus-alerts.yml) (다운/임시실패 급증/분석 오류/보류 적체/토큰 열거/인증 실패 급증 등)을 `rule_files`에 추가.
+- 대시보드: [`deploy/grafana-dashboard.json`](../deploy/grafana-dashboard.json)을 Grafana에서 Import(Prometheus 데이터소스).

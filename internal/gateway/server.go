@@ -15,6 +15,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/netip"
 	"strings"
 	"time"
@@ -39,6 +40,26 @@ type MessageProcessor interface {
 // gets 250 but nothing is relayed now.
 var ErrHeld = errors.New("message held")
 
+// ConnGate decides whether to accept a connection from the given client IP. A
+// non-nil return (ideally an *smtp.SMTPError) rejects the connection before any
+// command is processed. Used for DNSBL blocking.
+type ConnGate interface {
+	Gate(ctx context.Context, ip netip.Addr) *smtp.SMTPError
+}
+
+// Greylister reports whether a (client IP, sender, recipient) triplet may be
+// delivered now. false means defer (the recipient is tempfailed and not
+// forwarded upstream). nil disables greylisting.
+type Greylister interface {
+	Allow(ip, from, to string) bool
+}
+
+// RateLimiter reports whether an event for key (the client IP) may proceed now.
+// false means rate-exceeded (the transaction is tempfailed). nil disables it.
+type RateLimiter interface {
+	Allow(key string) bool
+}
+
 type BackendOptions struct {
 	// RecipientDomains restricts RCPT TO (inbound: our domains). Empty = any.
 	RecipientDomains []string
@@ -49,6 +70,15 @@ type BackendOptions struct {
 	Upstream       UpstreamOptions
 	// Name labels log lines ("inbound" / "outbound").
 	Name string
+	// ConnGate, if set, is consulted at connection time (e.g. DNSBL). nil
+	// disables it.
+	ConnGate ConnGate
+	// Greylist, if set, defers the first delivery of each unseen triplet. nil
+	// disables it.
+	Greylist Greylister
+	// RateLimit, if set, caps the per-client-IP message rate at MAIL. nil
+	// disables it.
+	RateLimit RateLimiter
 }
 
 type Backend struct {
@@ -75,6 +105,16 @@ func (b *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	if len(b.opts.AllowedClients) > 0 && !b.clientAllowed(s.remote) {
 		b.log.Warn("connection from unauthorised client refused", "remote", s.remote)
 		return nil, errClientDenied
+	}
+	if b.opts.ConnGate != nil {
+		if ap, err := netip.ParseAddrPort(s.remote); err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if serr := b.opts.ConnGate.Gate(ctx, ap.Addr().Unmap()); serr != nil {
+				b.log.Warn("connection refused by gate", "remote", s.remote, "reply", serr.Message)
+				return nil, serr
+			}
+		}
 	}
 	return s, nil
 }
@@ -131,7 +171,20 @@ var (
 		Message: "Upstream mail server unavailable, please retry"}
 	errNoMail = &smtp.SMTPError{Code: 503, EnhancedCode: smtp.EnhancedCode{5, 5, 1},
 		Message: "Need MAIL command"}
+	errGreylisted = &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 7, 1},
+		Message: "Greylisted, please retry shortly"}
+	errRateLimited = &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 7, 0},
+		Message: "Message rate limit exceeded, please slow down"}
 )
+
+// hostOnly strips the port from a host:port remote address, returning the input
+// unchanged when it has no port.
+func hostOnly(remote string) string {
+	if h, _, err := net.SplitHostPort(remote); err == nil {
+		return h
+	}
+	return remote
+}
 
 func (s *session) dialUpstream() (*smtp.Client, error) {
 	return smtpclient.Dial(s.b.opts.Upstream)
@@ -142,6 +195,10 @@ var errSenderDenied = &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode
 
 func (s *session) Mail(from string, opts *smtp.MailOptions) error {
 	s.resetState()
+	// Per-IP message-rate cap, checked before the upstream is dialled.
+	if s.b.opts.RateLimit != nil && !s.b.opts.RateLimit.Allow(hostOnly(s.remote)) {
+		return errRateLimited
+	}
 	// Null sender (bounces) is allowed; otherwise enforce SenderDomains.
 	if from != "" && len(s.b.opts.SenderDomains) > 0 && !domainIn(from, s.b.opts.SenderDomains) {
 		return errSenderDenied
@@ -174,6 +231,11 @@ func (s *session) Rcpt(to string, _ *smtp.RcptOptions) error {
 	}
 	if len(s.b.opts.RecipientDomains) > 0 && !domainIn(to, s.b.opts.RecipientDomains) {
 		return errRelayDenied
+	}
+	// Greylist before forwarding upstream so a deferred recipient is not
+	// accepted by the backend. The null sender (bounces) is never greylisted.
+	if s.b.opts.Greylist != nil && s.from != "" && !s.b.opts.Greylist.Allow(hostOnly(s.remote), s.from, to) {
+		return errGreylisted
 	}
 	if err := s.up.Rcpt(to, nil); err != nil {
 		return s.upstreamErr(err)

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -20,10 +21,12 @@ import (
 	"github.com/yiyuhki/p2/internal/metrics"
 	"github.com/yiyuhki/p2/internal/mimeproc"
 	"github.com/yiyuhki/p2/internal/model"
+	"github.com/yiyuhki/p2/internal/notify"
 	"github.com/yiyuhki/p2/internal/queue"
 	"github.com/yiyuhki/p2/internal/storage"
 	"github.com/yiyuhki/p2/internal/store"
 	"github.com/yiyuhki/p2/internal/token"
+	"github.com/yiyuhki/p2/internal/webhook"
 )
 
 type Options struct {
@@ -33,19 +36,61 @@ type Options struct {
 	AnalysisTimeout    time.Duration
 	MaxAttempts        int
 	VerdictReuseWindow time.Duration
+	// AuditRetention, when > 0, makes the janitor delete dlp_events and
+	// download_events older than this. 0 keeps the audit log forever.
+	AuditRetention time.Duration
+	// BlockedExtensions are file extensions (without dot) that are refused up
+	// front: the attachment is marked blocked without waiting for the analyzer,
+	// so the portal never releases it. Matched on the final extension, so
+	// "invoice.pdf.exe" is caught.
+	BlockedExtensions []string
+	// Webhook, when set, receives a JSON event when a verdict is MALICIOUS.
+	Webhook *webhook.Notifier
+	// NotifyRecipients emails the message recipients when an attachment verdict
+	// completes (CLEAN or MALICIOUS). Needs Notifier and NotifyFrom.
+	NotifyRecipients bool
+	Notifier         notify.Sender
+	NotifyFrom       string
 }
 
 type Service struct {
-	store   store.Store
-	storage storage.Storage
-	queue   queue.Queue
-	opts    Options
-	log     *slog.Logger
-	now     func() time.Time
+	store      store.Store
+	storage    storage.Storage
+	queue      queue.Queue
+	opts       Options
+	blockedExt atomic.Pointer[map[string]bool] // hot-swappable
+	log        *slog.Logger
+	now        func() time.Time
 }
 
 func New(st store.Store, obj storage.Storage, q queue.Queue, opts Options, log *slog.Logger) *Service {
-	return &Service{store: st, storage: obj, queue: q, opts: opts, log: log, now: time.Now}
+	s := &Service{store: st, storage: obj, queue: q, opts: opts, log: log, now: time.Now}
+	s.SetBlockedExtensions(opts.BlockedExtensions)
+	return s
+}
+
+// SetBlockedExtensions hot-swaps the blocked file-extension set (SIGHUP reload).
+func (s *Service) SetBlockedExtensions(exts []string) {
+	m := map[string]bool{}
+	for _, e := range exts {
+		if e = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(e), ".")); e != "" {
+			m[e] = true
+		}
+	}
+	s.blockedExt.Store(&m)
+}
+
+// fileExt returns the lower-cased extension of name without the dot ("" if none).
+// Trailing dots and whitespace are stripped first so a name like "evil.exe."
+// (which Windows and many mail clients save/execute as "evil.exe") is classified
+// by its real final extension and cannot slip past the blocked-extension gate.
+func fileExt(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	name = strings.TrimRight(name, ". ")
+	if i := strings.LastIndexByte(name, '.'); i >= 0 && i < len(name)-1 {
+		return name[i+1:]
+	}
+	return ""
 }
 
 // Link is the per-attachment information rendered into the mail banner.
@@ -71,6 +116,7 @@ func (s *Service) Quarantine(ctx context.Context, msg *model.Message, extracted 
 
 	atts := make([]*model.Attachment, 0, len(extracted))
 	links := make([]Link, 0, len(extracted))
+	blocked := map[string]bool{}
 	var stored []string
 	cleanup := func() {
 		for _, k := range stored {
@@ -100,7 +146,12 @@ func (s *Service) Quarantine(ctx context.Context, msg *model.Message, extracted 
 		tok := token.New()
 		a.TokenHash = token.Hash(tok)
 
-		if s.opts.VerdictReuseWindow > 0 {
+		if ext := fileExt(e.Filename); ext != "" && (*s.blockedExt.Load())[ext] {
+			// Refused by file-type policy: block without analysis.
+			a.Status, a.ThreatName, a.AnalyzedAt = model.StatusMalicious, "차단된 파일 형식 (."+ext+")", &now
+			a.VerdictDetail = json.RawMessage(`{"reason":"blocked_extension","ext":"` + ext + `"}`)
+			blocked[a.ID] = true
+		} else if s.opts.VerdictReuseWindow > 0 {
 			prev, err := s.store.FindReusableVerdict(ctx, a.SHA256, now.Add(-s.opts.VerdictReuseWindow))
 			if err == nil {
 				a.Status, a.ThreatName, a.AnalyzedAt = prev.Status, prev.ThreatName, &now
@@ -131,6 +182,11 @@ func (s *Service) Quarantine(ctx context.Context, msg *model.Message, extracted 
 	}
 
 	for _, a := range atts {
+		if blocked[a.ID] {
+			metrics.Attachments.WithLabelValues("blocked").Inc()
+			s.log.Info("attachment blocked by file-type policy", "attachment", a.ID, "filename", a.Filename, "threat", a.ThreatName)
+			continue
+		}
 		if a.Status != model.StatusPending {
 			metrics.Attachments.WithLabelValues("reused-" + strings.ToLower(string(a.Status))).Inc()
 			s.log.Info("verdict reused", "attachment", a.ID, "sha256", a.SHA256, "status", a.Status)
@@ -198,8 +254,61 @@ func (s *Service) ApplyVerdict(ctx context.Context, v model.Verdict) error {
 	if err == nil {
 		metrics.Verdicts.WithLabelValues(strings.ToLower(string(v.Status))).Inc()
 		s.log.Info("verdict applied", "attachment", v.AttachmentID, "status", v.Status, "threat", v.ThreatName)
+		s.afterVerdict(ctx, v)
 	}
 	return err
+}
+
+// afterVerdict fires the security webhook (MALICIOUS) and the recipient
+// completion notice (CLEAN/MALICIOUS), both enriched with the message envelope
+// from a single best-effort lookup. It only runs on the first (PENDING→final)
+// transition, so recipients are never notified twice.
+func (s *Service) afterVerdict(ctx context.Context, v model.Verdict) {
+	notifyRcpt := s.opts.NotifyRecipients && s.opts.Notifier != nil &&
+		(v.Status == model.StatusClean || v.Status == model.StatusMalicious)
+	if s.opts.Webhook == nil && !notifyRcpt {
+		return
+	}
+	var mailFrom, subject, filename string
+	var rcpt []string
+	if a, err := s.store.GetAttachment(ctx, v.AttachmentID); err == nil {
+		filename = a.Filename
+		if m, err := s.store.GetMessage(ctx, a.MessageID); err == nil {
+			mailFrom, rcpt, subject = m.MailFrom, m.RcptTo, m.Subject
+		}
+	}
+	if s.opts.Webhook != nil && v.Status == model.StatusMalicious {
+		s.opts.Webhook.Send(webhook.Event{
+			Type: "inbound_verdict", At: s.now().UTC(), Status: string(v.Status),
+			Threat: v.ThreatName, Attachment: v.AttachmentID,
+			MailFrom: mailFrom, RcptTo: rcpt, Subject: subject,
+		})
+	}
+	if notifyRcpt && len(rcpt) > 0 {
+		body := verdictBody(v.Status, filename, subject, v.ThreatName)
+		msg := notify.Build(s.opts.NotifyFrom, "보안 메일 게이트웨이", rcpt, verdictSubject(v.Status), body, s.now())
+		go func() {
+			if err := s.opts.Notifier.Send(context.WithoutCancel(ctx), s.opts.NotifyFrom, rcpt, msg); err != nil {
+				s.log.Warn("verdict notice send failed", "attachment", v.AttachmentID, "err", err)
+			}
+		}()
+	}
+}
+
+func verdictSubject(st model.Status) string {
+	if st == model.StatusMalicious {
+		return "[보안] 첨부파일이 차단되었습니다"
+	}
+	return "[보안] 첨부파일 검사 완료"
+}
+
+func verdictBody(st model.Status, filename, subject, threat string) string {
+	if st == model.StatusMalicious {
+		return fmt.Sprintf("받으신 메일(%q)의 첨부파일 '%s'이(가) 보안 검사에서 위협(%s)으로 판정되어 차단되었습니다.\n"+
+			"해당 파일은 내려받을 수 없습니다. 문의는 보안 담당자에게 연락하세요.", subject, filename, threat)
+	}
+	return fmt.Sprintf("받으신 메일(%q)의 첨부파일 '%s'이(가) 보안 검사를 통과했습니다.\n"+
+		"원본 메일 본문의 다운로드 링크에서 파일을 받으실 수 있습니다.", subject, filename)
 }
 
 // sanitizeThreatName strips control characters (the name is surfaced in the
@@ -296,6 +405,14 @@ func (s *Service) SweepOnce(ctx context.Context) {
 		}
 		if err := s.store.MarkExpired(ctx, a.ID, now); err != nil {
 			s.log.Error("janitor: mark expired", "attachment", a.ID, "err", err)
+		}
+	}
+
+	if s.opts.AuditRetention > 0 {
+		if n, err := s.store.PruneAuditEvents(ctx, now.Add(-s.opts.AuditRetention)); err != nil {
+			s.log.Error("janitor: prune audit events", "err", err)
+		} else if n > 0 {
+			s.log.Info("janitor: pruned audit events", "rows", n, "older_than", s.opts.AuditRetention)
 		}
 	}
 }

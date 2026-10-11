@@ -95,6 +95,20 @@ func (p *Postgres) ListExpiredHolds(ctx context.Context, now time.Time, limit in
 		WHERE status='HELD' AND expires_at < $1 ORDER BY expires_at LIMIT $2`, now, limit)
 }
 
+func (p *Postgres) PruneAuditEvents(ctx context.Context, cutoff time.Time) (int64, error) {
+	var total int64
+	tag, err := p.pool.Exec(ctx, `DELETE FROM dlp_events WHERE at < $1`, cutoff)
+	if err != nil {
+		return total, err
+	}
+	total += tag.RowsAffected()
+	tag, err = p.pool.Exec(ctx, `DELETE FROM download_events WHERE at < $1`, cutoff)
+	if err != nil {
+		return total, err
+	}
+	return total + tag.RowsAffected(), nil
+}
+
 func (p *Postgres) RecordDLPEvent(ctx context.Context, ev *model.DLPEvent) error {
 	var hold any
 	if ev.HoldID != "" {
@@ -105,6 +119,39 @@ func (p *Postgres) RecordDLPEvent(ctx context.Context, ev *model.DLPEvent) error
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
 		ev.ID, ev.MailFrom, ev.RcptTo, ev.Subject, ev.Action, ev.Severity, []byte(ev.Findings), hold, ev.At)
 	return err
+}
+
+func (p *Postgres) RecordAdminAction(ctx context.Context, a model.AdminAction) error {
+	_, err := p.pool.Exec(ctx, `INSERT INTO admin_actions
+		(id, at, actor, action, target, detail, source, result)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		a.ID, a.At, a.Actor, a.Action, a.Target, a.Detail, a.Source, a.Result)
+	return err
+}
+
+func (p *Postgres) ListAdminActions(ctx context.Context, limit int, page Page) ([]model.AdminAction, error) {
+	var args []any
+	arg := func(v any) string { args = append(args, v); return "$" + strconv.Itoa(len(args)) }
+	q := `SELECT id, at, actor, action, target, detail, source, result FROM admin_actions`
+	if page.Set() {
+		bt, bid := arg(page.Before), arg(page.BeforeID)
+		q += " WHERE (at < " + bt + " OR (at = " + bt + " AND id < " + bid + "))"
+	}
+	q += " ORDER BY at DESC, id DESC LIMIT " + arg(limit)
+	rows, err := p.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.AdminAction
+	for rows.Next() {
+		var a model.AdminAction
+		if err := rows.Scan(&a.ID, &a.At, &a.Actor, &a.Action, &a.Target, &a.Detail, &a.Source, &a.Result); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 func (p *Postgres) ListDLPEvents(ctx context.Context, f EventFilter, limit int, page Page) ([]*model.DLPEvent, error) {

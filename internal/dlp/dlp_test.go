@@ -459,3 +459,32 @@ func TestCombineDisabled(t *testing.T) {
 		}
 	}
 }
+
+func TestTestRule(t *testing.T) {
+	// Match order IDs; the whole match is masked.
+	got, err := TestRule(`ORD-[0-9]{6}`, "주문 ORD-123456, ORD-777888 접수", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 matches, got %v", got)
+	}
+	for _, m := range got {
+		if strings.Contains(m, "123456") || strings.Contains(m, "777888") {
+			t.Fatalf("match not masked: %q", m)
+		}
+	}
+	// Capture group 1 selects the matched value (longer so masks stay distinct).
+	got, _ = TestRule(`code=([A-Z]{6})`, "code=ABCDEF code=WXYZQP", 10)
+	if len(got) != 2 {
+		t.Fatalf("capture-group matches: %v", got)
+	}
+	// Too many capture groups is rejected like the rules engine.
+	if _, err := TestRule(`(a)(b)`, "ab", 10); err == nil {
+		t.Fatal("two capture groups should error")
+	}
+	// Bad regex errors.
+	if _, err := TestRule(`(`, "x", 10); err == nil {
+		t.Fatal("bad regex should error")
+	}
+}

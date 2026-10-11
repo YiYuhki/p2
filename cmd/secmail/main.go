@@ -4,6 +4,7 @@
 //	secmail -config config.yaml -components smtp         # SMTP proxy only
 //	secmail -config config.yaml -components portal,api,worker
 //	secmail dkim-keygen -out dkim.key                    # print DNS record
+//	secmail validate-config -config config.yaml          # check config, exit
 package main
 
 import (
@@ -13,6 +14,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"flag"
@@ -20,6 +22,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
@@ -31,27 +34,41 @@ import (
 	"github.com/emersion/go-smtp"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/yiyuhki/p2/internal/arc"
 	"github.com/yiyuhki/p2/internal/config"
+	"github.com/yiyuhki/p2/internal/digest"
 	"github.com/yiyuhki/p2/internal/dkimutil"
 	"github.com/yiyuhki/p2/internal/dlp"
 	"github.com/yiyuhki/p2/internal/dmarc"
+	"github.com/yiyuhki/p2/internal/dnsbl"
 	"github.com/yiyuhki/p2/internal/gateway"
+	"github.com/yiyuhki/p2/internal/greylist"
 	"github.com/yiyuhki/p2/internal/internalapi"
+	"github.com/yiyuhki/p2/internal/metrics"
 	"github.com/yiyuhki/p2/internal/mimeproc"
 	"github.com/yiyuhki/p2/internal/notify"
 	"github.com/yiyuhki/p2/internal/outbound"
 	"github.com/yiyuhki/p2/internal/portal"
 	"github.com/yiyuhki/p2/internal/queue"
+	"github.com/yiyuhki/p2/internal/ratelimit"
 	"github.com/yiyuhki/p2/internal/service"
 	"github.com/yiyuhki/p2/internal/smtpclient"
 	"github.com/yiyuhki/p2/internal/spfutil"
 	"github.com/yiyuhki/p2/internal/storage"
 	"github.com/yiyuhki/p2/internal/store"
+	"github.com/yiyuhki/p2/internal/webhook"
 )
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "dkim-keygen" {
 		if err := dkimKeygen(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "validate-config" {
+		if err := validateConfig(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -160,6 +177,16 @@ func run(cfgPath, components string, log *slog.Logger) error {
 	}); err != nil {
 		return err
 	}
+	if cfg.Storage.EncryptionKey != "" {
+		key, err := hex.DecodeString(cfg.Storage.EncryptionKey)
+		if err != nil {
+			return fmt.Errorf("storage.encryption_key: must be hex: %w", err)
+		}
+		if obj, err = storage.NewEncrypted(obj, key); err != nil {
+			return err
+		}
+		log.Info("attachment at-rest encryption enabled (AES-256-GCM)")
+	}
 
 	var rdb *redis.Client
 	var q queue.Queue
@@ -192,6 +219,16 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		return fmt.Errorf("queue.type: unknown %q", cfg.Queue.Type)
 	}
 
+	whOpts := webhook.Options{
+		Timeout: cfg.Webhook.Timeout,
+		Retries: cfg.Webhook.Retries,
+		Backoff: cfg.Webhook.Backoff,
+	}
+	if dlq := webhook.NewFileDeadLetter(cfg.Webhook.DeadLetterFile); dlq != nil {
+		whOpts.DeadLetter = dlq
+	}
+	wh := webhook.NewWithOptions(cfg.Webhook.URL, cfg.Webhook.Secret, whOpts, log)
+
 	svc := service.New(st, obj, q, service.Options{
 		PublicBaseURL:      cfg.Portal.PublicBaseURL,
 		InternalBaseURL:    cfg.InternalAPI.AdvertiseURL,
@@ -199,6 +236,12 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		AnalysisTimeout:    cfg.Analysis.Timeout,
 		MaxAttempts:        cfg.Analysis.MaxAttempts,
 		VerdictReuseWindow: cfg.Analysis.VerdictReuseWindow,
+		AuditRetention:     cfg.Analysis.AuditRetention,
+		Webhook:            wh,
+		BlockedExtensions:  cfg.Rewrite.BlockedExtensions,
+		NotifyRecipients:   cfg.Analysis.NotifyRecipients,
+		Notifier:           notify.NewSMTPSender(upstreamOpts(cfg)),
+		NotifyFrom:         cfg.Analysis.NotifyFrom,
 	}, log)
 
 	// ---- outbound DLP ----
@@ -250,10 +293,44 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			ExemptSenders:          cfg.DLP.ExemptSenders,
 			ExemptRecipientDomains: cfg.DLP.ExemptRecipientDomains,
 			ScanInternal:           cfg.DLP.ScanInternal,
+			DryRun:                 cfg.DLP.DryRun,
+			Webhook:                wh,
 			NextHop:                nextHopOpts(cfg),
 			Location:               loc,
 		}, log)
 	}
+
+	// SIGHUP hot-reloads the tunable DLP policy (exempt lists, actions,
+	// dry-run, scan-internal, blocked extensions) from the config file without
+	// restarting listeners or reconnecting storage/DB.
+	go func() {
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		defer signal.Stop(hup)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hup:
+				newCfg, err := config.Load(cfgPath)
+				if err != nil {
+					log.Error("config reload failed; keeping current policy", "err", err)
+					continue
+				}
+				svc.SetBlockedExtensions(newCfg.Rewrite.BlockedExtensions)
+				if outSvc != nil {
+					outSvc.ReloadPolicy(outbound.Options{
+						Actions:                newCfg.DLP.Actions,
+						ExemptSenders:          newCfg.DLP.ExemptSenders,
+						ExemptRecipientDomains: newCfg.DLP.ExemptRecipientDomains,
+						DryRun:                 newCfg.DLP.DryRun,
+						ScanInternal:           newCfg.DLP.ScanInternal,
+					})
+				}
+				log.Info("config reloaded (dynamic DLP policy)", "path", cfgPath)
+			}
+		}
+	}()
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, 4)
@@ -267,6 +344,14 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			if err != nil {
 				return err
 			}
+		}
+		var arcSealer *arc.Sealer
+		if cfg.ARC.Sign {
+			arcSealer, err = arc.LoadSealer(cfg.ARC.Domain, cfg.ARC.Selector, cfg.ARC.AuthservID, cfg.ARC.PrivateKeyFile)
+			if err != nil {
+				return err
+			}
+			log.Info("arc sealing enabled", "domain", cfg.ARC.Domain, "selector", cfg.ARC.Selector)
 		}
 		var spfChecker *spfutil.Checker
 		if cfg.SPF.VerifyInbound {
@@ -289,15 +374,41 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			VerifyDKIM:    cfg.DKIM.VerifyInbound,
 			VerifySPF:     cfg.SPF.VerifyInbound,
 			VerifyDMARC:   cfg.DMARC.VerifyInbound,
+			EnforceDMARC:  cfg.DMARC.Enforce,
 			StripOrigDKIM: cfg.DKIM.StripOriginal,
 			Signer:        signer,
+			ArcSealer:     arcSealer,
 			SPF:           spfChecker,
 			DMARC:         dmarcEval,
 		}, log)
-		be := gateway.NewBackend(proc, gateway.BackendOptions{
+		beOpts := gateway.BackendOptions{
 			RecipientDomains: cfg.SMTP.AcceptedDomains,
 			Upstream:         upstreamOpts(cfg),
-		}, log)
+		}
+		if bl := dnsbl.New(cfg.DNSBL.Zones, cfg.DNSBL.Timeout, nil, log); bl != nil {
+			beOpts.ConnGate = dnsblGate{bl: bl}
+			log.Info("dnsbl enabled", "zones", cfg.DNSBL.Zones)
+		}
+		if cfg.Greylist.Enabled {
+			gl := greylist.New(cfg.Greylist.Delay, cfg.Greylist.Expiry)
+			beOpts.Greylist = gl
+			log.Info("greylisting enabled", "delay", cfg.Greylist.Delay, "expiry", cfg.Greylist.Expiry)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				sweepEvery(ctx, time.Hour, gl.Sweep)
+			}()
+		}
+		if rl := ratelimit.New(cfg.SMTP.RateLimitPerIPRPS, cfg.SMTP.RateLimitPerIPBurst); rl != nil {
+			beOpts.RateLimit = rl
+			log.Info("inbound per-IP rate limit enabled", "rps", cfg.SMTP.RateLimitPerIPRPS, "burst", cfg.SMTP.RateLimitPerIPBurst)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				sweepEvery(ctx, 10*time.Minute, func() { rl.Sweep(time.Hour) })
+			}()
+		}
+		be := gateway.NewBackend(proc, beOpts, log)
 		var tlsConf *tls.Config
 		if cfg.SMTP.TLSCertFile != "" {
 			cert, err := tls.LoadX509KeyPair(cfg.SMTP.TLSCertFile, cfg.SMTP.TLSKeyFile)
@@ -363,13 +474,14 @@ func run(cfgPath, components string, log *slog.Logger) error {
 				OTPResendAfter:   cfg.Portal.Auth.OTPResendAfter,
 				SecureCookie:     strings.HasPrefix(cfg.Portal.PublicBaseURL, "https://"),
 			},
-			Codes:     codes,
-			Mailer:    portal.NewSMTPMailer(upstreamOpts(cfg), cfg.Portal.Auth.OTPFrom),
-			Holds:     holdReviewer(outSvc),
-			DLPAdmins: cfg.DLP.Admins,
+			Codes:       codes,
+			Mailer:      portal.NewSMTPMailer(upstreamOpts(cfg), cfg.Portal.Auth.OTPFrom),
+			Holds:       holdReviewer(outSvc),
+			DLPAdmins:   cfg.DLP.Admins,
+			DLPAuditors: cfg.DLP.Auditors,
 		}, log)
 		log.Info("portal recipient authentication", "mode", cfg.Portal.Auth.Mode)
-		shutdowns = append(shutdowns, serveHTTP(&wg, errCh, log, "portal", cfg.Portal.Listen, p.Handler()))
+		shutdowns = append(shutdowns, serveHTTP(&wg, errCh, log, "portal", cfg.Portal.Listen, p.Handler(), cfg.Portal.TLSCertFile, cfg.Portal.TLSKeyFile))
 	}
 
 	// ---- internal API for the analyzer ----
@@ -378,7 +490,7 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		if outSvc != nil && cfg.InternalAPI.AdminToken != "" {
 			api.EnableDLPAdmin(cfg.InternalAPI.AdminToken, outSvc)
 		}
-		shutdowns = append(shutdowns, serveHTTP(&wg, errCh, log, "internal-api", cfg.InternalAPI.Listen, api.Handler()))
+		shutdowns = append(shutdowns, serveHTTP(&wg, errCh, log, "internal-api", cfg.InternalAPI.Listen, api.Handler(), "", ""))
 	}
 
 	// ---- background workers ----
@@ -401,6 +513,41 @@ func run(cfgPath, components string, log *slog.Logger) error {
 				outSvc.Janitor(ctx, cfg.Analysis.JanitorInterval)
 			}()
 		}
+		// Held-mail digest: periodic reminder of the review backlog.
+		if cfg.DLP.Digest.Enabled {
+			recipients := cfg.DLP.Digest.Recipients
+			if len(recipients) == 0 {
+				recipients = cfg.DLP.Admins
+			}
+			interval := cfg.DLP.Digest.Interval
+			if interval <= 0 {
+				interval = 24 * time.Hour
+			}
+			dm := digest.New(st, notify.NewSMTPSender(upstreamOpts(cfg)), cfg.DLP.NotifyFrom, "보안메일", recipients, loc)
+			if dm == nil {
+				log.Warn("dlp.digest.enabled set but no notify_from/recipients; digest disabled")
+			} else {
+				log.Info("held-mail digest enabled", "interval", interval, "recipients", len(recipients))
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					// Skip the immediate run sweepEvery would do, so a restart
+					// does not fire a digest every boot; wait one interval first.
+					t := time.NewTicker(interval)
+					defer t.Stop()
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						case <-t.C:
+							if err := dm.Send(ctx); err != nil {
+								log.Warn("held-mail digest failed", "err", err)
+							}
+						}
+					}
+				}()
+			}
+		}
 		// Optional in-process attachment analyzer (only present in a
 		// -tags malengine build; startInProcAnalyzer is nil otherwise).
 		if cfg.Analyzer.Enabled {
@@ -410,6 +557,20 @@ func run(cfgPath, components string, log *slog.Logger) error {
 				return fmt.Errorf("in-process analyzer: %w", err)
 			}
 		}
+	}
+
+	// ---- TLS certificate expiry metric ----
+	// Re-read each configured serving cert hourly so the gauge follows a
+	// renewal (e.g. certbot) without a restart; alerting lives in Prometheus.
+	for comp, file := range map[string]string{"smtp": cfg.SMTP.TLSCertFile, "portal": cfg.Portal.TLSCertFile} {
+		if file == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(component, certFile string) {
+			defer wg.Done()
+			watchCertExpiry(ctx, log, component, certFile, time.Hour)
+		}(comp, file)
 	}
 
 	select {
@@ -507,7 +668,69 @@ func startSMTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, p smtpP
 	return srv.Shutdown, nil
 }
 
-func serveHTTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, name, addr string, h http.Handler) func(context.Context) error {
+// sweepEvery calls fn immediately and then every interval until ctx is done.
+func sweepEvery(ctx context.Context, interval time.Duration, fn func()) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			fn()
+		}
+	}
+}
+
+// watchCertExpiry reads the leaf certificate from certFile and publishes its
+// NotAfter to the TLS-cert-expiry gauge, refreshing every interval until ctx is
+// done so a renewed certificate updates the metric without a restart.
+func watchCertExpiry(ctx context.Context, log *slog.Logger, component, certFile string, interval time.Duration) {
+	read := func() {
+		exp, err := certExpiry(certFile)
+		if err != nil {
+			log.Warn("cert expiry read failed", "component", component, "file", certFile, "err", err)
+			return
+		}
+		metrics.SetCertExpiry(component, exp)
+	}
+	read()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			read()
+		}
+	}
+}
+
+// certExpiry returns the NotAfter of the first (leaf) certificate in a PEM file.
+func certExpiry(certFile string) (time.Time, error) {
+	raw, err := os.ReadFile(certFile)
+	if err != nil {
+		return time.Time{}, err
+	}
+	for {
+		var block *pem.Block
+		block, raw = pem.Decode(raw)
+		if block == nil {
+			return time.Time{}, errors.New("no CERTIFICATE block in PEM")
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return time.Time{}, err
+		}
+		return c.NotAfter, nil
+	}
+}
+
+func serveHTTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, name, addr string, h http.Handler, certFile, keyFile string) func(context.Context) error {
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           h,
@@ -518,15 +741,52 @@ func serveHTTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, name, a
 		ReadTimeout: 30 * time.Second,
 		IdleTimeout: 120 * time.Second,
 	}
+	tlsEnabled := certFile != ""
+	if tlsEnabled {
+		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		log.Info(name+" listening", "addr", addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Info(name+" listening", "addr", addr, "tls", tlsEnabled)
+		var err error
+		if tlsEnabled {
+			err = srv.ListenAndServeTLS(certFile, keyFile)
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("%s: %w", name, err)
 		}
 	}()
 	return srv.Shutdown
+}
+
+// dnsblGate adapts a dnsbl.Checker to gateway.ConnGate: a listed client IP is
+// refused with 554, matching how other access-denied conditions reply.
+type dnsblGate struct{ bl *dnsbl.Checker }
+
+func (g dnsblGate) Gate(ctx context.Context, ip netip.Addr) *smtp.SMTPError {
+	if listed, zone := g.bl.Listed(ctx, ip); listed {
+		return &smtp.SMTPError{Code: 554, EnhancedCode: smtp.EnhancedCode{5, 7, 1},
+			Message: "Client host [" + ip.String() + "] blocked by " + zone}
+	}
+	return nil
+}
+
+// validateConfig loads and validates a config file without starting any
+// listener, for use as a CI / pre-deploy gate: `secmail validate-config -config
+// config.yaml`. ${VAR} references are expanded from the environment exactly as
+// at boot, so the same environment must be present for the check to be faithful.
+func validateConfig(args []string) error {
+	fs := flag.NewFlagSet("validate-config", flag.ExitOnError)
+	cfgPath := fs.String("config", "config.yaml", "path to YAML config")
+	fs.Parse(args)
+	if _, err := config.Load(*cfgPath); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
+	}
+	fmt.Printf("%s: OK\n", *cfgPath)
+	return nil
 }
 
 func dkimKeygen(args []string) error {

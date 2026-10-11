@@ -20,6 +20,7 @@ type Config struct {
 	Upstream    UpstreamConfig    `yaml:"upstream"`
 	Rewrite     RewriteConfig     `yaml:"rewrite"`
 	DKIM        DKIMConfig        `yaml:"dkim"`
+	ARC         ARCConfig         `yaml:"arc"`
 	SPF         SPFConfig         `yaml:"spf"`
 	DMARC       DMARCConfig       `yaml:"dmarc"`
 	Portal      PortalConfig      `yaml:"portal"`
@@ -32,6 +33,41 @@ type Config struct {
 	Analyzer    AnalyzerConfig    `yaml:"analyzer"`
 	Outbound    OutboundConfig    `yaml:"outbound"`
 	DLP         DLPConfig         `yaml:"dlp"`
+	Webhook     WebhookConfig     `yaml:"webhook"`
+	DNSBL       DNSBLConfig       `yaml:"dnsbl"`
+	Greylist    GreylistConfig    `yaml:"greylist"`
+}
+
+// DNSBLConfig rejects inbound connections whose client IP is on a DNS block
+// list. Disabled when Zones is empty.
+type DNSBLConfig struct {
+	Zones   []string      `yaml:"zones"`   // e.g. ["zen.spamhaus.org", "bl.spamcop.net"]
+	Timeout time.Duration `yaml:"timeout"` // per-lookup timeout (default 3s)
+}
+
+// GreylistConfig temporarily defers (451) the first delivery attempt for an
+// unseen (client, sender, recipient) triplet and accepts it on a retry after
+// Delay. Disabled unless Enabled.
+type GreylistConfig struct {
+	Enabled bool          `yaml:"enabled"`
+	Delay   time.Duration `yaml:"delay"`  // min wait before a retry is accepted (default 1m)
+	Expiry  time.Duration `yaml:"expiry"` // how long a passed triplet is remembered (default 36h)
+}
+
+// WebhookConfig posts security events (DLP decisions, malware verdicts) to an
+// external endpoint as JSON. Disabled when URL is empty.
+type WebhookConfig struct {
+	URL     string        `yaml:"url"`
+	Secret  string        `yaml:"secret"` // optional HMAC-SHA256 signing secret
+	Timeout time.Duration `yaml:"timeout"`
+	// Retries is the number of extra delivery attempts after the first on a
+	// network error or 5xx/429 response (0 = fire-and-forget, the default).
+	// Backoff is the initial delay, doubled each retry (default 1s).
+	Retries int           `yaml:"retries"`
+	Backoff time.Duration `yaml:"backoff"`
+	// DeadLetterFile, when set, receives one JSON line per permanently-failed
+	// event (all attempts exhausted) so nothing is lost silently.
+	DeadLetterFile string `yaml:"dead_letter_file"`
 }
 
 // AnalyzerConfig configures the OPTIONAL in-process attachment analyzer, which
@@ -131,7 +167,10 @@ type DLPConfig struct {
 	NotifySender    bool       `yaml:"notify_sender"`
 	// Admins receive notices and review holds (and must be the logged-in
 	// user on the review page when portal.auth is enabled).
-	Admins     []string      `yaml:"admins"`
+	Admins []string `yaml:"admins"`
+	// Auditors get read-only dashboard access (view/export holds, events and the
+	// audit log) but cannot release or reject. Admins implicitly have this too.
+	Auditors   []string      `yaml:"auditors"`
 	NotifyFrom string        `yaml:"notify_from"`
 	HoldTTL    time.Duration `yaml:"hold_ttl"`
 	// Disabled built-in detector IDs; MinCounts overrides bulk thresholds.
@@ -146,6 +185,9 @@ type DLPConfig struct {
 	// domains (off by default: only mail leaving the organisation).
 	ScanInternal           bool     `yaml:"scan_internal"`
 	ExemptRecipientDomains []string `yaml:"exempt_recipient_domains"`
+	// DryRun records decisions and metrics but relays mail regardless (no
+	// holds/blocks/notices) — use to tune a policy before enforcing it.
+	DryRun bool `yaml:"dry_run"`
 	// CombinePII escalates a location that holds several distinct personal-data
 	// types, or a bulk list, to high severity (an identity-revealing dataset
 	// is riskier than an isolated value).
@@ -156,6 +198,16 @@ type DLPConfig struct {
 	// PATH, "none" = disabled). Non-encrypted archives are unpacked and their
 	// contents scanned; encrypted ones follow actions.encrypted.
 	SevenZipCommand string `yaml:"sevenzip_command"`
+	// Digest emails a periodic summary of currently-held mail to reviewers.
+	Digest DigestConfig `yaml:"digest"`
+}
+
+// DigestConfig controls the periodic held-mail reminder. Disabled unless
+// Enabled. Recipients defaults to Admins; the From address is dlp.notify_from.
+type DigestConfig struct {
+	Enabled    bool          `yaml:"enabled"`
+	Interval   time.Duration `yaml:"interval"`   // default 24h
+	Recipients []string      `yaml:"recipients"` // default: dlp.admins
 }
 
 type SMTPConfig struct {
@@ -176,6 +228,11 @@ type SMTPConfig struct {
 	// apply a per-IP cap because its clients are the allow-listed internal
 	// mail servers.
 	MaxConnectionsPerIP int `yaml:"max_connections_per_ip"`
+	// RateLimitPerIPRPS caps the sustained message (MAIL) rate from one client
+	// IP on the inbound listener (0 = unlimited); RateLimitPerIPBurst is the
+	// bucket size. Over the cap, MAIL is tempfailed with 451.
+	RateLimitPerIPRPS   float64 `yaml:"rate_limit_per_ip_rps"`
+	RateLimitPerIPBurst int     `yaml:"rate_limit_per_ip_burst"`
 }
 
 type UpstreamConfig struct {
@@ -184,6 +241,13 @@ type UpstreamConfig struct {
 	StartTLS           bool          `yaml:"starttls"`
 	InsecureSkipVerify bool          `yaml:"insecure_skip_verify"`
 	Timeout            time.Duration `yaml:"timeout"`
+	// RequireTLS is a safety rail: when set, the relay to the upstream MTA must
+	// use STARTTLS with a verified certificate, so a config that would send
+	// mail to the backend in cleartext or without verification is rejected at
+	// startup instead of silently downgrading. (External-delivery TLS policy
+	// such as MTA-STS/DANE is enforced by that backend MTA, which performs the
+	// MX delivery; secmail only relays to it.)
+	RequireTLS bool `yaml:"require_tls"`
 }
 
 // Policy values for signed / encrypted messages.
@@ -203,6 +267,10 @@ type RewriteConfig struct {
 	EncryptedPolicy string `yaml:"encrypted_policy"`
 	// GatewayID is stamped into X-SecMail-* headers.
 	GatewayID string `yaml:"gateway_id"`
+	// BlockedExtensions are inbound attachment file extensions refused up front
+	// (marked blocked without analysis; the portal never releases them). Matched
+	// on the final extension, e.g. "exe", "scr", "js".
+	BlockedExtensions []string `yaml:"blocked_extensions"`
 }
 
 // SPFConfig controls inbound SPF verification. The result is added to
@@ -219,6 +287,9 @@ type SPFConfig struct {
 type DMARCConfig struct {
 	VerifyInbound bool          `yaml:"verify_inbound"`
 	Timeout       time.Duration `yaml:"timeout"` // DNS budget for the policy lookup (default 5s)
+	// Enforce rejects (550) a message that DMARC-fails under a published
+	// p=reject policy. Off by default (evaluate-only, record in A-R).
+	Enforce bool `yaml:"enforce"`
 }
 
 type DKIMConfig struct {
@@ -228,6 +299,19 @@ type DKIMConfig struct {
 	Domain         string `yaml:"domain"`
 	Selector       string `yaml:"selector"`
 	PrivateKeyFile string `yaml:"private_key_file"`
+}
+
+// ARCConfig controls ARC sealing of rewritten inbound mail. Because the gateway
+// alters messages (banner, attachment rewrite) it breaks original DKIM/SPF
+// alignment; an ARC seal records the authentication the gateway saw so a
+// downstream ARC-aware receiver can still trust it. Domain/Selector/PrivateKey
+// default to the DKIM signing key when left empty.
+type ARCConfig struct {
+	Sign           bool   `yaml:"sign"`
+	Domain         string `yaml:"domain"`
+	Selector       string `yaml:"selector"`
+	PrivateKeyFile string `yaml:"private_key_file"`
+	AuthservID     string `yaml:"authserv_id"` // defaults to smtp.hostname
 }
 
 type PortalConfig struct {
@@ -243,8 +327,12 @@ type PortalConfig struct {
 	EnumPerIPBurst int     `yaml:"enum_per_ip_burst"`
 	EnumGlobalRPS  float64 `yaml:"enum_global_rps"`
 	// TrustProxyHeaders makes the rate limiter key on X-Forwarded-For.
-	TrustProxyHeaders bool             `yaml:"trust_proxy_headers"`
-	Auth              PortalAuthConfig `yaml:"auth"`
+	TrustProxyHeaders bool `yaml:"trust_proxy_headers"`
+	// TLSCertFile / TLSKeyFile enable HTTPS on the portal listener directly
+	// (no reverse proxy). Empty serves plain HTTP (e.g. behind a TLS proxy).
+	TLSCertFile string           `yaml:"tls_cert_file"`
+	TLSKeyFile  string           `yaml:"tls_key_file"`
+	Auth        PortalAuthConfig `yaml:"auth"`
 }
 
 // Recipient authentication modes for the download portal.
@@ -288,6 +376,11 @@ type StorageConfig struct {
 	Type string   `yaml:"type"` // s3 | fs
 	S3   S3Config `yaml:"s3"`
 	FS   FSConfig `yaml:"fs"`
+	// EncryptionKey enables AES-256-GCM at-rest encryption of stored
+	// attachments. It is 64 hex characters (32 bytes); empty disables it. With
+	// encryption on, analyzers must read attachments through the content API
+	// (a direct object-store read sees ciphertext).
+	EncryptionKey string `yaml:"encryption_key"`
 }
 
 type S3Config struct {
@@ -335,6 +428,13 @@ type AnalysisConfig struct {
 	VerdictReuseWindow time.Duration `yaml:"verdict_reuse_window"`
 	// JanitorInterval controls the expiry / stale-job sweep.
 	JanitorInterval time.Duration `yaml:"janitor_interval"`
+	// AuditRetention, when > 0, makes the janitor delete dlp_events and
+	// download_events older than this. 0 (default) keeps the audit log forever.
+	AuditRetention time.Duration `yaml:"audit_retention"`
+	// NotifyRecipients emails the message recipients when an attachment's
+	// analysis verdict completes (CLEAN or MALICIOUS). NotifyFrom is the sender.
+	NotifyRecipients bool   `yaml:"notify_recipients"`
+	NotifyFrom       string `yaml:"notify_from"`
 }
 
 func Default() Config {
@@ -427,6 +527,14 @@ func (c *Config) Validate() error {
 	if c.Upstream.Addr == "" {
 		errs = append(errs, errors.New("upstream.addr is required"))
 	}
+	if c.Upstream.RequireTLS {
+		if !c.Upstream.StartTLS {
+			errs = append(errs, errors.New("upstream.require_tls needs upstream.starttls: true"))
+		}
+		if c.Upstream.InsecureSkipVerify {
+			errs = append(errs, errors.New("upstream.require_tls forbids upstream.insecure_skip_verify: true"))
+		}
+	}
 	if len(c.SMTP.AcceptedDomains) == 0 {
 		errs = append(errs, errors.New("smtp.accepted_domains must not be empty (open relay protection)"))
 	}
@@ -435,6 +543,12 @@ func (c *Config) Validate() error {
 	}
 	for i, d := range c.SMTP.AcceptedDomains {
 		c.SMTP.AcceptedDomains[i] = strings.ToLower(strings.TrimSpace(d))
+	}
+	if (c.SMTP.TLSCertFile == "") != (c.SMTP.TLSKeyFile == "") {
+		errs = append(errs, errors.New("smtp.tls_cert_file and smtp.tls_key_file must be set together"))
+	}
+	if (c.Portal.TLSCertFile == "") != (c.Portal.TLSKeyFile == "") {
+		errs = append(errs, errors.New("portal.tls_cert_file and portal.tls_key_file must be set together"))
 	}
 	c.Portal.PublicBaseURL = strings.TrimRight(c.Portal.PublicBaseURL, "/")
 	c.InternalAPI.AdvertiseURL = strings.TrimRight(c.InternalAPI.AdvertiseURL, "/")
@@ -499,6 +613,24 @@ func (c *Config) Validate() error {
 	}
 	if c.DKIM.Sign && (c.DKIM.Domain == "" || c.DKIM.Selector == "" || c.DKIM.PrivateKeyFile == "") {
 		errs = append(errs, errors.New("dkim.sign requires domain, selector and private_key_file"))
+	}
+	if c.ARC.Sign {
+		// Default ARC's key material to the DKIM signing key.
+		if c.ARC.Domain == "" {
+			c.ARC.Domain = c.DKIM.Domain
+		}
+		if c.ARC.Selector == "" {
+			c.ARC.Selector = c.DKIM.Selector
+		}
+		if c.ARC.PrivateKeyFile == "" {
+			c.ARC.PrivateKeyFile = c.DKIM.PrivateKeyFile
+		}
+		if c.ARC.AuthservID == "" {
+			c.ARC.AuthservID = c.SMTP.Hostname
+		}
+		if c.ARC.Domain == "" || c.ARC.Selector == "" || c.ARC.PrivateKeyFile == "" {
+			errs = append(errs, errors.New("arc.sign requires domain, selector and private_key_file (or dkim.* to inherit from)"))
+		}
 	}
 	if c.InternalAPI.Listen != "" && len(c.InternalAPI.Token) < 16 {
 		errs = append(errs, errors.New("internal_api.token must be at least 16 characters"))
