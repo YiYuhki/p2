@@ -130,6 +130,14 @@ portal:
 - 과도하게 긴 SMTP 라인(`smtp.max_line_length`), 메시지 크기(`smtp.max_message_bytes`, SIZE로 광고), 읽기/쓰기 타임아웃(slow-loris 방지)을 적용합니다.
 - MIME 구조 자체도 제한합니다: 중첩 깊이 32단계, 전체 파트 수 10,000개를 넘으면 파싱을 거부하고 메일 전체를 통째로 격리합니다(작은 파트 수백만 개로 메모리를 소진시키는 증폭 공격 방어). 메일은 유실되지 않고 그대로 배달됩니다.
 - 부하가 큰 환경에서는 `smtp.max_connections`를 파일 디스크립터 한도(`ulimit -n`)와 함께 조정하세요.
+- **DNSBL**: `dnsbl.zones`에 블록리스트(zen.spamhaus.org 등)를 지정하면 연결 클라이언트 IP를 조회해 등재된 발신지를 `554`로 즉시 거부합니다(루프백·사설 IP는 조회하지 않음).
+- **그레이리스팅**: `greylist.enabled`로 (클라이언트 IP, 발신자, 수신자) 트리플릿의 첫 시도를 `451`로 유예하고, `delay` 이후 재시도를 수락합니다. 정상 MTA는 재시도하지만 상당수 스팸웨어는 재시도하지 않습니다.
+- **발신 속도 제한**: `smtp.rate_limit_per_ip_rps`/`_burst`로 한 클라이언트 IP의 메시지(MAIL) 속도를 토큰버킷으로 제한합니다(초과 시 `451`).
+
+### 전송 구간 TLS
+
+- secmail는 MX 직접 배달을 하지 않고 **고정 upstream MTA로 중계**합니다. 따라서 외부 수신지에 대한 **MTA-STS / DANE(TLSA) / TLS-RPT**는 실제 MX 배달을 수행하는 그 백엔드 MTA에서 설정합니다(예: Postfix `smtp_tls_security_level`, `smtp_dns_support_level=dnssec`, `smtp_tls_policy_maps`).
+- upstream 중계 구간은 `upstream.starttls`로 STARTTLS를, `require_tls: true`로 **검증된 TLS 강제**를 겁니다. `require_tls`는 `starttls:false`이거나 `insecure_skip_verify:true`이면 기동을 거부해, 백엔드로 평문·무검증 전송되는 설정 실수를 막는 안전장치입니다.
 
 ## 7. 발신 메일 DLP 연동
 

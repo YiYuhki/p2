@@ -32,7 +32,11 @@ upstream:                        # the real mail server (Exchange, Postfix, ...)
   helo_name: secmail.example.com
   starttls: true
   insecure_skip_verify: false
+  require_tls: false             # safety rail: reject startup unless the relay uses verified STARTTLS
   timeout: 60s
+  # External-delivery TLS policy (MTA-STS, DANE/TLSA, TLS-RPT) is enforced by
+  # the backend MTA that performs MX delivery, not by secmail — secmail only
+  # relays to that MTA. See docs/deployment.md.
 
 rewrite:
   gateway_id: secmail-01

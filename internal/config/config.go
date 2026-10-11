@@ -240,6 +240,13 @@ type UpstreamConfig struct {
 	StartTLS           bool          `yaml:"starttls"`
 	InsecureSkipVerify bool          `yaml:"insecure_skip_verify"`
 	Timeout            time.Duration `yaml:"timeout"`
+	// RequireTLS is a safety rail: when set, the relay to the upstream MTA must
+	// use STARTTLS with a verified certificate, so a config that would send
+	// mail to the backend in cleartext or without verification is rejected at
+	// startup instead of silently downgrading. (External-delivery TLS policy
+	// such as MTA-STS/DANE is enforced by that backend MTA, which performs the
+	// MX delivery; secmail only relays to it.)
+	RequireTLS bool `yaml:"require_tls"`
 }
 
 // Policy values for signed / encrypted messages.
@@ -505,6 +512,14 @@ func (c *Config) Validate() error {
 	var errs []error
 	if c.Upstream.Addr == "" {
 		errs = append(errs, errors.New("upstream.addr is required"))
+	}
+	if c.Upstream.RequireTLS {
+		if !c.Upstream.StartTLS {
+			errs = append(errs, errors.New("upstream.require_tls needs upstream.starttls: true"))
+		}
+		if c.Upstream.InsecureSkipVerify {
+			errs = append(errs, errors.New("upstream.require_tls forbids upstream.insecure_skip_verify: true"))
+		}
 	}
 	if len(c.SMTP.AcceptedDomains) == 0 {
 		errs = append(errs, errors.New("smtp.accepted_domains must not be empty (open relay protection)"))
