@@ -197,6 +197,16 @@ type DLPConfig struct {
 	// PATH, "none" = disabled). Non-encrypted archives are unpacked and their
 	// contents scanned; encrypted ones follow actions.encrypted.
 	SevenZipCommand string `yaml:"sevenzip_command"`
+	// Digest emails a periodic summary of currently-held mail to reviewers.
+	Digest DigestConfig `yaml:"digest"`
+}
+
+// DigestConfig controls the periodic held-mail reminder. Disabled unless
+// Enabled. Recipients defaults to Admins; the From address is dlp.notify_from.
+type DigestConfig struct {
+	Enabled    bool          `yaml:"enabled"`
+	Interval   time.Duration `yaml:"interval"`   // default 24h
+	Recipients []string      `yaml:"recipients"` // default: dlp.admins
 }
 
 type SMTPConfig struct {

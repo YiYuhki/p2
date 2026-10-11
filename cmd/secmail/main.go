@@ -35,6 +35,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/yiyuhki/p2/internal/config"
+	"github.com/yiyuhki/p2/internal/digest"
 	"github.com/yiyuhki/p2/internal/dkimutil"
 	"github.com/yiyuhki/p2/internal/dlp"
 	"github.com/yiyuhki/p2/internal/dmarc"
@@ -491,6 +492,41 @@ func run(cfgPath, components string, log *slog.Logger) error {
 				defer wg.Done()
 				outSvc.Janitor(ctx, cfg.Analysis.JanitorInterval)
 			}()
+		}
+		// Held-mail digest: periodic reminder of the review backlog.
+		if cfg.DLP.Digest.Enabled {
+			recipients := cfg.DLP.Digest.Recipients
+			if len(recipients) == 0 {
+				recipients = cfg.DLP.Admins
+			}
+			interval := cfg.DLP.Digest.Interval
+			if interval <= 0 {
+				interval = 24 * time.Hour
+			}
+			dm := digest.New(st, notify.NewSMTPSender(upstreamOpts(cfg)), cfg.DLP.NotifyFrom, "보안메일", recipients, loc)
+			if dm == nil {
+				log.Warn("dlp.digest.enabled set but no notify_from/recipients; digest disabled")
+			} else {
+				log.Info("held-mail digest enabled", "interval", interval, "recipients", len(recipients))
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					// Skip the immediate run sweepEvery would do, so a restart
+					// does not fire a digest every boot; wait one interval first.
+					t := time.NewTicker(interval)
+					defer t.Stop()
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						case <-t.C:
+							if err := dm.Send(ctx); err != nil {
+								log.Warn("held-mail digest failed", "err", err)
+							}
+						}
+					}
+				}()
+			}
 		}
 		// Optional in-process attachment analyzer (only present in a
 		// -tags malengine build; startInProcAnalyzer is nil otherwise).
