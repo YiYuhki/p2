@@ -39,6 +39,7 @@ import (
 	"github.com/yiyuhki/p2/internal/dmarc"
 	"github.com/yiyuhki/p2/internal/gateway"
 	"github.com/yiyuhki/p2/internal/internalapi"
+	"github.com/yiyuhki/p2/internal/metrics"
 	"github.com/yiyuhki/p2/internal/mimeproc"
 	"github.com/yiyuhki/p2/internal/notify"
 	"github.com/yiyuhki/p2/internal/outbound"
@@ -475,6 +476,20 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		}
 	}
 
+	// ---- TLS certificate expiry metric ----
+	// Re-read each configured serving cert hourly so the gauge follows a
+	// renewal (e.g. certbot) without a restart; alerting lives in Prometheus.
+	for comp, file := range map[string]string{"smtp": cfg.SMTP.TLSCertFile, "portal": cfg.Portal.TLSCertFile} {
+		if file == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(component, certFile string) {
+			defer wg.Done()
+			watchCertExpiry(ctx, log, component, certFile, time.Hour)
+		}(comp, file)
+	}
+
 	select {
 	case <-ctx.Done():
 		log.Info("shutting down")
@@ -568,6 +583,54 @@ func startSMTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, p smtpP
 		}
 	}()
 	return srv.Shutdown, nil
+}
+
+// watchCertExpiry reads the leaf certificate from certFile and publishes its
+// NotAfter to the TLS-cert-expiry gauge, refreshing every interval until ctx is
+// done so a renewed certificate updates the metric without a restart.
+func watchCertExpiry(ctx context.Context, log *slog.Logger, component, certFile string, interval time.Duration) {
+	read := func() {
+		exp, err := certExpiry(certFile)
+		if err != nil {
+			log.Warn("cert expiry read failed", "component", component, "file", certFile, "err", err)
+			return
+		}
+		metrics.SetCertExpiry(component, exp)
+	}
+	read()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			read()
+		}
+	}
+}
+
+// certExpiry returns the NotAfter of the first (leaf) certificate in a PEM file.
+func certExpiry(certFile string) (time.Time, error) {
+	raw, err := os.ReadFile(certFile)
+	if err != nil {
+		return time.Time{}, err
+	}
+	for {
+		var block *pem.Block
+		block, raw = pem.Decode(raw)
+		if block == nil {
+			return time.Time{}, errors.New("no CERTIFICATE block in PEM")
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return time.Time{}, err
+		}
+		return c.NotAfter, nil
+	}
 }
 
 func serveHTTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, name, addr string, h http.Handler, certFile, keyFile string) func(context.Context) error {

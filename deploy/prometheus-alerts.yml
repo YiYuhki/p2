@@ -65,3 +65,19 @@ groups:
         labels: { severity: info }
         annotations:
           summary: "External tool {{ $labels.tool }} p95 runtime is high"
+
+      - alert: SecmailTLSCertExpiringSoon
+        expr: secmail_tls_cert_expiry_timestamp_seconds - time() < 14 * 24 * 3600
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.component }} TLS certificate expires in under 14 days"
+          description: "Renew the serving certificate before it breaks STARTTLS/HTTPS."
+
+      - alert: SecmailTLSCertExpired
+        expr: secmail_tls_cert_expiry_timestamp_seconds - time() < 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.component }} TLS certificate has expired"
+          description: "STARTTLS/HTTPS for this component is now serving an expired certificate."

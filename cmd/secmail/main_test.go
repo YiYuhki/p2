@@ -2,14 +2,48 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"io"
 	"log/slog"
+	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestCertExpiry(t *testing.T) {
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	want := time.Now().Add(42 * 24 * time.Hour).UTC().Truncate(time.Second)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     want,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := filepath.Join(t.TempDir(), "cert.pem")
+	os.WriteFile(f, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600)
+
+	got, err := certExpiry(f)
+	if err != nil {
+		t.Fatalf("certExpiry: %v", err)
+	}
+	if !got.Equal(want) {
+		t.Fatalf("expiry = %v, want %v", got, want)
+	}
+	if _, err := certExpiry(filepath.Join(t.TempDir(), "missing.pem")); err == nil {
+		t.Fatal("missing file should error")
+	}
+}
 
 func quietLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
