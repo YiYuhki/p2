@@ -499,3 +499,65 @@ func TestDMARCEnforceOffRelays(t *testing.T) {
 		t.Fatal("A-R should record dmarc=fail")
 	}
 }
+
+// deferAlways / allowAlways implement Greylister for the greylist gate test.
+type deferAlways struct{}
+
+func (deferAlways) Allow(_, _, _ string) bool { return false }
+
+type allowAlways struct{}
+
+func (allowAlways) Allow(_, _, _ string) bool { return true }
+
+func greylistHarness(t *testing.T, gl Greylister) string {
+	t.Helper()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	up := &upstream{}
+	upAddr := serve(t, up)
+	be := NewBackend(passthroughProc{}, BackendOptions{
+		RecipientDomains: []string{"example.com"},
+		Upstream:         UpstreamOptions{Addr: upAddr, Timeout: 5 * time.Second},
+		Greylist:         gl,
+	}, log)
+	return serve(t, be)
+}
+
+// passthroughProc relays unchanged (keeps the greylist test focused on RCPT).
+type passthroughProc struct{}
+
+func (passthroughProc) Process(_ context.Context, _ Envelope, raw []byte) ([]byte, error) {
+	return raw, nil
+}
+
+func TestGreylistDefersFirstAttempt(t *testing.T) {
+	addr := greylistHarness(t, deferAlways{})
+	c, err := smtp.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.Mail("sender@ext.org", nil); err != nil {
+		t.Fatalf("MAIL: %v", err)
+	}
+	err = c.Rcpt("user@example.com", nil)
+	if err == nil {
+		t.Fatal("greylisted recipient should be deferred")
+	}
+	var se *smtp.SMTPError
+	if !errors.As(err, &se) || se.Code != 451 {
+		t.Fatalf("want 451, got %v", err)
+	}
+}
+
+func TestGreylistAllowsRelays(t *testing.T) {
+	addr := greylistHarness(t, allowAlways{})
+	c, err := smtp.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.SendMail("sender@ext.org", []string{"user@example.com"},
+		strings.NewReader("From: s@ext.org\r\nTo: user@example.com\r\n\r\nhi\r\n")); err != nil {
+		t.Fatalf("allowed mail should relay: %v", err)
+	}
+}

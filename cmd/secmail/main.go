@@ -40,6 +40,7 @@ import (
 	"github.com/yiyuhki/p2/internal/dmarc"
 	"github.com/yiyuhki/p2/internal/dnsbl"
 	"github.com/yiyuhki/p2/internal/gateway"
+	"github.com/yiyuhki/p2/internal/greylist"
 	"github.com/yiyuhki/p2/internal/internalapi"
 	"github.com/yiyuhki/p2/internal/metrics"
 	"github.com/yiyuhki/p2/internal/mimeproc"
@@ -376,6 +377,16 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			beOpts.ConnGate = dnsblGate{bl: bl}
 			log.Info("dnsbl enabled", "zones", cfg.DNSBL.Zones)
 		}
+		if cfg.Greylist.Enabled {
+			gl := greylist.New(cfg.Greylist.Delay, cfg.Greylist.Expiry)
+			beOpts.Greylist = gl
+			log.Info("greylisting enabled", "delay", cfg.Greylist.Delay, "expiry", cfg.Greylist.Expiry)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				sweepEvery(ctx, time.Hour, gl.Sweep)
+			}()
+		}
 		be := gateway.NewBackend(proc, beOpts, log)
 		var tlsConf *tls.Config
 		if cfg.SMTP.TLSCertFile != "" {
@@ -598,6 +609,20 @@ func startSMTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, p smtpP
 		}
 	}()
 	return srv.Shutdown, nil
+}
+
+// sweepEvery calls fn immediately and then every interval until ctx is done.
+func sweepEvery(ctx context.Context, interval time.Duration, fn func()) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			fn()
+		}
+	}
 }
 
 // watchCertExpiry reads the leaf certificate from certFile and publishes its
