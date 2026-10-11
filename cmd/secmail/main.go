@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
@@ -37,6 +38,7 @@ import (
 	"github.com/yiyuhki/p2/internal/dkimutil"
 	"github.com/yiyuhki/p2/internal/dlp"
 	"github.com/yiyuhki/p2/internal/dmarc"
+	"github.com/yiyuhki/p2/internal/dnsbl"
 	"github.com/yiyuhki/p2/internal/gateway"
 	"github.com/yiyuhki/p2/internal/internalapi"
 	"github.com/yiyuhki/p2/internal/metrics"
@@ -366,10 +368,15 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			SPF:           spfChecker,
 			DMARC:         dmarcEval,
 		}, log)
-		be := gateway.NewBackend(proc, gateway.BackendOptions{
+		beOpts := gateway.BackendOptions{
 			RecipientDomains: cfg.SMTP.AcceptedDomains,
 			Upstream:         upstreamOpts(cfg),
-		}, log)
+		}
+		if bl := dnsbl.New(cfg.DNSBL.Zones, cfg.DNSBL.Timeout, nil, log); bl != nil {
+			beOpts.ConnGate = dnsblGate{bl: bl}
+			log.Info("dnsbl enabled", "zones", cfg.DNSBL.Zones)
+		}
+		be := gateway.NewBackend(proc, beOpts, log)
 		var tlsConf *tls.Config
 		if cfg.SMTP.TLSCertFile != "" {
 			cert, err := tls.LoadX509KeyPair(cfg.SMTP.TLSCertFile, cfg.SMTP.TLSKeyFile)
@@ -671,6 +678,18 @@ func serveHTTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, name, a
 		}
 	}()
 	return srv.Shutdown
+}
+
+// dnsblGate adapts a dnsbl.Checker to gateway.ConnGate: a listed client IP is
+// refused with 554, matching how other access-denied conditions reply.
+type dnsblGate struct{ bl *dnsbl.Checker }
+
+func (g dnsblGate) Gate(ctx context.Context, ip netip.Addr) *smtp.SMTPError {
+	if listed, zone := g.bl.Listed(ctx, ip); listed {
+		return &smtp.SMTPError{Code: 554, EnhancedCode: smtp.EnhancedCode{5, 7, 1},
+			Message: "Client host [" + ip.String() + "] blocked by " + zone}
+	}
+	return nil
 }
 
 // validateConfig loads and validates a config file without starting any

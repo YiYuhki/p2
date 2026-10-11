@@ -61,6 +61,16 @@ dmarc:
   # dkim verify_inbound. With enforce=false the gateway only records the result (the internal
   # mail server decides); enforce=true hard-rejects p=reject failures at the gateway.
 
+dnsbl:                           # optional: refuse inbound connections from listed client IPs
+  zones: []                      # e.g. [zen.spamhaus.org, bl.spamcop.net]; empty disables
+  timeout: 3s                    # per-zone DNS lookup budget
+  # Loopback/private clients are never queried. A listed IP is refused with 554 before MAIL.
+
+greylist:                        # optional: defer first delivery from an unseen (ip, from, rcpt) triplet
+  enabled: false
+  delay: 1m                      # retries sooner than this are deferred (451); legit MTAs retry
+  expiry: 36h                    # how long a triplet that passed is remembered
+
 portal:
   listen: ":8080"
   public_base_url: https://sec-mail.example.com   # used in the links inserted into mail

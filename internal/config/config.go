@@ -33,6 +33,24 @@ type Config struct {
 	Outbound    OutboundConfig    `yaml:"outbound"`
 	DLP         DLPConfig         `yaml:"dlp"`
 	Webhook     WebhookConfig     `yaml:"webhook"`
+	DNSBL       DNSBLConfig       `yaml:"dnsbl"`
+	Greylist    GreylistConfig    `yaml:"greylist"`
+}
+
+// DNSBLConfig rejects inbound connections whose client IP is on a DNS block
+// list. Disabled when Zones is empty.
+type DNSBLConfig struct {
+	Zones   []string      `yaml:"zones"`   // e.g. ["zen.spamhaus.org", "bl.spamcop.net"]
+	Timeout time.Duration `yaml:"timeout"` // per-lookup timeout (default 3s)
+}
+
+// GreylistConfig temporarily defers (451) the first delivery attempt for an
+// unseen (client, sender, recipient) triplet and accepts it on a retry after
+// Delay. Disabled unless Enabled.
+type GreylistConfig struct {
+	Enabled bool          `yaml:"enabled"`
+	Delay   time.Duration `yaml:"delay"`  // min wait before a retry is accepted (default 1m)
+	Expiry  time.Duration `yaml:"expiry"` // how long a passed triplet is remembered (default 36h)
 }
 
 // WebhookConfig posts security events (DLP decisions, malware verdicts) to an

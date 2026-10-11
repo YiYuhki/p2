@@ -39,6 +39,13 @@ type MessageProcessor interface {
 // gets 250 but nothing is relayed now.
 var ErrHeld = errors.New("message held")
 
+// ConnGate decides whether to accept a connection from the given client IP. A
+// non-nil return (ideally an *smtp.SMTPError) rejects the connection before any
+// command is processed. Used for DNSBL blocking.
+type ConnGate interface {
+	Gate(ctx context.Context, ip netip.Addr) *smtp.SMTPError
+}
+
 type BackendOptions struct {
 	// RecipientDomains restricts RCPT TO (inbound: our domains). Empty = any.
 	RecipientDomains []string
@@ -49,6 +56,9 @@ type BackendOptions struct {
 	Upstream       UpstreamOptions
 	// Name labels log lines ("inbound" / "outbound").
 	Name string
+	// ConnGate, if set, is consulted at connection time (e.g. DNSBL). nil
+	// disables it.
+	ConnGate ConnGate
 }
 
 type Backend struct {
@@ -75,6 +85,16 @@ func (b *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	if len(b.opts.AllowedClients) > 0 && !b.clientAllowed(s.remote) {
 		b.log.Warn("connection from unauthorised client refused", "remote", s.remote)
 		return nil, errClientDenied
+	}
+	if b.opts.ConnGate != nil {
+		if ap, err := netip.ParseAddrPort(s.remote); err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if serr := b.opts.ConnGate.Gate(ctx, ap.Addr().Unmap()); serr != nil {
+				b.log.Warn("connection refused by gate", "remote", s.remote, "reply", serr.Message)
+				return nil, serr
+			}
+		}
 	}
 	return s, nil
 }

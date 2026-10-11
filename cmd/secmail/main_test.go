@@ -11,11 +11,35 @@ import (
 	"io"
 	"log/slog"
 	"math/big"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/yiyuhki/p2/internal/dnsbl"
 )
+
+type blResolver struct{ hit string }
+
+func (r blResolver) LookupHost(_ context.Context, host string) ([]string, error) {
+	if host == r.hit {
+		return []string{"127.0.0.2"}, nil
+	}
+	return nil, errors.New("no such host")
+}
+
+func TestDNSBLGate(t *testing.T) {
+	// 192.0.2.66 -> 66.2.0.192.bl.example
+	bl := dnsbl.New([]string{"bl.example"}, time.Second, blResolver{hit: "66.2.0.192.bl.example"}, quietLog())
+	g := dnsblGate{bl: bl}
+	if serr := g.Gate(context.Background(), netip.MustParseAddr("192.0.2.66")); serr == nil || serr.Code != 554 {
+		t.Fatalf("listed IP should be refused 554, got %v", serr)
+	}
+	if serr := g.Gate(context.Background(), netip.MustParseAddr("192.0.2.67")); serr != nil {
+		t.Fatalf("unlisted IP should pass, got %v", serr)
+	}
+}
 
 func TestCertExpiry(t *testing.T) {
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
