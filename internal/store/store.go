@@ -57,6 +57,11 @@ type Store interface {
 	// cutoff and returns how many rows were removed in total. Used for audit-log
 	// retention.
 	PruneAuditEvents(ctx context.Context, cutoff time.Time) (int64, error)
+
+	// RecordAdminAction appends an admin audit record (hold decision, export,
+	// login). ListAdminActions returns them newest-first with keyset paging.
+	RecordAdminAction(ctx context.Context, a model.AdminAction) error
+	ListAdminActions(ctx context.Context, limit int, page Page) ([]model.AdminAction, error)
 	Close()
 }
 

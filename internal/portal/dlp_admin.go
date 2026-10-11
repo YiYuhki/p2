@@ -32,19 +32,34 @@ import (
 // because in "none" mode there is no identity to check against DLPAdmins and the
 // dashboard would expose every held message to anyone who reached the URL.
 
-// adminGuard restricts access to the configured DLP admins.
+// adminGuard restricts access to the configured DLP admins (full control:
+// release/reject). Used for state-changing endpoints.
 func (s *Server) adminGuard() guard {
 	return guard{
-		base: "/dlp/admin",
-		eligible: func(_ context.Context, u string) (bool, error) {
-			for _, a := range s.opts.DLPAdmins {
-				if NormalizeEmail(a) == u {
-					return true, nil
-				}
+		base:     "/dlp/admin",
+		eligible: s.eligibleFrom(s.opts.DLPAdmins),
+		logID:    "dlp-admin",
+	}
+}
+
+// viewerGuard restricts read-only endpoints (list, events, export, audit, the
+// dashboard page) to DLP admins OR auditors — the read-only compliance role.
+func (s *Server) viewerGuard() guard {
+	return guard{
+		base:     "/dlp/admin",
+		eligible: s.eligibleFrom(append(append([]string{}, s.opts.DLPAdmins...), s.opts.DLPAuditors...)),
+		logID:    "dlp-admin",
+	}
+}
+
+func (s *Server) eligibleFrom(allowed []string) func(context.Context, string) (bool, error) {
+	return func(_ context.Context, u string) (bool, error) {
+		for _, a := range allowed {
+			if NormalizeEmail(a) == u {
+				return true, nil
 			}
-			return false, nil
-		},
-		logID: "dlp-admin",
+		}
+		return false, nil
 	}
 }
 
@@ -76,7 +91,7 @@ func (s *Server) adminHolds(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many requests"})
 		return
 	}
-	if _, ok := s.authorizeGuard(w, r, s.adminGuard(), true); !ok {
+	if _, ok := s.authorizeGuard(w, r, s.viewerGuard(), true); !ok {
 		return
 	}
 	status := model.HoldStatus(strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("status"))))
@@ -134,7 +149,7 @@ func (s *Server) adminEvents(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many requests"})
 		return
 	}
-	if _, ok := s.authorizeGuard(w, r, s.adminGuard(), true); !ok {
+	if _, ok := s.authorizeGuard(w, r, s.viewerGuard(), true); !ok {
 		return
 	}
 	const limit = 50
@@ -163,6 +178,54 @@ func (s *Server) adminEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+type adminAuditJSON struct {
+	ID     string `json:"id"`
+	At     string `json:"at"`
+	Actor  string `json:"actor"`
+	Action string `json:"action"`
+	Target string `json:"target,omitempty"`
+	Detail string `json:"detail,omitempty"`
+	Source string `json:"source,omitempty"`
+	Result string `json:"result,omitempty"`
+}
+
+// adminAudit serves the admin-action audit trail (release/reject/export/login),
+// newest first with cursor paging. Read-only: auditors and admins.
+func (s *Server) adminAudit(w http.ResponseWriter, r *http.Request) {
+	if s.adminAuthDisabled() {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "admin dashboard requires recipient auth"})
+		return
+	}
+	if !s.limiter.Allow(r) {
+		w.Header().Set("Retry-After", "5")
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many requests"})
+		return
+	}
+	if _, ok := s.authorizeGuard(w, r, s.viewerGuard(), true); !ok {
+		return
+	}
+	const limit = 50
+	acts, err := s.store.ListAdminActions(r.Context(), limit, decodeHoldCursor(r.URL.Query().Get("cursor")))
+	if err != nil {
+		s.log.Error("portal: admin list audit", "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	out := make([]adminAuditJSON, 0, len(acts))
+	for _, a := range acts {
+		out = append(out, adminAuditJSON{
+			ID: a.ID, At: a.At.In(s.opts.Location).Format("2006-01-02 15:04"), Actor: a.Actor,
+			Action: a.Action, Target: a.Target, Detail: a.Detail, Source: a.Source, Result: a.Result,
+		})
+	}
+	resp := map[string]any{"actions": out}
+	if len(acts) == limit {
+		last := acts[len(acts)-1]
+		resp["next"] = encodeHoldCursor(last.At, last.ID)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 // csvSafe neutralizes spreadsheet formula injection (CWE-1236). encoding/csv
 // quotes commas/quotes/newlines but leaves a leading =, +, -, @, tab or CR
 // intact, so a mail field like `=HYPERLINK(...)` would run as a formula when an
@@ -186,7 +249,8 @@ func (s *Server) adminExport(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if _, ok := s.authorizeGuard(w, r, s.adminGuard(), true); !ok {
+	user, ok := s.authorizeGuard(w, r, s.viewerGuard(), true)
+	if !ok {
 		return
 	}
 	kind := r.URL.Query().Get("kind")
@@ -194,6 +258,7 @@ func (s *Server) adminExport(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "kind must be holds or events"})
 		return
 	}
+	s.recordAdmin(r.Context(), user, "export", kind, kind, "ok")
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="dlp-`+kind+`.csv"`)
 	cw := csv.NewWriter(w)
@@ -264,11 +329,14 @@ func (s *Server) adminDecide(release bool) http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad id"})
 			return
 		}
+		action := "release"
+		reason := ""
 		var err error
 		if release {
 			err = s.opts.Holds.Release(r.Context(), id, user)
 		} else {
-			reason := strings.TrimSpace(r.PostFormValue("reason"))
+			action = "reject"
+			reason = strings.TrimSpace(r.PostFormValue("reason"))
 			if len(reason) > 300 {
 				reason = reason[:300]
 			}
@@ -280,16 +348,35 @@ func (s *Server) adminDecide(release bool) http.HandlerFunc {
 			if !release {
 				st = model.HoldRejected
 			}
+			s.recordAdmin(r.Context(), user, action, id, reason, "ok")
 			s.log.Info("portal: admin hold decision", "hold", id, "by", user, "status", st)
 			writeJSON(w, http.StatusOK, map[string]string{"status": string(st)})
 		case errors.Is(err, store.ErrConflict):
+			s.recordAdmin(r.Context(), user, action, id, reason, "conflict")
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "already decided"})
 		case errors.Is(err, store.ErrNotFound):
+			s.recordAdmin(r.Context(), user, action, id, reason, "notfound")
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		default:
+			s.recordAdmin(r.Context(), user, action, id, reason, "error")
 			s.log.Error("portal: admin hold decision failed", "hold", id, "err", err)
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "decision failed"})
 		}
+	}
+}
+
+// recordAdmin appends an admin-action audit record (best-effort: a store
+// failure is logged, never blocks the response).
+func (s *Server) recordAdmin(ctx context.Context, actor, action, target, detail, result string) {
+	if len(detail) > 300 {
+		detail = detail[:300]
+	}
+	err := s.store.RecordAdminAction(ctx, model.AdminAction{
+		ID: uuid.NewString(), At: time.Now().UTC(), Actor: actor,
+		Action: action, Target: target, Detail: detail, Source: "portal", Result: result,
+	})
+	if err != nil {
+		s.log.Warn("portal: admin audit record failed", "action", action, "err", err)
 	}
 }
 
@@ -299,7 +386,18 @@ func (s *Server) adminAuth(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	s.otpLogin(w, r, s.adminGuard())
+	s.otpLogin(w, r, s.viewerGuard())
+}
+
+// isFullAdmin reports whether user has release/reject rights (vs read-only
+// auditor access).
+func (s *Server) isFullAdmin(user string) bool {
+	for _, a := range s.opts.DLPAdmins {
+		if NormalizeEmail(a) == user {
+			return true
+		}
+	}
+	return false
 }
 
 // adminLogout clears the session and returns to the dashboard.
@@ -313,17 +411,17 @@ func (s *Server) adminDashboard(w http.ResponseWriter, r *http.Request) {
 	n := nonce()
 	user := ""
 	if s.adminAuthDisabled() {
-		s.renderAdmin(w, http.StatusOK, n, "", true)
+		s.renderAdmin(w, http.StatusOK, n, "", true, false)
 		return
 	}
 	var ok bool
-	if user, ok = s.authorizeGuard(w, r, s.adminGuard(), false); !ok {
+	if user, ok = s.authorizeGuard(w, r, s.viewerGuard(), false); !ok {
 		return // the guard rendered the login/forbidden page
 	}
-	s.renderAdmin(w, http.StatusOK, n, user, false)
+	s.renderAdmin(w, http.StatusOK, n, user, false, s.isFullAdmin(user))
 }
 
-func (s *Server) renderAdmin(w http.ResponseWriter, code int, nonce, user string, disabled bool) {
+func (s *Server) renderAdmin(w http.ResponseWriter, code int, nonce, user string, disabled, canDecide bool) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Security-Policy",
 		"default-src 'none'; style-src 'nonce-"+nonce+"'; script-src 'nonce-"+nonce+"'; "+
@@ -333,7 +431,8 @@ func (s *Server) renderAdmin(w http.ResponseWriter, code int, nonce, user string
 		Nonce, User string
 		Disabled    bool
 		CanLogout   bool
-	}{Nonce: nonce, User: user, Disabled: disabled, CanLogout: user != "" && s.opts.Auth.Mode == config.AuthOTP}
+		CanDecide   bool
+	}{Nonce: nonce, User: user, Disabled: disabled, CanLogout: user != "" && s.opts.Auth.Mode == config.AuthOTP, CanDecide: canDecide}
 	if err := tmpl.ExecuteTemplate(w, "dlp_admin.html", d); err != nil {
 		s.log.Error("portal: render admin", "err", err)
 	}

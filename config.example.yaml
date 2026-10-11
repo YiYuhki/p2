@@ -184,6 +184,7 @@ dlp:
   combine_bulk: 20                 # >= this many records of a single type in one place -> high
   notify_sender: true
   admins: [security@example.com]   # receive notices; approve/reject holds on the portal
+  auditors: []                     # read-only dashboard role: view/export holds, events, audit log; cannot release/reject
   notify_from: dlp-noreply@example.com
   hold_ttl: 72h                    # undecided holds are discarded (not sent) after this
   ocr:                             # read text in images: screenshots, photos, scanned PDFs,

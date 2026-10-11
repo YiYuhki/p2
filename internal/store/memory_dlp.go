@@ -140,6 +140,29 @@ func (s *Memory) PruneAuditEvents(_ context.Context, cutoff time.Time) (int64, e
 	return n, nil
 }
 
+func (s *Memory) RecordAdminAction(_ context.Context, a model.AdminAction) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.adminActions = append(s.adminActions, a)
+	return nil
+}
+
+func (s *Memory) ListAdminActions(_ context.Context, limit int, page Page) ([]model.AdminAction, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var all []model.AdminAction
+	for _, a := range s.adminActions {
+		if afterCursor(a.At, a.ID, page) {
+			all = append(all, a)
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return beforeKey(all[i].At, all[i].ID, all[j].At, all[j].ID) })
+	if len(all) > limit {
+		all = all[:limit]
+	}
+	return all, nil
+}
+
 func (s *Memory) ListDLPEvents(_ context.Context, f EventFilter, limit int, page Page) ([]*model.DLPEvent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -166,7 +166,10 @@ type DLPConfig struct {
 	NotifySender    bool       `yaml:"notify_sender"`
 	// Admins receive notices and review holds (and must be the logged-in
 	// user on the review page when portal.auth is enabled).
-	Admins     []string      `yaml:"admins"`
+	Admins []string `yaml:"admins"`
+	// Auditors get read-only dashboard access (view/export holds, events and the
+	// audit log) but cannot release or reject. Admins implicitly have this too.
+	Auditors   []string      `yaml:"auditors"`
 	NotifyFrom string        `yaml:"notify_from"`
 	HoldTTL    time.Duration `yaml:"hold_ttl"`
 	// Disabled built-in detector IDs; MinCounts overrides bulk thresholds.

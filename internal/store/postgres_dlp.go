@@ -121,6 +121,39 @@ func (p *Postgres) RecordDLPEvent(ctx context.Context, ev *model.DLPEvent) error
 	return err
 }
 
+func (p *Postgres) RecordAdminAction(ctx context.Context, a model.AdminAction) error {
+	_, err := p.pool.Exec(ctx, `INSERT INTO admin_actions
+		(id, at, actor, action, target, detail, source, result)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		a.ID, a.At, a.Actor, a.Action, a.Target, a.Detail, a.Source, a.Result)
+	return err
+}
+
+func (p *Postgres) ListAdminActions(ctx context.Context, limit int, page Page) ([]model.AdminAction, error) {
+	var args []any
+	arg := func(v any) string { args = append(args, v); return "$" + strconv.Itoa(len(args)) }
+	q := `SELECT id, at, actor, action, target, detail, source, result FROM admin_actions`
+	if page.Set() {
+		bt, bid := arg(page.Before), arg(page.BeforeID)
+		q += " WHERE (at < " + bt + " OR (at = " + bt + " AND id < " + bid + "))"
+	}
+	q += " ORDER BY at DESC, id DESC LIMIT " + arg(limit)
+	rows, err := p.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.AdminAction
+	for rows.Next() {
+		var a model.AdminAction
+		if err := rows.Scan(&a.ID, &a.At, &a.Actor, &a.Action, &a.Target, &a.Detail, &a.Source, &a.Result); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 func (p *Postgres) ListDLPEvents(ctx context.Context, f EventFilter, limit int, page Page) ([]*model.DLPEvent, error) {
 	const cols = `id, mail_from, rcpt_to, subject, action, severity, findings, COALESCE(hold_id::text, ''), at`
 	var args []any

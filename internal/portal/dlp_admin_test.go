@@ -46,6 +46,76 @@ func adminFixture(t *testing.T, auth AuthOptions) (string, *fakeReviewer, *fakeM
 	return srv.URL, rv, m, ids
 }
 
+// rolesFixture builds a dashboard with a full admin and a read-only auditor.
+func rolesFixture(t *testing.T) (string, *fakeReviewer, *fakeMailer, []string) {
+	t.Helper()
+	st := store.NewMemory()
+	obj, _ := storage.NewFS(t.TempDir())
+	var ids []string
+	base := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < 2; i++ {
+		id := "00000000-0000-0000-0000-00000000000" + string(rune('a'+i))
+		ids = append(ids, id)
+		st.CreateHold(context.Background(), &model.Hold{ID: id, TokenHash: "tok" + id,
+			MailFrom: "kim@example.com", RcptTo: []string{"p@ext.org"}, Subject: "s", Findings: []byte(`{}`),
+			Status: model.HoldHeld, CreatedAt: base.Add(time.Duration(i) * time.Minute), ExpiresAt: base.Add(time.Hour)})
+	}
+	rv := &fakeReviewer{st: st}
+	m := &fakeMailer{codes: map[string]string{}}
+	auth := AuthOptions{Mode: "otp", SessionSecret: []byte("0123456789abcdef0123456789abcdef"),
+		SessionTTL: time.Hour, OTPTTL: time.Minute, OTPMaxAttempts: 3, OTPResendAfter: time.Minute}
+	p := New(st, obj, NewMemoryTickets(), Options{RateLimitRPS: 1000, RateLimitBurst: 1000, Auth: auth,
+		Codes: NewMemoryCodes(), Mailer: m, Holds: rv,
+		DLPAdmins: []string{"admin@example.com"}, DLPAuditors: []string{"auditor@example.com"}},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := httptest.NewServer(p.Handler())
+	t.Cleanup(srv.Close)
+	return srv.URL, rv, m, ids
+}
+
+func TestAdminAuditorIsReadOnly(t *testing.T) {
+	base, _, m, ids := rolesFixture(t)
+	c := browser(t)
+	adminLogin(t, c, base, "auditor@example.com", m)
+
+	// Auditor can list holds (read).
+	if resp, _ := fetch(t, c, "GET", base+"/dlp/admin/holds?status=HELD", nil); resp.StatusCode != 200 {
+		t.Fatalf("auditor list holds = %d, want 200", resp.StatusCode)
+	}
+	// Auditor can export (read).
+	if resp, _ := fetch(t, c, "GET", base+"/dlp/admin/export?kind=holds", nil); resp.StatusCode != 200 {
+		t.Fatalf("auditor export = %d, want 200", resp.StatusCode)
+	}
+	// Auditor cannot release (write) — forbidden.
+	resp, _ := fetch(t, c, "POST", base+"/dlp/admin/holds/"+ids[0]+"/release", url.Values{})
+	if resp.StatusCode == 200 {
+		t.Fatal("auditor must not be able to release a hold")
+	}
+	// The dashboard shell for an auditor must not render the bulk action buttons.
+	_, body := fetch(t, c, "GET", base+"/dlp/admin", nil)
+	if strings.Contains(body, `id="bulkRelease"`) {
+		t.Fatal("auditor dashboard should hide bulk action buttons")
+	}
+}
+
+func TestAdminActionAudited(t *testing.T) {
+	base, _, m, ids := rolesFixture(t)
+	c := browser(t)
+	adminLogin(t, c, base, "admin@example.com", m)
+
+	if resp, _ := fetch(t, c, "POST", base+"/dlp/admin/holds/"+ids[0]+"/release", url.Values{}); resp.StatusCode != 200 {
+		t.Fatalf("admin release = %d, want 200", resp.StatusCode)
+	}
+	resp, body := fetch(t, c, "GET", base+"/dlp/admin/audit", nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("audit list = %d\n%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, `"action":"release"`) || !strings.Contains(body, `"actor":"admin@example.com"`) ||
+		!strings.Contains(body, ids[0]) || !strings.Contains(body, `"result":"ok"`) {
+		t.Fatalf("audit record missing fields:\n%s", body)
+	}
+}
+
 func TestAdminDashboardDisabledWithoutAuth(t *testing.T) {
 	url0, _, _, _ := adminFixture(t, AuthOptions{Mode: "none"})
 	c := browser(t)

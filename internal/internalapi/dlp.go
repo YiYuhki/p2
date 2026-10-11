@@ -47,6 +47,7 @@ func (a *API) mountDLP(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/v1/dlp/holds/{id}/release", a.admin(a.decide(true)))
 	mux.HandleFunc("POST /internal/v1/dlp/holds/{id}/reject", a.admin(a.decide(false)))
 	mux.HandleFunc("GET /internal/v1/dlp/events", a.admin(a.listEvents))
+	mux.HandleFunc("GET /internal/v1/dlp/audit", a.admin(a.listAudit))
 	mux.HandleFunc("POST /internal/v1/dlp/rules/test", a.admin(a.testRule))
 	if _, ok := a.holds.(PolicyViewer); ok {
 		mux.HandleFunc("GET /internal/v1/dlp/policy", a.admin(a.dlpPolicy))
@@ -223,23 +224,63 @@ func (a *API) decide(release bool) http.HandlerFunc {
 		if body.By == "" {
 			body.By = "admin-api"
 		}
+		action := "release"
 		var err error
 		if release {
 			err = a.holds.Release(r.Context(), id, body.By)
 		} else {
+			action = "reject"
 			err = a.holds.Reject(r.Context(), id, body.By, body.Reason)
 		}
 		switch {
 		case err == nil:
+			a.recordAdmin(r.Context(), body.By, action, id, body.Reason, "ok")
 			writeJSON(w, http.StatusOK, map[string]string{"result": "ok"})
 		case errors.Is(err, store.ErrNotFound):
+			a.recordAdmin(r.Context(), body.By, action, id, body.Reason, "notfound")
 			writeJSON(w, http.StatusNotFound, errBody("not found"))
 		case errors.Is(err, store.ErrConflict):
+			a.recordAdmin(r.Context(), body.By, action, id, body.Reason, "conflict")
 			writeJSON(w, http.StatusConflict, errBody("hold already decided"))
 		default:
+			a.recordAdmin(r.Context(), body.By, action, id, body.Reason, "error")
 			a.log.Error("internalapi: hold decision", "hold", id, "err", err)
 			writeJSON(w, http.StatusBadGateway, errBody(err.Error()))
 		}
+	}
+}
+
+// listAudit returns the admin-action audit trail, newest first, with the same
+// opaque cursor as the events list.
+func (a *API) listAudit(w http.ResponseWriter, r *http.Request) {
+	limit := limitParam(r, 100)
+	page, _ := decodeCursor(r.URL.Query().Get("cursor"))
+	acts, err := a.store.ListAdminActions(r.Context(), limit, page)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errBody("internal error"))
+		return
+	}
+	if len(acts) == limit {
+		last := acts[len(acts)-1]
+		w.Header().Set("X-Next-Cursor", encodeCursor(last.At, last.ID, store.EventFilter{}))
+	}
+	writeJSON(w, http.StatusOK, acts)
+}
+
+// recordAdmin appends an admin-action audit record (best-effort).
+func (a *API) recordAdmin(ctx context.Context, actor, action, target, detail, result string) {
+	if actor == "" {
+		actor = "admin-api"
+	}
+	if len(detail) > 300 {
+		detail = detail[:300]
+	}
+	err := a.store.RecordAdminAction(ctx, model.AdminAction{
+		ID: uuid.NewString(), At: time.Now().UTC(), Actor: actor,
+		Action: action, Target: target, Detail: detail, Source: "api", Result: result,
+	})
+	if err != nil {
+		a.log.Warn("internalapi: admin audit record failed", "action", action, "err", err)
 	}
 }
 

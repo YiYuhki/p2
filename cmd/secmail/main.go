@@ -453,10 +453,11 @@ func run(cfgPath, components string, log *slog.Logger) error {
 				OTPResendAfter:   cfg.Portal.Auth.OTPResendAfter,
 				SecureCookie:     strings.HasPrefix(cfg.Portal.PublicBaseURL, "https://"),
 			},
-			Codes:     codes,
-			Mailer:    portal.NewSMTPMailer(upstreamOpts(cfg), cfg.Portal.Auth.OTPFrom),
-			Holds:     holdReviewer(outSvc),
-			DLPAdmins: cfg.DLP.Admins,
+			Codes:       codes,
+			Mailer:      portal.NewSMTPMailer(upstreamOpts(cfg), cfg.Portal.Auth.OTPFrom),
+			Holds:       holdReviewer(outSvc),
+			DLPAdmins:   cfg.DLP.Admins,
+			DLPAuditors: cfg.DLP.Auditors,
 		}, log)
 		log.Info("portal recipient authentication", "mode", cfg.Portal.Auth.Mode)
 		shutdowns = append(shutdowns, serveHTTP(&wg, errCh, log, "portal", cfg.Portal.Listen, p.Handler(), cfg.Portal.TLSCertFile, cfg.Portal.TLSKeyFile))

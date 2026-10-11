@@ -32,10 +32,12 @@
       <a id="hexport" class="btnlink" href="#">CSV 내보내기</a>
       <span class="count" id="hcount"></span>
     </div>
+    {{if .CanDecide}}
     <div class="bulk" id="hbulk" hidden>
       <button id="bulkRelease" type="button">선택 승인</button>
       <button id="bulkReject" class="danger" type="button">선택 반려</button>
     </div>
+    {{end}}
     <table class="holds">
       <thead><tr><th><input type="checkbox" id="hall" aria-label="전체 선택"></th>
         <th>접수</th><th>발신</th><th>수신</th><th>제목</th><th>탐지</th><th>상태</th><th></th></tr></thead>
@@ -74,6 +76,7 @@
   {{end}}
   <script nonce="{{.Nonce}}">
   (function () {
+    var canDecide = {{if .CanDecide}}true{{else}}false{{end}};
     var SEV = { high: '높음', medium: '중간', low: '낮음' };
     var STATUS = { HELD: '검토 대기', RELEASED: '승인됨', REJECTED: '반려됨', EXPIRED: '만료' };
     var ACTION = { block: '차단', hold: '보류', notify: '알림', allow: '허용', exempt: '예외' };
@@ -89,7 +92,7 @@
       var tr = document.createElement('tr'); tr.dataset.id = h.id;
       if (h.status !== 'HELD') tr.className = 'decided';
       var cbTd = document.createElement('td');
-      if (h.status === 'HELD') {
+      if (h.status === 'HELD' && canDecide) {
         var cb = document.createElement('input'); cb.type = 'checkbox'; cb.className = 'sel';
         cbTd.appendChild(cb);
       }
@@ -101,7 +104,7 @@
       var pill = document.createElement('span'); pill.className = 'pill ' + h.status;
       pill.textContent = STATUS[h.status] || h.status; st.appendChild(pill); tr.appendChild(st);
       var act = document.createElement('td');
-      if (h.status === 'HELD') {
+      if (h.status === 'HELD' && canDecide) {
         var box = document.createElement('div'); box.className = 'acts';
         var rel = document.createElement('button'); rel.textContent = '승인';
         rel.addEventListener('click', function () { decide(tr, h.id, 'release'); });
@@ -150,7 +153,7 @@
           (j.holds || []).forEach(renderHold);
           hcursor = j.next || null; $('hmore').hidden = !hcursor;
           $('hempty').hidden = hrows.children.length > 0;
-          $('hbulk').hidden = hrows.querySelectorAll('.sel').length === 0;
+          if (canDecide) $('hbulk').hidden = hrows.querySelectorAll('.sel').length === 0;
           $('hcount').textContent = hrows.children.length + '건 표시';
           hloading = false;
         }).catch(function () { hloading = false; });
@@ -191,8 +194,10 @@
     $('hall').addEventListener('change', function () {
       hrows.querySelectorAll('.sel').forEach(function (c) { c.checked = $('hall').checked; });
     });
-    $('bulkRelease').addEventListener('click', function () { bulk('release'); });
-    $('bulkReject').addEventListener('click', function () { bulk('reject'); });
+    if (canDecide) {
+      $('bulkRelease').addEventListener('click', function () { bulk('release'); });
+      $('bulkReject').addEventListener('click', function () { bulk('reject'); });
+    }
     $('eaction').addEventListener('change', function () { loadEvents(true); syncExports(); });
     $('eseverity').addEventListener('change', function () { loadEvents(true); syncExports(); });
     $('emore').addEventListener('click', function () { loadEvents(false); });

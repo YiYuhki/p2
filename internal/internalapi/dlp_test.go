@@ -58,6 +58,12 @@ func TestDLPAdminAPI(t *testing.T) {
 	if code, _ = do(t, "POST", base+"/holds/"+id+"/reject", admin, `{"by":"sec","reason":"no"}`); code != 200 {
 		t.Fatalf("reject: %d", code)
 	}
+	// The reject is recorded in the admin audit trail (actor, action, source).
+	if code, body = do(t, "GET", base+"/audit", admin, ""); code != 200 ||
+		!strings.Contains(body, `"Action":"reject"`) || !strings.Contains(body, `"Actor":"sec"`) ||
+		!strings.Contains(body, `"Source":"api"`) {
+		t.Fatalf("audit: %d %s", code, body)
+	}
 	if code, _ = do(t, "POST", base+"/holds/"+id+"/release", admin, `{}`); code != 409 {
 		t.Fatalf("release after reject: %d", code)
 	}
