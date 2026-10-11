@@ -5,11 +5,31 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
 
 func quietLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+func TestValidateConfig(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good.yaml")
+	os.WriteFile(good, []byte("upstream:\n  addr: 127.0.0.1:25\nsmtp:\n  accepted_domains:\n    - example.com\ninternal_api:\n  token: 0123456789abcdef0123\n"), 0o600)
+	if err := validateConfig([]string{"-config", good}); err != nil {
+		t.Fatalf("valid config rejected: %v", err)
+	}
+	bad := filepath.Join(dir, "bad.yaml")
+	// Missing accepted_domains (open-relay protection) must fail validation.
+	os.WriteFile(bad, []byte("upstream:\n  addr: 127.0.0.1:25\n"), 0o600)
+	if err := validateConfig([]string{"-config", bad}); err == nil {
+		t.Fatal("invalid config accepted")
+	}
+	if err := validateConfig([]string{"-config", filepath.Join(dir, "nope.yaml")}); err == nil {
+		t.Fatal("missing file accepted")
+	}
+}
 
 func TestWaitReadySucceedsAfterRetries(t *testing.T) {
 	calls := 0

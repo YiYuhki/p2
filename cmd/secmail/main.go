@@ -4,6 +4,7 @@
 //	secmail -config config.yaml -components smtp         # SMTP proxy only
 //	secmail -config config.yaml -components portal,api,worker
 //	secmail dkim-keygen -out dkim.key                    # print DNS record
+//	secmail validate-config -config config.yaml          # check config, exit
 package main
 
 import (
@@ -54,6 +55,13 @@ import (
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "dkim-keygen" {
 		if err := dkimKeygen(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "validate-config" {
+		if err := validateConfig(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -592,6 +600,21 @@ func serveHTTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, name, a
 		}
 	}()
 	return srv.Shutdown
+}
+
+// validateConfig loads and validates a config file without starting any
+// listener, for use as a CI / pre-deploy gate: `secmail validate-config -config
+// config.yaml`. ${VAR} references are expanded from the environment exactly as
+// at boot, so the same environment must be present for the check to be faithful.
+func validateConfig(args []string) error {
+	fs := flag.NewFlagSet("validate-config", flag.ExitOnError)
+	cfgPath := fs.String("config", "config.yaml", "path to YAML config")
+	fs.Parse(args)
+	if _, err := config.Load(*cfgPath); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
+	}
+	fmt.Printf("%s: OK\n", *cfgPath)
+	return nil
 }
 
 func dkimKeygen(args []string) error {
