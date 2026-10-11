@@ -20,6 +20,7 @@ type Config struct {
 	Upstream    UpstreamConfig    `yaml:"upstream"`
 	Rewrite     RewriteConfig     `yaml:"rewrite"`
 	DKIM        DKIMConfig        `yaml:"dkim"`
+	ARC         ARCConfig         `yaml:"arc"`
 	SPF         SPFConfig         `yaml:"spf"`
 	DMARC       DMARCConfig       `yaml:"dmarc"`
 	Portal      PortalConfig      `yaml:"portal"`
@@ -298,6 +299,19 @@ type DKIMConfig struct {
 	Domain         string `yaml:"domain"`
 	Selector       string `yaml:"selector"`
 	PrivateKeyFile string `yaml:"private_key_file"`
+}
+
+// ARCConfig controls ARC sealing of rewritten inbound mail. Because the gateway
+// alters messages (banner, attachment rewrite) it breaks original DKIM/SPF
+// alignment; an ARC seal records the authentication the gateway saw so a
+// downstream ARC-aware receiver can still trust it. Domain/Selector/PrivateKey
+// default to the DKIM signing key when left empty.
+type ARCConfig struct {
+	Sign           bool   `yaml:"sign"`
+	Domain         string `yaml:"domain"`
+	Selector       string `yaml:"selector"`
+	PrivateKeyFile string `yaml:"private_key_file"`
+	AuthservID     string `yaml:"authserv_id"` // defaults to smtp.hostname
 }
 
 type PortalConfig struct {
@@ -599,6 +613,24 @@ func (c *Config) Validate() error {
 	}
 	if c.DKIM.Sign && (c.DKIM.Domain == "" || c.DKIM.Selector == "" || c.DKIM.PrivateKeyFile == "") {
 		errs = append(errs, errors.New("dkim.sign requires domain, selector and private_key_file"))
+	}
+	if c.ARC.Sign {
+		// Default ARC's key material to the DKIM signing key.
+		if c.ARC.Domain == "" {
+			c.ARC.Domain = c.DKIM.Domain
+		}
+		if c.ARC.Selector == "" {
+			c.ARC.Selector = c.DKIM.Selector
+		}
+		if c.ARC.PrivateKeyFile == "" {
+			c.ARC.PrivateKeyFile = c.DKIM.PrivateKeyFile
+		}
+		if c.ARC.AuthservID == "" {
+			c.ARC.AuthservID = c.SMTP.Hostname
+		}
+		if c.ARC.Domain == "" || c.ARC.Selector == "" || c.ARC.PrivateKeyFile == "" {
+			errs = append(errs, errors.New("arc.sign requires domain, selector and private_key_file (or dkim.* to inherit from)"))
+		}
 	}
 	if c.InternalAPI.Listen != "" && len(c.InternalAPI.Token) < 16 {
 		errs = append(errs, errors.New("internal_api.token must be at least 16 characters"))

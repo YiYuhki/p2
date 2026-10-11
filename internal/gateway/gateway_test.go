@@ -19,6 +19,7 @@ import (
 	"github.com/emersion/go-msgauth/dkim"
 	"github.com/emersion/go-smtp"
 
+	"github.com/yiyuhki/p2/internal/arc"
 	"github.com/yiyuhki/p2/internal/dkimutil"
 	"github.com/yiyuhki/p2/internal/dmarc"
 	"github.com/yiyuhki/p2/internal/mimeproc"
@@ -589,5 +590,26 @@ func TestRateLimitTempfailsMail(t *testing.T) {
 	var se *smtp.SMTPError
 	if !errors.As(err, &se) || se.Code != 451 {
 		t.Fatalf("want 451, got %v", err)
+	}
+}
+
+func TestProcessorArcSeals(t *testing.T) {
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	proc := NewProcessor(stubQ{}, ProcessorOptions{
+		Hostname: "gw.example.com", GatewayID: "test-gw", LinkTTL: time.Hour,
+		ArcSealer: arc.New("gw.example.com", "arc1", "gw.example.com", key),
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	raw := "From: sender@ext.org\r\nTo: user@example.com\r\nSubject: hi\r\n\r\nbody\r\n"
+	out, err := proc.Process(context.Background(), Envelope{
+		MailFrom: "sender@ext.org", RcptTo: []string{"user@example.com"}, RemoteAddr: "203.0.113.9:2500",
+	}, []byte(raw))
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	s := string(out)
+	for _, h := range []string{"ARC-Seal:", "ARC-Message-Signature:", "ARC-Authentication-Results:"} {
+		if !strings.Contains(s, h) {
+			t.Fatalf("output missing %s:\n%s", h, s)
+		}
 	}
 }

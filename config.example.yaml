@@ -53,6 +53,13 @@ dkim:
   selector: secmail
   private_key_file: /etc/secmail/dkim.key   # generate with: secmail dkim-keygen
 
+arc:                             # optional: ARC-seal rewritten inbound mail (RFC 8617)
+  sign: false                    # add an ARC set recording the authentication the gateway observed
+  # domain/selector/private_key_file default to the dkim.* values above when empty.
+  # authserv_id: ""              # defaults to smtp.hostname
+  # Because the gateway rewrites mail (banner/attachments) it breaks the original DKIM/SPF
+  # alignment; an ARC seal lets a downstream ARC-aware receiver still trust what the gateway saw.
+
 spf:
   verify_inbound: true           # check the sending IP against the MAIL FROM domain's SPF record
   timeout: 10s                   # per-message DNS budget (SPF may do several lookups)

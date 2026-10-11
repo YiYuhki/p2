@@ -34,6 +34,7 @@ import (
 	"github.com/emersion/go-smtp"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/yiyuhki/p2/internal/arc"
 	"github.com/yiyuhki/p2/internal/config"
 	"github.com/yiyuhki/p2/internal/digest"
 	"github.com/yiyuhki/p2/internal/dkimutil"
@@ -344,6 +345,14 @@ func run(cfgPath, components string, log *slog.Logger) error {
 				return err
 			}
 		}
+		var arcSealer *arc.Sealer
+		if cfg.ARC.Sign {
+			arcSealer, err = arc.LoadSealer(cfg.ARC.Domain, cfg.ARC.Selector, cfg.ARC.AuthservID, cfg.ARC.PrivateKeyFile)
+			if err != nil {
+				return err
+			}
+			log.Info("arc sealing enabled", "domain", cfg.ARC.Domain, "selector", cfg.ARC.Selector)
+		}
 		var spfChecker *spfutil.Checker
 		if cfg.SPF.VerifyInbound {
 			spfChecker = spfutil.New(nil, cfg.SPF.Timeout) // nil = system resolver
@@ -368,6 +377,7 @@ func run(cfgPath, components string, log *slog.Logger) error {
 			EnforceDMARC:  cfg.DMARC.Enforce,
 			StripOrigDKIM: cfg.DKIM.StripOriginal,
 			Signer:        signer,
+			ArcSealer:     arcSealer,
 			SPF:           spfChecker,
 			DMARC:         dmarcEval,
 		}, log)

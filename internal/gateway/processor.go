@@ -14,6 +14,7 @@ import (
 	"github.com/emersion/go-message/textproto"
 	"github.com/emersion/go-smtp"
 
+	"github.com/yiyuhki/p2/internal/arc"
 	"github.com/yiyuhki/p2/internal/dkimutil"
 	"github.com/yiyuhki/p2/internal/dmarc"
 	"github.com/yiyuhki/p2/internal/metrics"
@@ -42,6 +43,10 @@ type ProcessorOptions struct {
 	EnforceDMARC  bool
 	StripOrigDKIM bool
 	Signer        *dkimutil.Signer // nil disables re-signing
+	// ArcSealer, if set, seals the rewritten message with an ARC set so a
+	// downstream ARC-aware receiver can see the authentication the gateway
+	// observed despite the rewrite. nil disables it.
+	ArcSealer *arc.Sealer
 	// LookupTXT overrides DNS for DKIM verification (tests).
 	LookupTXT func(string) ([]string, error)
 	// SPF is the SPF checker; nil disables SPF even when VerifySPF is set.
@@ -185,6 +190,16 @@ func (p *Processor) finish(ctx context.Context, log *slog.Logger, env Envelope, 
 	if err != nil {
 		log.Error("serialise failed", "err", err)
 		return nil, errTempFail
+	}
+	// ARC-seal before DKIM signing: the seal captures the Authentication-Results
+	// the gateway added. ARC is advisory, so a sealing error is logged and the
+	// message continues unsealed rather than failing delivery.
+	if p.opts.ArcSealer != nil {
+		if sealed, serr := p.opts.ArcSealer.Seal(out, authResults); serr != nil {
+			log.Warn("arc seal failed", "err", serr)
+		} else {
+			out = sealed
+		}
 	}
 	if p.opts.Signer != nil {
 		signed, err := p.opts.Signer.Sign(out)
