@@ -119,11 +119,13 @@ async fn run(cfg_path: &str) -> Result<(), String> {
     // token is configured.
     if !cfg.internal_api.token.is_empty() {
         let store: Arc<dyn secmail::store::Store> = Arc::new(secmail::store::Memory::new());
-        app = app.merge(secmail::internalapi::router(secmail::internalapi::ApiState {
-            store,
-            token: cfg.internal_api.token.clone(),
-            admin_token: cfg.internal_api.admin_token.clone(),
-        }));
+        app = app.merge(secmail::internalapi::router(
+            secmail::internalapi::ApiState {
+                store,
+                token: cfg.internal_api.token.clone(),
+                admin_token: cfg.internal_api.admin_token.clone(),
+            },
+        ));
         eprintln!("internal API mounted (/internal/v1/...)");
     }
     eprintln!("ops HTTP (/metrics, /healthz) listening on {ops_listen}");
