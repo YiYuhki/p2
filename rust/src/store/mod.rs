@@ -6,7 +6,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value as Json;
 
-use crate::model::{AdminAction, Attachment, DlpEvent, DownloadEvent, Hold, HoldStatus, Message, Status};
+use crate::model::{
+    AdminAction, Attachment, DlpEvent, DownloadEvent, Hold, HoldStatus, Message, Status,
+};
 
 pub mod memory;
 pub use memory::Memory;
@@ -70,17 +72,27 @@ pub trait Store: Send + Sync {
         detail: Option<Json>,
         at: DateTime<Utc>,
     ) -> Result<()>;
-    async fn find_reusable_verdict(&self, sha256: &str, since: DateTime<Utc>) -> Result<Attachment>;
+    async fn find_reusable_verdict(&self, sha256: &str, since: DateTime<Utc>)
+        -> Result<Attachment>;
     async fn mark_requeued(&self, id: &str, at: DateTime<Utc>) -> Result<()>;
     async fn record_download(&self, ev: DownloadEvent) -> Result<()>;
-    async fn list_stale_pending(&self, older_than: DateTime<Utc>, limit: usize) -> Result<Vec<Attachment>>;
+    async fn list_stale_pending(
+        &self,
+        older_than: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Attachment>>;
     async fn list_expired(&self, now: DateTime<Utc>, limit: usize) -> Result<Vec<Attachment>>;
     async fn mark_expired(&self, id: &str, at: DateTime<Utc>) -> Result<()>;
 
     async fn create_hold(&self, h: &Hold) -> Result<()>;
     async fn get_hold(&self, id: &str) -> Result<Hold>;
     async fn get_hold_by_token_hash(&self, th: &str) -> Result<Hold>;
-    async fn list_holds(&self, status: Option<HoldStatus>, limit: usize, page: Page) -> Result<Vec<Hold>>;
+    async fn list_holds(
+        &self,
+        status: Option<HoldStatus>,
+        limit: usize,
+        page: Page,
+    ) -> Result<Vec<Hold>>;
     async fn decide_hold(
         &self,
         id: &str,
@@ -93,7 +105,12 @@ pub trait Store: Send + Sync {
     async fn list_expired_holds(&self, now: DateTime<Utc>, limit: usize) -> Result<Vec<Hold>>;
 
     async fn record_dlp_event(&self, ev: &DlpEvent) -> Result<()>;
-    async fn list_dlp_events(&self, filter: EventFilter, limit: usize, page: Page) -> Result<Vec<DlpEvent>>;
+    async fn list_dlp_events(
+        &self,
+        filter: EventFilter,
+        limit: usize,
+        page: Page,
+    ) -> Result<Vec<DlpEvent>>;
     async fn prune_audit_events(&self, cutoff: DateTime<Utc>) -> Result<i64>;
 
     async fn record_admin_action(&self, a: AdminAction) -> Result<()>;
@@ -101,7 +118,12 @@ pub trait Store: Send + Sync {
 }
 
 /// Orders by (time DESC, id DESC): row (a) sorts before (b).
-pub(crate) fn before_key(at: DateTime<Utc>, aid: &str, bt: DateTime<Utc>, bid: &str) -> std::cmp::Ordering {
+pub(crate) fn before_key(
+    at: DateTime<Utc>,
+    aid: &str,
+    bt: DateTime<Utc>,
+    bid: &str,
+) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     if at == bt {
         bid.cmp(aid) // id DESC

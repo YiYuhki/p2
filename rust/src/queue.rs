@@ -54,12 +54,8 @@ pub fn retry_backoff(attempt: u32) -> Duration {
 /// Applies a verdict, retrying transient failures with backoff. Permanent
 /// failures invoke `dead_letter`; transient failures past the try limit drop
 /// the verdict (the stale-job sweep re-queues the job). `sleep` is injectable.
-pub async fn deliver_with_retry<H, D, S, F>(
-    handler: &H,
-    v: &Verdict,
-    dead_letter: D,
-    sleep: S,
-) where
+pub async fn deliver_with_retry<H, D, S, F>(handler: &H, v: &Verdict, dead_letter: D, sleep: S)
+where
     H: ResultHandler,
     D: Fn(),
     S: Fn(Duration) -> F,
@@ -125,7 +121,12 @@ impl Memory {
     /// Consumes verdicts until the results channel closes, applying each with
     /// retry/dead-letter. Takes the receiver (single consumer).
     pub async fn consume_results<H: ResultHandler>(&self, handler: &H) {
-        let mut rx = self.results_rx.lock().unwrap().take().expect("results already consumed");
+        let mut rx = self
+            .results_rx
+            .lock()
+            .unwrap()
+            .take()
+            .expect("results already consumed");
         while let Some(v) = rx.recv().await {
             deliver_with_retry(handler, &v, || {}, |_d| async {}).await;
         }
@@ -133,7 +134,12 @@ impl Memory {
 
     /// Consumes jobs until the jobs channel closes (in-process analyzer).
     pub async fn consume_jobs<H: JobHandler>(&self, handler: &H) {
-        let mut rx = self.jobs_rx.lock().unwrap().take().expect("jobs already consumed");
+        let mut rx = self
+            .jobs_rx
+            .lock()
+            .unwrap()
+            .take()
+            .expect("jobs already consumed");
         while let Some(job) = rx.recv().await {
             let _ = handler.handle(&job).await;
         }
@@ -165,7 +171,11 @@ mod tests {
             content_type: "application/pdf".into(),
             size: 10,
             sha256: "x".into(),
-            storage: JobObject { kind: "fs".into(), bucket: String::new(), key: "k".into() },
+            storage: JobObject {
+                kind: "fs".into(),
+                bucket: String::new(),
+                key: "k".into(),
+            },
             content_url: String::new(),
             verdict_url: String::new(),
             attempt: 0,
@@ -203,11 +213,27 @@ mod tests {
     #[tokio::test]
     async fn retry_then_succeed() {
         let calls = Arc::new(AtomicU32::new(0));
-        let h = CountHandler { calls: calls.clone(), plan: vec![1, 1, 0] };
-        let v = Verdict { attachment_id: "a".into(), status: Status::Clean, threat_name: String::new(), detail: None };
+        let h = CountHandler {
+            calls: calls.clone(),
+            plan: vec![1, 1, 0],
+        };
+        let v = Verdict {
+            attachment_id: "a".into(),
+            status: Status::Clean,
+            threat_name: String::new(),
+            detail: None,
+        };
         let dead = Arc::new(AtomicU32::new(0));
         let d = dead.clone();
-        deliver_with_retry(&h, &v, || { d.fetch_add(1, Ordering::SeqCst); }, |_| async {}).await;
+        deliver_with_retry(
+            &h,
+            &v,
+            || {
+                d.fetch_add(1, Ordering::SeqCst);
+            },
+            |_| async {},
+        )
+        .await;
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_eq!(dead.load(Ordering::SeqCst), 0);
     }
@@ -215,11 +241,27 @@ mod tests {
     #[tokio::test]
     async fn permanent_dead_letters() {
         let calls = Arc::new(AtomicU32::new(0));
-        let h = CountHandler { calls: calls.clone(), plan: vec![2] };
-        let v = Verdict { attachment_id: "a".into(), status: Status::Error, threat_name: String::new(), detail: None };
+        let h = CountHandler {
+            calls: calls.clone(),
+            plan: vec![2],
+        };
+        let v = Verdict {
+            attachment_id: "a".into(),
+            status: Status::Error,
+            threat_name: String::new(),
+            detail: None,
+        };
         let dead = Arc::new(AtomicU32::new(0));
         let d = dead.clone();
-        deliver_with_retry(&h, &v, || { d.fetch_add(1, Ordering::SeqCst); }, |_| async {}).await;
+        deliver_with_retry(
+            &h,
+            &v,
+            || {
+                d.fetch_add(1, Ordering::SeqCst);
+            },
+            |_| async {},
+        )
+        .await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(dead.load(Ordering::SeqCst), 1);
     }
@@ -227,11 +269,27 @@ mod tests {
     #[tokio::test]
     async fn transient_exhausts_without_dead_letter() {
         let calls = Arc::new(AtomicU32::new(0));
-        let h = CountHandler { calls: calls.clone(), plan: vec![1, 1, 1, 1, 1] };
-        let v = Verdict { attachment_id: "a".into(), status: Status::Clean, threat_name: String::new(), detail: None };
+        let h = CountHandler {
+            calls: calls.clone(),
+            plan: vec![1, 1, 1, 1, 1],
+        };
+        let v = Verdict {
+            attachment_id: "a".into(),
+            status: Status::Clean,
+            threat_name: String::new(),
+            detail: None,
+        };
         let dead = Arc::new(AtomicU32::new(0));
         let d = dead.clone();
-        deliver_with_retry(&h, &v, || { d.fetch_add(1, Ordering::SeqCst); }, |_| async {}).await;
+        deliver_with_retry(
+            &h,
+            &v,
+            || {
+                d.fetch_add(1, Ordering::SeqCst);
+            },
+            |_| async {},
+        )
+        .await;
         assert_eq!(calls.load(Ordering::SeqCst), 4); // MAX_DELIVER_TRIES
         assert_eq!(dead.load(Ordering::SeqCst), 0);
     }
@@ -240,9 +298,22 @@ mod tests {
     async fn consume_results_drains() {
         let q = Memory::new();
         let calls = Arc::new(AtomicU32::new(0));
-        let h = CountHandler { calls: calls.clone(), plan: vec![] };
-        q.push_result(Verdict { attachment_id: "a".into(), status: Status::Clean, threat_name: String::new(), detail: None });
-        q.push_result(Verdict { attachment_id: "b".into(), status: Status::Malicious, threat_name: "x".into(), detail: None });
+        let h = CountHandler {
+            calls: calls.clone(),
+            plan: vec![],
+        };
+        q.push_result(Verdict {
+            attachment_id: "a".into(),
+            status: Status::Clean,
+            threat_name: String::new(),
+            detail: None,
+        });
+        q.push_result(Verdict {
+            attachment_id: "b".into(),
+            status: Status::Malicious,
+            threat_name: "x".into(),
+            detail: None,
+        });
         // The queue holds its own sender, so the consumer never ends on its own;
         // a short timeout bounds the drain and both queued verdicts are applied.
         let _ = tokio::time::timeout(Duration::from_millis(50), q.consume_results(&h)).await;

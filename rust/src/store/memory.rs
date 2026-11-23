@@ -8,7 +8,9 @@ use chrono::{DateTime, Utc};
 use serde_json::Value as Json;
 
 use super::{after_cursor, before_key, EventFilter, Page, Result, Store, StoreError};
-use crate::model::{AdminAction, Attachment, DlpEvent, DownloadEvent, Hold, HoldStatus, Message, Status};
+use crate::model::{
+    AdminAction, Attachment, DlpEvent, DownloadEvent, Hold, HoldStatus, Message, Status,
+};
 
 #[derive(Default)]
 struct Inner {
@@ -55,11 +57,23 @@ impl Store for Memory {
     }
 
     async fn get_message(&self, id: &str) -> Result<Message> {
-        self.inner.lock().unwrap().messages.get(id).cloned().ok_or(StoreError::NotFound)
+        self.inner
+            .lock()
+            .unwrap()
+            .messages
+            .get(id)
+            .cloned()
+            .ok_or(StoreError::NotFound)
     }
 
     async fn get_attachment(&self, id: &str) -> Result<Attachment> {
-        self.inner.lock().unwrap().atts.get(id).cloned().ok_or(StoreError::NotFound)
+        self.inner
+            .lock()
+            .unwrap()
+            .atts
+            .get(id)
+            .cloned()
+            .ok_or(StoreError::NotFound)
     }
 
     async fn get_attachment_by_token_hash(&self, h: &str) -> Result<Attachment> {
@@ -89,7 +103,11 @@ impl Store for Memory {
         Ok(())
     }
 
-    async fn find_reusable_verdict(&self, sha256: &str, since: DateTime<Utc>) -> Result<Attachment> {
+    async fn find_reusable_verdict(
+        &self,
+        sha256: &str,
+        since: DateTime<Utc>,
+    ) -> Result<Attachment> {
         let g = self.inner.lock().unwrap();
         let mut best: Option<&Attachment> = None;
         for a in g.atts.values() {
@@ -103,7 +121,10 @@ impl Store for Memory {
             if a.status != Status::Clean && a.status != Status::Malicious {
                 continue;
             }
-            if best.map(|b| analyzed > b.analyzed_at.unwrap()).unwrap_or(true) {
+            if best
+                .map(|b| analyzed > b.analyzed_at.unwrap())
+                .unwrap_or(true)
+            {
                 best = Some(a);
             }
         }
@@ -121,21 +142,32 @@ impl Store for Memory {
 
     async fn record_download(&self, ev: DownloadEvent) -> Result<()> {
         let mut g = self.inner.lock().unwrap();
-        let a = g.atts.get_mut(&ev.attachment_id).ok_or(StoreError::NotFound)?;
+        let a = g
+            .atts
+            .get_mut(&ev.attachment_id)
+            .ok_or(StoreError::NotFound)?;
         a.download_count += 1;
         a.last_downloaded_at = Some(ev.at);
         g.downloads.push(ev);
         Ok(())
     }
 
-    async fn list_stale_pending(&self, older_than: DateTime<Utc>, limit: usize) -> Result<Vec<Attachment>> {
+    async fn list_stale_pending(
+        &self,
+        older_than: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Attachment>> {
         let g = self.inner.lock().unwrap();
-        Ok(att_list(&g, limit, |a| a.status == Status::Pending && a.queued_at < older_than))
+        Ok(att_list(&g, limit, |a| {
+            a.status == Status::Pending && a.queued_at < older_than
+        }))
     }
 
     async fn list_expired(&self, now: DateTime<Utc>, limit: usize) -> Result<Vec<Attachment>> {
         let g = self.inner.lock().unwrap();
-        Ok(att_list(&g, limit, |a| a.status != Status::Expired && a.expires_at < now))
+        Ok(att_list(&g, limit, |a| {
+            a.status != Status::Expired && a.expires_at < now
+        }))
     }
 
     async fn mark_expired(&self, id: &str, at: DateTime<Utc>) -> Result<()> {
@@ -147,23 +179,43 @@ impl Store for Memory {
     }
 
     async fn create_hold(&self, h: &Hold) -> Result<()> {
-        self.inner.lock().unwrap().holds.insert(h.id.clone(), h.clone());
+        self.inner
+            .lock()
+            .unwrap()
+            .holds
+            .insert(h.id.clone(), h.clone());
         Ok(())
     }
 
     async fn get_hold(&self, id: &str) -> Result<Hold> {
-        self.inner.lock().unwrap().holds.get(id).cloned().ok_or(StoreError::NotFound)
+        self.inner
+            .lock()
+            .unwrap()
+            .holds
+            .get(id)
+            .cloned()
+            .ok_or(StoreError::NotFound)
     }
 
     async fn get_hold_by_token_hash(&self, th: &str) -> Result<Hold> {
         let g = self.inner.lock().unwrap();
-        g.holds.values().find(|h| h.token_hash == th).cloned().ok_or(StoreError::NotFound)
+        g.holds
+            .values()
+            .find(|h| h.token_hash == th)
+            .cloned()
+            .ok_or(StoreError::NotFound)
     }
 
-    async fn list_holds(&self, status: Option<HoldStatus>, limit: usize, page: Page) -> Result<Vec<Hold>> {
+    async fn list_holds(
+        &self,
+        status: Option<HoldStatus>,
+        limit: usize,
+        page: Page,
+    ) -> Result<Vec<Hold>> {
         let g = self.inner.lock().unwrap();
         Ok(hold_list(&g, limit, |h| {
-            status.map(|s| h.status == s).unwrap_or(true) && after_cursor(h.created_at, &h.id, &page)
+            status.map(|s| h.status == s).unwrap_or(true)
+                && after_cursor(h.created_at, &h.id, &page)
         }))
     }
 
@@ -202,7 +254,9 @@ impl Store for Memory {
 
     async fn list_expired_holds(&self, now: DateTime<Utc>, limit: usize) -> Result<Vec<Hold>> {
         let g = self.inner.lock().unwrap();
-        Ok(hold_list(&g, limit, |h| h.status == HoldStatus::Held && h.expires_at < now))
+        Ok(hold_list(&g, limit, |h| {
+            h.status == HoldStatus::Held && h.expires_at < now
+        }))
     }
 
     async fn record_dlp_event(&self, ev: &DlpEvent) -> Result<()> {
@@ -210,7 +264,12 @@ impl Store for Memory {
         Ok(())
     }
 
-    async fn list_dlp_events(&self, filter: EventFilter, limit: usize, page: Page) -> Result<Vec<DlpEvent>> {
+    async fn list_dlp_events(
+        &self,
+        filter: EventFilter,
+        limit: usize,
+        page: Page,
+    ) -> Result<Vec<DlpEvent>> {
         let g = self.inner.lock().unwrap();
         let mut all: Vec<DlpEvent> = g
             .dlp_events
@@ -302,17 +361,37 @@ mod tests {
     #[tokio::test]
     async fn verdict_lifecycle() {
         let s = Memory::new();
-        let m = Message { id: "m1".into(), ..Default::default() };
-        s.create_message(&m, &[att("a1", Status::Pending)]).await.unwrap();
-        assert_eq!(s.get_attachment("a1").await.unwrap().status, Status::Pending);
+        let m = Message {
+            id: "m1".into(),
+            ..Default::default()
+        };
+        s.create_message(&m, &[att("a1", Status::Pending)])
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get_attachment("a1").await.unwrap().status,
+            Status::Pending
+        );
         // by token
-        assert_eq!(s.get_attachment_by_token_hash("tok-a1").await.unwrap().id, "a1");
+        assert_eq!(
+            s.get_attachment_by_token_hash("tok-a1").await.unwrap().id,
+            "a1"
+        );
         // set verdict
-        s.set_verdict("a1", Status::Clean, "", None, Utc::now()).await.unwrap();
+        s.set_verdict("a1", Status::Clean, "", None, Utc::now())
+            .await
+            .unwrap();
         assert_eq!(s.get_attachment("a1").await.unwrap().status, Status::Clean);
         // second verdict conflicts (not pending any more)
-        assert_eq!(s.set_verdict("a1", Status::Malicious, "x", None, Utc::now()).await, Err(StoreError::Conflict));
-        assert_eq!(s.get_attachment("missing").await.err(), Some(StoreError::NotFound));
+        assert_eq!(
+            s.set_verdict("a1", Status::Malicious, "x", None, Utc::now())
+                .await,
+            Err(StoreError::Conflict)
+        );
+        assert_eq!(
+            s.get_attachment("missing").await.err(),
+            Some(StoreError::NotFound)
+        );
     }
 
     #[tokio::test]
@@ -338,20 +417,36 @@ mod tests {
             };
             s.create_hold(&h).await.unwrap();
         }
-        let held = s.list_holds(Some(HoldStatus::Held), 50, Page::default()).await.unwrap();
+        let held = s
+            .list_holds(Some(HoldStatus::Held), 50, Page::default())
+            .await
+            .unwrap();
         assert_eq!(held.len(), 3);
         // newest first
         assert_eq!(held[0].id, "h2");
         // decide one
-        s.decide_hold("h1", HoldStatus::Rejected, "sec", "no", Utc::now()).await.unwrap();
-        assert_eq!(s.decide_hold("h1", HoldStatus::Released, "x", "", Utc::now()).await, Err(StoreError::Conflict));
+        s.decide_hold("h1", HoldStatus::Rejected, "sec", "no", Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            s.decide_hold("h1", HoldStatus::Released, "x", "", Utc::now())
+                .await,
+            Err(StoreError::Conflict)
+        );
         assert_eq!(s.get_hold("h1").await.unwrap().status, HoldStatus::Rejected);
         // keyset paging: first page of 2, then the rest
         let page1 = s.list_holds(None, 2, Page::default()).await.unwrap();
         assert_eq!(page1.len(), 2);
         let last = &page1[1];
         let page2 = s
-            .list_holds(None, 2, Page { before: Some(last.created_at), before_id: last.id.clone() })
+            .list_holds(
+                None,
+                2,
+                Page {
+                    before: Some(last.created_at),
+                    before_id: last.id.clone(),
+                },
+            )
             .await
             .unwrap();
         assert_eq!(page2.len(), 1);
@@ -364,24 +459,75 @@ mod tests {
         let old = Utc::now() - Duration::hours(48);
         let recent = Utc::now();
         s.record_dlp_event(&DlpEvent {
-            id: "e1".into(), mail_from: "a".into(), rcpt_to: vec![], subject: "s".into(),
-            action: "block".into(), severity: "high".into(), findings: None, hold_id: String::new(), at: old,
-        }).await.unwrap();
+            id: "e1".into(),
+            mail_from: "a".into(),
+            rcpt_to: vec![],
+            subject: "s".into(),
+            action: "block".into(),
+            severity: "high".into(),
+            findings: None,
+            hold_id: String::new(),
+            at: old,
+        })
+        .await
+        .unwrap();
         s.record_dlp_event(&DlpEvent {
-            id: "e2".into(), mail_from: "a".into(), rcpt_to: vec![], subject: "s".into(),
-            action: "notify".into(), severity: "low".into(), findings: None, hold_id: String::new(), at: recent,
-        }).await.unwrap();
-        let blocked = s.list_dlp_events(EventFilter { action: "block".into(), ..Default::default() }, 50, Page::default()).await.unwrap();
+            id: "e2".into(),
+            mail_from: "a".into(),
+            rcpt_to: vec![],
+            subject: "s".into(),
+            action: "notify".into(),
+            severity: "low".into(),
+            findings: None,
+            hold_id: String::new(),
+            at: recent,
+        })
+        .await
+        .unwrap();
+        let blocked = s
+            .list_dlp_events(
+                EventFilter {
+                    action: "block".into(),
+                    ..Default::default()
+                },
+                50,
+                Page::default(),
+            )
+            .await
+            .unwrap();
         assert_eq!(blocked.len(), 1);
         // prune events older than 24h -> drops e1
-        let n = s.prune_audit_events(Utc::now() - Duration::hours(24)).await.unwrap();
+        let n = s
+            .prune_audit_events(Utc::now() - Duration::hours(24))
+            .await
+            .unwrap();
         assert_eq!(n, 1);
-        assert_eq!(s.list_dlp_events(EventFilter::default(), 50, Page::default()).await.unwrap().len(), 1);
+        assert_eq!(
+            s.list_dlp_events(EventFilter::default(), 50, Page::default())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         // admin actions
         s.record_admin_action(AdminAction {
-            id: "x1".into(), at: Utc::now(), actor: "admin".into(), action: "release".into(),
-            target: "h0".into(), detail: String::new(), source: "portal".into(), result: "ok".into(),
-        }).await.unwrap();
-        assert_eq!(s.list_admin_actions(50, Page::default()).await.unwrap().len(), 1);
+            id: "x1".into(),
+            at: Utc::now(),
+            actor: "admin".into(),
+            action: "release".into(),
+            target: "h0".into(),
+            detail: String::new(),
+            source: "portal".into(),
+            result: "ok".into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            s.list_admin_actions(50, Page::default())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

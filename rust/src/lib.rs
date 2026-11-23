@@ -9,6 +9,7 @@ pub mod config;
 pub mod dlp;
 pub mod dnsbl;
 pub mod greylist;
+pub mod metrics;
 pub mod model;
 pub mod queue;
 pub mod ratelimit;
