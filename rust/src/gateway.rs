@@ -56,8 +56,9 @@ pub trait MessageProcessor: Send + Sync {
 }
 
 /// Consulted at connection time (DNSBL). A `Some` rejects the connection.
+#[async_trait]
 pub trait ConnGate: Send + Sync {
-    fn gate(&self, ip: IpAddr) -> Option<SmtpError>;
+    async fn gate(&self, ip: IpAddr) -> Option<SmtpError>;
 }
 
 /// Defers the first delivery of each unseen triplet (greylisting).
@@ -132,7 +133,7 @@ impl Backend {
         // Connection gate (DNSBL).
         if let Some(gate) = &self.opts.conn_gate {
             if let Ok(ip) = host_only(&remote).parse::<IpAddr>() {
-                if let Some(err) = gate.gate(ip) {
+                if let Some(err) = gate.gate(ip).await {
                     reply(&mut w, err.code, &err.message).await?;
                     return Ok(());
                 }

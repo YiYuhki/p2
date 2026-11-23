@@ -13,6 +13,21 @@ pub trait Resolver {
     fn lookup_host(&self, host: &str) -> Result<Vec<String>, String>;
 }
 
+/// A resolver backed by the system resolver via `ToSocketAddrs` (A/AAAA
+/// lookups, which is what A-record DNSBLs need). Blocking — call from a blocking
+/// context (e.g. `spawn_blocking`).
+pub struct StdResolver;
+
+impl Resolver for StdResolver {
+    fn lookup_host(&self, host: &str) -> Result<Vec<String>, String> {
+        use std::net::ToSocketAddrs;
+        match (host, 0u16).to_socket_addrs() {
+            Ok(addrs) => Ok(addrs.map(|a| a.ip().to_string()).collect()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
 /// Queries one or more DNSBL zones.
 pub struct Checker<R: Resolver> {
     zones: Vec<String>,

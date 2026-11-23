@@ -34,6 +34,21 @@ fn main() {
     }
 }
 
+/// Adapts a DNSBL checker to the gateway's async connection gate, running the
+/// blocking DNS lookup off the async executor.
+struct DnsblGate {
+    checker: Arc<secmail::dnsbl::Checker<secmail::dnsbl::StdResolver>>,
+}
+
+#[async_trait::async_trait]
+impl secmail::gateway::ConnGate for DnsblGate {
+    async fn gate(&self, ip: std::net::IpAddr) -> Option<secmail::gateway::SmtpError> {
+        let c = self.checker.clone();
+        let zone = tokio::task::spawn_blocking(move || c.listed(ip)).await.ok().flatten()?;
+        Some(secmail::gateway::SmtpError::new(554, &format!("Client host [{ip}] blocked by {zone}")))
+    }
+}
+
 /// Finds `-flag value` in argv.
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -127,6 +142,13 @@ async fn run(cfg_path: &str) -> Result<(), String> {
         eprintln!("inbound per-IP rate limit enabled");
     }
 
+    // Optional DNSBL connection gate.
+    let mut conn_gate: Option<Arc<dyn secmail::gateway::ConnGate>> = None;
+    if let Some(checker) = secmail::dnsbl::Checker::new(&cfg.dnsbl.zones, secmail::dnsbl::StdResolver) {
+        conn_gate = Some(Arc::new(DnsblGate { checker: Arc::new(checker) }));
+        eprintln!("dnsbl enabled: {:?}", cfg.dnsbl.zones);
+    }
+
     // Inbound SMTP proxy.
     let backend = Arc::new(Backend::new(
         Arc::new(InboundProcessor::new(Some(service), arc)),
@@ -134,6 +156,7 @@ async fn run(cfg_path: &str) -> Result<(), String> {
             recipient_domains: cfg.smtp.accepted_domains.clone(),
             hostname: cfg.smtp.hostname.clone(),
             max_message_bytes: cfg.smtp.max_message_bytes as usize,
+            conn_gate,
             upstream: UpstreamOptions {
                 addr: cfg.upstream.addr.clone(),
                 helo_name: if cfg.upstream.helo_name.is_empty() {
