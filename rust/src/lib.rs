@@ -14,6 +14,7 @@ pub mod http;
 pub mod metrics;
 pub mod mimeproc;
 pub mod model;
+pub mod outbound;
 pub mod processor;
 pub mod queue;
 pub mod ratelimit;
