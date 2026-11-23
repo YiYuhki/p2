@@ -10,3 +10,4 @@ pub mod dnsbl;
 pub mod greylist;
 pub mod model;
 pub mod ratelimit;
+pub mod storage;
