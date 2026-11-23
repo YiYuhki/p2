@@ -25,5 +25,6 @@ rsa = { version = "0.9.8", features = ["sha2"] }
 sha2 = "0.10.9"
 hmac = "0.12.1"
 base64 = "0.22.1"
+regex = "1.11.3"
 
 [dev-dependencies]

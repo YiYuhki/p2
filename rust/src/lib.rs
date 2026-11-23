@@ -6,6 +6,7 @@
 
 pub mod arc;
 pub mod config;
+pub mod dlp;
 pub mod dnsbl;
 pub mod greylist;
 pub mod model;
