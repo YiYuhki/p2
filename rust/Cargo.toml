@@ -1,0 +1,19 @@
+[package]
+name = "secmail"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Secure mail gateway (Rust port of the Go secmail) — DLP, inbound auth, quarantine portal"
+license = "MIT"
+
+[lib]
+name = "secmail"
+path = "src/lib.rs"
+
+[[bin]]
+name = "secmail"
+path = "src/main.rs"
+
+[dependencies]
+
+[dev-dependencies]
