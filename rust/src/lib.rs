@@ -11,6 +11,7 @@ pub mod dnsbl;
 pub mod gateway;
 pub mod greylist;
 pub mod http;
+pub mod internalapi;
 pub mod metrics;
 pub mod mimeproc;
 pub mod model;
