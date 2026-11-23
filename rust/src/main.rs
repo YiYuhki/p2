@@ -97,6 +97,36 @@ async fn run(cfg_path: &str) -> Result<(), String> {
         &cfg.rewrite.blocked_extensions,
     ));
 
+    // Optional inbound protections (greylisting, per-IP message rate limit).
+    let mut greylist: Option<Arc<dyn secmail::gateway::Greylister>> = None;
+    if cfg.greylist.enabled {
+        let gl = Arc::new(secmail::greylist::Greylist::new(cfg.greylist.delay, cfg.greylist.expiry));
+        let sweep = gl.clone();
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                t.tick().await;
+                sweep.sweep();
+            }
+        });
+        greylist = Some(gl);
+        eprintln!("greylisting enabled");
+    }
+    let mut rate_limit: Option<Arc<dyn secmail::gateway::RateLimiter>> = None;
+    if let Some(rl) = secmail::ratelimit::Limiter::new(cfg.smtp.rate_limit_per_ip_rps, cfg.smtp.rate_limit_per_ip_burst) {
+        let rl = Arc::new(rl);
+        let sweep = rl.clone();
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(std::time::Duration::from_secs(600));
+            loop {
+                t.tick().await;
+                sweep.sweep(std::time::Duration::from_secs(3600));
+            }
+        });
+        rate_limit = Some(rl);
+        eprintln!("inbound per-IP rate limit enabled");
+    }
+
     // Inbound SMTP proxy.
     let backend = Arc::new(Backend::new(
         Arc::new(InboundProcessor::new(Some(service), arc)),
@@ -113,9 +143,62 @@ async fn run(cfg_path: &str) -> Result<(), String> {
                 },
                 timeout: cfg.upstream.timeout,
             },
+            greylist,
+            rate_limit,
             ..Default::default()
         },
     ));
+
+    // Optional outbound DLP listener.
+    if cfg.outbound.enabled {
+        let scanner = Arc::new(
+            secmail::dlp::Scanner::new(secmail::dlp::Options { combine_pii: true, ..Default::default() })
+                .map_err(|e| e.to_string())?,
+        );
+        let policy = secmail::outbound::Policy {
+            high: cfg.dlp.actions.high.clone(),
+            medium: cfg.dlp.actions.medium.clone(),
+            low: cfg.dlp.actions.low.clone(),
+            uninspectable: cfg.dlp.actions.uninspectable.clone(),
+            encrypted: cfg.dlp.actions.encrypted.clone(),
+            exempt_senders: cfg.dlp.exempt_senders.clone(),
+            exempt_recipient_domains: cfg.dlp.exempt_recipient_domains.clone(),
+            dry_run: cfg.dlp.dry_run,
+        };
+        let out_svc = Arc::new(secmail::outbound::Service::new(
+            scanner,
+            store.clone(),
+            storage.clone(),
+            policy,
+            cfg.dlp.hold_ttl,
+        ));
+        let obe = Arc::new(Backend::new(
+            out_svc,
+            BackendOptions {
+                sender_domains: if cfg.outbound.sender_domains.is_empty() {
+                    cfg.smtp.accepted_domains.clone()
+                } else {
+                    cfg.outbound.sender_domains.clone()
+                },
+                hostname: cfg.smtp.hostname.clone(),
+                name: "outbound".into(),
+                max_message_bytes: cfg.outbound.max_message_bytes as usize,
+                upstream: UpstreamOptions {
+                    addr: cfg.outbound.next_hop.addr.clone(),
+                    helo_name: cfg.smtp.hostname.clone(),
+                    timeout: cfg.outbound.next_hop.timeout,
+                },
+                ..Default::default()
+            },
+        ));
+        let out_listen = bind_addr(&cfg.outbound.listen);
+        let out_l = tokio::net::TcpListener::bind(&out_listen)
+            .await
+            .map_err(|e| format!("bind outbound {out_listen}: {e}"))?;
+        eprintln!("outbound DLP proxy listening on {out_listen} -> next-hop {}", cfg.outbound.next_hop.addr);
+        tokio::spawn(obe.serve(out_l));
+    }
+
     let smtp_listen = bind_addr(&cfg.smtp.listen);
     let smtp_l = tokio::net::TcpListener::bind(&smtp_listen)
         .await
