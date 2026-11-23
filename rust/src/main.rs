@@ -76,9 +76,30 @@ async fn run(cfg_path: &str) -> Result<(), String> {
         None
     };
 
+    // Shared dependencies (in-memory store/queue; FS object store).
+    let store: Arc<dyn secmail::store::Store> = Arc::new(secmail::store::Memory::new());
+    let storage: Arc<dyn secmail::storage::Storage> = Arc::new(
+        secmail::storage::Fs::new(&cfg.storage.dir)
+            .await
+            .map_err(|e| e.to_string())?,
+    );
+    let queue: Arc<dyn secmail::queue::Queue> = Arc::new(secmail::queue::Memory::new());
+
+    // Inbound quarantine service.
+    let service = Arc::new(secmail::service::Service::new(
+        store.clone(),
+        storage.clone(),
+        queue.clone(),
+        metrics.clone(),
+        cfg.portal.public_base_url.clone(),
+        cfg.portal.link_ttl,
+        cfg.rewrite.gateway_id.clone(),
+        &cfg.rewrite.blocked_extensions,
+    ));
+
     // Inbound SMTP proxy.
     let backend = Arc::new(Backend::new(
-        Arc::new(InboundProcessor::new(arc)),
+        Arc::new(InboundProcessor::new(Some(service), arc)),
         BackendOptions {
             recipient_domains: cfg.smtp.accepted_domains.clone(),
             hostname: cfg.smtp.hostname.clone(),
@@ -114,21 +135,27 @@ async fn run(cfg_path: &str) -> Result<(), String> {
     let ops_l = tokio::net::TcpListener::bind(&ops_listen)
         .await
         .map_err(|e| format!("bind ops {ops_listen}: {e}"))?;
-    let mut app = ops_router(AppState { metrics });
-    // Internal API (analyzer verdicts + DLP admin) on the same listener when a
-    // token is configured.
+    let mut app = ops_router(AppState {
+        metrics: metrics.clone(),
+    })
+    // Download portal gate on the same listener.
+    .merge(secmail::portal::router(secmail::portal::PortalState {
+        store: store.clone(),
+        storage: storage.clone(),
+        metrics: metrics.clone(),
+    }));
+    // Internal API (analyzer verdicts + DLP admin) when a token is configured.
     if !cfg.internal_api.token.is_empty() {
-        let store: Arc<dyn secmail::store::Store> = Arc::new(secmail::store::Memory::new());
         app = app.merge(secmail::internalapi::router(
             secmail::internalapi::ApiState {
-                store,
+                store: store.clone(),
                 token: cfg.internal_api.token.clone(),
                 admin_token: cfg.internal_api.admin_token.clone(),
             },
         ));
         eprintln!("internal API mounted (/internal/v1/...)");
     }
-    eprintln!("ops HTTP (/metrics, /healthz) listening on {ops_listen}");
+    eprintln!("ops HTTP (/metrics, /healthz, /dl/) listening on {ops_listen}");
     let http_task = tokio::spawn(secmail::http::serve(ops_l, app));
 
     // Run until Ctrl-C.

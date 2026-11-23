@@ -235,6 +235,7 @@ pub struct Storage {
     #[serde(rename = "type")]
     pub kind: String,
     pub encryption_key: String,
+    pub dir: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -486,6 +487,7 @@ impl Default for Storage {
         Storage {
             kind: "fs".into(),
             encryption_key: String::new(),
+            dir: "./data/objects".into(),
         }
     }
 }

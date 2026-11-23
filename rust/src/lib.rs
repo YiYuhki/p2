@@ -21,6 +21,7 @@ pub mod portal;
 pub mod processor;
 pub mod queue;
 pub mod ratelimit;
+pub mod service;
 pub mod smtpclient;
 pub mod storage;
 pub mod store;

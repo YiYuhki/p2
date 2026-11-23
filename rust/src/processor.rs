@@ -1,7 +1,6 @@
-//! The inbound message processor wired into the SMTP proxy. This is the port's
-//! current inbound pipeline: optional ARC sealing of the relayed message. The
-//! attachment-quarantine and banner-insertion stages land with the mimeproc
-//! port; the hook points are already here.
+//! The inbound message processor wired into the SMTP proxy: attachment
+//! quarantine (replacing attachments with download links) followed by optional
+//! ARC sealing of the relayed message.
 
 use std::sync::Arc;
 
@@ -9,30 +8,35 @@ use async_trait::async_trait;
 
 use crate::arc::Sealer;
 use crate::gateway::{Envelope, MessageProcessor, ProcessError};
+use crate::service::Service;
 
-/// Inbound processor. For now it relays unchanged, optionally ARC-sealing.
+/// Inbound processor: quarantine (when configured) then optional ARC seal.
 pub struct InboundProcessor {
+    service: Option<Arc<Service>>,
     arc: Option<Arc<Sealer>>,
 }
 
 impl InboundProcessor {
-    pub fn new(arc: Option<Arc<Sealer>>) -> Self {
-        InboundProcessor { arc }
+    pub fn new(service: Option<Arc<Service>>, arc: Option<Arc<Sealer>>) -> Self {
+        InboundProcessor { service, arc }
     }
 }
 
 #[async_trait]
 impl MessageProcessor for InboundProcessor {
-    async fn process(&self, _env: &Envelope, raw: &[u8]) -> Result<Vec<u8>, ProcessError> {
+    async fn process(&self, env: &Envelope, raw: &[u8]) -> Result<Vec<u8>, ProcessError> {
+        let quarantined = match &self.service {
+            Some(s) => s.quarantine(env, raw).await?,
+            None => raw.to_vec(),
+        };
         if let Some(sealer) = &self.arc {
-            // Authentication results will be supplied by the auth stage once the
-            // SPF/DKIM/DMARC verifiers land; seal with "none" until then.
-            match sealer.seal(raw, "none") {
-                Ok(out) => return Ok(out),
-                Err(_) => return Ok(raw.to_vec()), // sealing is advisory
+            // The auth stage (SPF/DKIM/DMARC) will supply real results; seal with
+            // "none" until then. Sealing is advisory, so a failure is non-fatal.
+            if let Ok(out) = sealer.seal(&quarantined, "none") {
+                return Ok(out);
             }
         }
-        Ok(raw.to_vec())
+        Ok(quarantined)
     }
 }
 
@@ -41,8 +45,8 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn passthrough_without_arc() {
-        let p = InboundProcessor::new(None);
+    async fn passthrough_without_service_or_arc() {
+        let p = InboundProcessor::new(None, None);
         let out = p.process(&Envelope::default(), b"hi").await.unwrap();
         assert_eq!(out, b"hi");
     }
