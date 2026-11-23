@@ -39,6 +39,7 @@ pub struct Envelope {
 }
 
 /// Outcome of processing a message before relay.
+#[derive(Debug)]
 pub enum ProcessError {
     /// The processor kept the message (DLP hold): client gets 250, nothing relayed.
     Held,
