@@ -7,4 +7,5 @@
 pub mod arc;
 pub mod dnsbl;
 pub mod greylist;
+pub mod model;
 pub mod ratelimit;
