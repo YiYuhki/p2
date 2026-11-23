@@ -28,11 +28,17 @@ proxy (lock-step relay to the upstream) and an ops HTTP server
 | `queue` | `internal/queue` | ✅ memory + verdict retry (Redis pending) |
 | `metrics` | `internal/metrics` | ✅ Prometheus collectors |
 | `smtpclient` + `gateway` | `internal/smtpclient`, `internal/gateway` | ✅ async SMTP proxy (STARTTLS pending) |
-| `http` | — | ✅ metrics + health (portal/admin/internal-API pending) |
-| `main` | `cmd/secmail` | ✅ runs proxy + ops HTTP; `validate-config` |
-| MIME rewrite, attachment quarantine | `internal/mimeproc`, `internal/service` | ⏳ |
-| SPF/DKIM/DMARC verification | `internal/{spfutil,dkimutil,dmarc}` | ⏳ |
-| outbound DLP service, portal, admin dashboard, internal API, Postgres/Redis | — | ⏳ |
+| `mimeproc` | `internal/mimeproc` | ✅ parse (subject/text/attachments) + SanitizeFilename (rewrite/banner pending) |
+| `dlp::scan_message` | `internal/dlp` | ✅ scans subject + bodies + text attachments |
+| `outbound` | `internal/outbound` | ✅ decide + hold/block/relay + exemptions + dry-run |
+| `internalapi` | `internal/internalapi` | ✅ verdicts + DLP admin (holds/events/audit/rule-test) |
+| `portal` | `internal/portal` | ✅ token-gated download gate (OTP/review/admin-UI pending) |
+| `http`, `main` | `cmd/secmail` | ✅ ops HTTP + internal API mounted; `validate-config` |
+| `authres` | `internal/authres` | ✅ |
+| SPF/DKIM/DMARC verification | `internal/{spfutil,dkimutil,dmarc}` | ⏳ (authres rendering done; verifiers pending) |
+| MIME rewrite + inbound attachment quarantine | `internal/{mimeproc,service}` | ⏳ |
+| portal OTP/session auth + DLP review + admin dashboard | `internal/portal` | ⏳ |
+| Postgres store + Redis queue, STARTTLS | — | ⏳ |
 
 ## Build & test
 

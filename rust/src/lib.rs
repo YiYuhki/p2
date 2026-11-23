@@ -5,6 +5,7 @@
 //! async I/O layers (SMTP proxy, HTTP portal, Postgres/Redis stores) follow.
 
 pub mod arc;
+pub mod authres;
 pub mod config;
 pub mod dlp;
 pub mod dnsbl;
