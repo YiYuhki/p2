@@ -21,5 +21,9 @@ serde_yml = "0.0.12"
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "std", "serde"] }
 aes-gcm = "0.10.3"
 rand = "0.8.5"
+rsa = { version = "0.9.8", features = ["sha2"] }
+sha2 = "0.10.9"
+hmac = "0.12.1"
+base64 = "0.22.1"
 
 [dev-dependencies]

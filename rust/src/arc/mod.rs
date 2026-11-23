@@ -5,5 +5,7 @@
 //! a later step together with the RSA key handling.
 
 pub mod canon;
+pub mod seal;
 
 pub use canon::{relaxed_body, relaxed_header};
+pub use seal::Sealer;
