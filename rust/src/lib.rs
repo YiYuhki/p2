@@ -12,6 +12,7 @@ pub mod gateway;
 pub mod greylist;
 pub mod http;
 pub mod metrics;
+pub mod mimeproc;
 pub mod model;
 pub mod processor;
 pub mod queue;

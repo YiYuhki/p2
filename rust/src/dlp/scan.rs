@@ -310,6 +310,43 @@ impl Scanner {
         rep.findings.sort_by_key(|f| std::cmp::Reverse(f.sev()));
         rep
     }
+
+    /// Parses a raw message and scans its subject, text bodies and text
+    /// attachments. Port of the Go ScanMessage text path (OCR/archive extraction
+    /// is the analysis project's territory). Non-text attachments are noted as
+    /// uninspectable.
+    pub fn scan_message(&self, raw: &[u8]) -> Report {
+        let mut rep = Report::default();
+        let parsed = match crate::mimeproc::parse(raw) {
+            Ok(p) => p,
+            Err(_) => {
+                rep.uninspectable
+                    .push("메일 구조 해석 실패: 원문 전체를 텍스트로 검사".into());
+                rep.findings = self.scan_text("메일 원문", &String::from_utf8_lossy(raw));
+                self.escalate(&mut rep);
+                rep.findings.sort_by_key(|f| std::cmp::Reverse(f.sev()));
+                return rep;
+            }
+        };
+        if !parsed.subject.is_empty() {
+            rep.findings.extend(self.scan_text("제목", &parsed.subject));
+        }
+        for body in &parsed.text_parts {
+            rep.findings.extend(self.scan_text("본문", body));
+        }
+        for att in &parsed.attachments {
+            let loc = format!("첨부 {}", att.filename);
+            match std::str::from_utf8(&att.data) {
+                Ok(text) => rep.findings.extend(self.scan_text(&loc, text)),
+                Err(_) => rep
+                    .uninspectable
+                    .push(format!("{loc}: 텍스트로 해석할 수 없는 첨부")),
+            }
+        }
+        self.escalate(&mut rep);
+        rep.findings.sort_by_key(|f| std::cmp::Reverse(f.sev()));
+        rep
+    }
 }
 
 fn is_identity_detector(id: &str) -> bool {
@@ -549,6 +586,28 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(out[0].contains('*'));
         assert!(test_rule(r"(\d)(\d)", "12", 50).is_err()); // >1 capture group
+    }
+
+    #[test]
+    fn scan_message_subject_body_attachment() {
+        let s = scanner();
+        let raw = b"From: a@ext.org\r\nSubject: card 4111 1111 1111 1111\r\n\
+MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"B\"\r\n\r\n\
+--B\r\nContent-Type: text/plain\r\n\r\n\
+\xEC\xA3\xBC\xEB\xAF\xBC 900101-1234567\r\n\
+--B\r\nContent-Type: text/csv; name=\"list.csv\"\r\n\
+Content-Disposition: attachment; filename=\"list.csv\"\r\n\r\n\
+name,ssn\r\nkim,900101-1234567\r\n--B--\r\n";
+        let rep = s.scan_message(raw);
+        assert!(rep.findings.iter().any(|f| f.detector == "kr_rrn"));
+        assert!(rep
+            .findings
+            .iter()
+            .any(|f| f.location == "제목" && f.detector == "credit_card"));
+        assert!(rep
+            .findings
+            .iter()
+            .any(|f| f.location.starts_with("첨부 list.csv")));
     }
 
     #[test]
