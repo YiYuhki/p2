@@ -1,44 +1,62 @@
 # secmail (Rust port)
 
 A ground-up Rust reimplementation of the Go `secmail` secure mail gateway
-(DLP, inbound authentication, quarantine portal). It is being ported **subsystem
-by subsystem**: each lands compiling and unit-tested before the next.
+(DLP, inbound authentication, attachment quarantine, recipient portal), built on
+`tokio`, `axum`, `tokio-rustls`, `tokio-postgres` and `redis`.
 
-The pure-logic layers are ported first; the async I/O layers (SMTP proxy, HTTP
-portal, Postgres/Redis stores) follow, built on `tokio`.
+`secmail -config config.yaml` runs the full gateway:
 
-The binary **runs**: `secmail -config config.yaml` starts the inbound SMTP
-proxy (lock-step relay to the upstream) and an ops HTTP server
-(`/metrics`, `/healthz`); `secmail validate-config` checks a config and exits.
+- **Inbound SMTP proxy** (STARTTLS, DNSBL, greylisting, per-IP rate limit):
+  SPF/DKIM/DMARC verification, optional DMARC enforcement, attachment
+  quarantine with a structural MIME rewrite and download banner,
+  `Authentication-Results` + `Received`, ARC sealing and gateway DKIM signing.
+- **Outbound DLP proxy**: scan, then relay, hold for review, or block.
+- **Recipient portal** (HTTP or HTTPS): token-gated downloads, OTP/header
+  authentication, DLP review pages and the admin dashboard. Releasing a held
+  message relays it to the outbound next hop.
+- **Ops/internal API**: `/metrics`, `/healthz`, analyzer verdict and DLP admin
+  endpoints.
+- **Background workers**: Redis verdict consumer and the janitor (re-queue
+  stalled analyses, give up after `max_attempts`, expire attachments and holds,
+  prune audit events).
 
-## Status
+`secmail validate-config -config config.yaml` checks a config and exits.
 
-| Module | Go source | Status |
-|--------|-----------|--------|
-| `arc::canon` + `arc::seal` | `internal/arc` | ✅ RFC 6376 canon + RSA-SHA256 AMS/Seal |
-| `dnsbl` | `internal/dnsbl` | ✅ reversal/zone logic + `Resolver` trait |
-| `greylist` | `internal/greylist` | ✅ |
-| `ratelimit` | `internal/ratelimit` | ✅ token bucket |
-| `model` | `internal/model` | ✅ |
-| `config` | `internal/config` | ✅ full sections + validation + `${ENV}` |
-| `storage::encrypt` | `internal/storage` | ✅ AES-256-GCM, byte-compatible framing |
-| `webhook` | `internal/webhook` | ✅ HMAC + retry/backoff + DLQ |
-| `dlp` | `internal/dlp` | ✅ detectors + scanner + escalation + `test_rule` |
-| `store` | `internal/store` | ✅ async trait + in-memory (Postgres pending) |
-| `queue` | `internal/queue` | ✅ memory + verdict retry (Redis pending) |
-| `metrics` | `internal/metrics` | ✅ Prometheus collectors |
-| `smtpclient` + `gateway` | `internal/smtpclient`, `internal/gateway` | ✅ async SMTP proxy (STARTTLS pending) |
-| `mimeproc` | `internal/mimeproc` | ✅ parse (subject/text/attachments) + SanitizeFilename (rewrite/banner pending) |
-| `dlp::scan_message` | `internal/dlp` | ✅ scans subject + bodies + text attachments |
-| `outbound` | `internal/outbound` | ✅ decide + hold/block/relay + exemptions + dry-run |
-| `internalapi` | `internal/internalapi` | ✅ verdicts + DLP admin (holds/events/audit/rule-test) |
-| `portal` | `internal/portal` | ✅ token-gated download gate (OTP/review/admin-UI pending) |
-| `http`, `main` | `cmd/secmail` | ✅ ops HTTP + internal API mounted; `validate-config` |
-| `authres` | `internal/authres` | ✅ |
-| SPF/DKIM/DMARC verification | `internal/{spfutil,dkimutil,dmarc}` | ⏳ (authres rendering done; verifiers pending) |
-| MIME rewrite + inbound attachment quarantine | `internal/{mimeproc,service}` | ⏳ |
-| portal OTP/session auth + DLP review + admin dashboard | `internal/portal` | ⏳ |
-| Postgres store + Redis queue, STARTTLS | — | ⏳ |
+## Backends
+
+| Setting | Values |
+|---------|--------|
+| `database.type` | `memory` (default) or `postgres` (`database.dsn`; migrations run at startup under the same advisory lock as the Go service) |
+| `queue.type` | `memory` (default; verdicts via the internal API) or `redis` (`redis.addr`, `queue.key_prefix`) |
+| `storage.encryption_key` | 64 hex chars enables AES-256-GCM at rest (byte-compatible with Go) |
+| `smtp.tls_cert_file` / `tls_key_file` | enables inbound STARTTLS |
+| `upstream.starttls` / `require_tls` / `insecure_skip_verify` | upstream STARTTLS |
+| `portal.tls_cert_file` / `tls_key_file` | serves the portal over HTTPS |
+
+## Modules
+
+| Module | Go source |
+|--------|-----------|
+| `gateway`, `smtpclient`, `tls` | `internal/gateway`, `internal/smtpclient` |
+| `processor` | `internal/gateway` processor (auth → quarantine → headers → ARC → DKIM) |
+| `spf`, `dkim`, `dmarc`, `dns` | `internal/{spfutil,dkimutil,dmarc}` (native verifiers, hickory DNS) |
+| `arc`, `authres` | `internal/arc`, `internal/authres` |
+| `mimetree`, `mimeproc` | `internal/mimeproc` (raw-byte MIME tree, extract, banner) |
+| `service`, `janitor` | `internal/service` (quarantine, verdicts, janitor, notices) |
+| `outbound`, `dlp` | `internal/outbound`, `internal/dlp` |
+| `portal` | `internal/portal` (downloads, OTP/session/CSRF, DLP review, dashboard) |
+| `internalapi`, `http`, `metrics` | `internal/internalapi`, ops HTTP |
+| `store::{memory,postgres}`, `queue`, `redisq`, `storage` | `internal/{store,queue,storage}` |
+| `config`, `model`, `dnsbl`, `greylist`, `ratelimit`, `webhook` | same-named Go packages |
+
+### Differences from the Go version
+
+- The portal streams CLEAN files directly from `GET /dl/{token}`; Go's
+  one-time download-ticket step is not ported.
+- OTP codes are kept in memory (no Redis code store).
+- The webhook notifier has no production HTTP transport wired in yet.
+- `timezone` accepts fixed offsets (`+09:00`) and a few common zone names.
+- DKIM verification supports `rsa-sha256` (not `ed25519-sha256`).
 
 ## Build & test
 
@@ -49,8 +67,17 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
+The Postgres and Redis integration tests run when these are set (they skip
+otherwise):
+
+```sh
+SECMAIL_TEST_PG='host=127.0.0.1 user=postgres password=postgres dbname=secmail_test' \
+SECMAIL_TEST_REDIS=redis://127.0.0.1:6379/ cargo test
+```
+
 ## Scope
 
 As with the Go implementation, the file static/dynamic **analysis engine** stays
 a separate project; this port provides the gateway and the analyzer integration
-contract, not the engine.
+contract (jobs on the queue, verdicts back via Redis or the internal API), not
+the engine.

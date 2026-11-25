@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-mod dur {
+pub mod dur {
     //! Go-style duration (`"60s"`, `"5m"`, `"72h"`, `"1h30m"`, `"0s"`) <-> Duration.
     use super::Duration;
     use serde::{Deserialize, Deserializer};
@@ -99,6 +99,7 @@ pub struct Config {
     pub storage: Storage,
     pub database: Database,
     pub redis: Redis,
+    pub queue: Queue,
     pub outbound: Outbound,
     pub dlp: Dlp,
     pub webhook: Webhook,
@@ -202,6 +203,10 @@ pub struct Portal {
     pub tls_cert_file: String,
     pub tls_key_file: String,
     pub auth: PortalAuth,
+    /// Take the client IP from X-Forwarded-For (behind a trusted proxy).
+    pub trust_proxy_headers: bool,
+    pub enum_per_ip_burst: i64,
+    pub enum_global_rps: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -218,6 +223,8 @@ pub struct PortalAuth {
     pub otp_max_attempts: i32,
     #[serde(deserialize_with = "dur::de_opt")]
     pub otp_resend_after: Duration,
+    /// Let any user of an accepted domain open attachment links.
+    pub allow_domain_users: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -255,6 +262,27 @@ pub struct Database {
 pub struct Redis {
     pub addr: String,
     pub pool_size: i32,
+    pub password: String,
+    pub db: i64,
+}
+
+/// Analysis queue backend.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct Queue {
+    /// "memory" (in-process; verdicts via the internal API) or "redis".
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub key_prefix: String,
+}
+
+impl Default for Queue {
+    fn default() -> Self {
+        Queue {
+            kind: "memory".into(),
+            key_prefix: "secmail".into(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -383,6 +411,7 @@ impl Default for Config {
             },
             storage: Storage::default(),
             database: Database::default(),
+            queue: Queue::default(),
             redis: Redis {
                 addr: "localhost:6379".into(),
                 ..Default::default()
@@ -463,6 +492,9 @@ impl Default for Portal {
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
             auth: PortalAuth::default(),
+            trust_proxy_headers: false,
+            enum_per_ip_burst: 0,
+            enum_global_rps: 0.0,
         }
     }
 }
@@ -478,6 +510,7 @@ impl Default for PortalAuth {
             otp_ttl: Duration::from_secs(10 * 60),
             otp_max_attempts: 5,
             otp_resend_after: Duration::from_secs(60),
+            allow_domain_users: false,
         }
     }
 }
@@ -593,6 +626,36 @@ impl Config {
 
         if self.upstream.addr.is_empty() {
             errs.push("upstream.addr is required".into());
+        }
+        match self.queue.kind.as_str() {
+            "memory" => {}
+            "redis" if self.redis.addr.is_empty() => {
+                errs.push("redis.addr is required when queue.type is redis".into())
+            }
+            "redis" => {}
+            v => errs.push(format!("queue.type: unknown value {v:?} (memory|redis)")),
+        }
+        match self.database.kind.as_str() {
+            "memory" => {}
+            "postgres" if self.database.dsn.is_empty() => {
+                errs.push("database.dsn is required when database.type is postgres".into())
+            }
+            "postgres" => {}
+            v => errs.push(format!(
+                "database.type: unknown value {v:?} (memory|postgres)"
+            )),
+        }
+        if !self.storage.encryption_key.is_empty() {
+            let k = self.storage.encryption_key.trim();
+            if k.len() != 64 || !k.chars().all(|c| c.is_ascii_hexdigit()) {
+                errs.push("storage.encryption_key must be 64 hex characters (AES-256)".into());
+            }
+        }
+        if (self.smtp.tls_cert_file.is_empty()) != (self.smtp.tls_key_file.is_empty()) {
+            errs.push("smtp.tls_cert_file and smtp.tls_key_file must be set together".into());
+        }
+        if (self.portal.tls_cert_file.is_empty()) != (self.portal.tls_key_file.is_empty()) {
+            errs.push("portal.tls_cert_file and portal.tls_key_file must be set together".into());
         }
         if self.smtp.accepted_domains.is_empty() {
             errs.push("smtp.accepted_domains must not be empty (open relay protection)".into());

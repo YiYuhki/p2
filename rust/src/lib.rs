@@ -16,6 +16,7 @@ pub mod gateway;
 pub mod greylist;
 pub mod http;
 pub mod internalapi;
+pub mod janitor;
 pub mod metrics;
 pub mod mimeproc;
 pub mod mimetree;
