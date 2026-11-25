@@ -10,6 +10,7 @@ pub mod config;
 pub mod dkim;
 pub mod dlp;
 pub mod dmarc;
+pub mod dns;
 pub mod dnsbl;
 pub mod gateway;
 pub mod greylist;

@@ -44,8 +44,14 @@ struct DnsblGate {
 impl secmail::gateway::ConnGate for DnsblGate {
     async fn gate(&self, ip: std::net::IpAddr) -> Option<secmail::gateway::SmtpError> {
         let c = self.checker.clone();
-        let zone = tokio::task::spawn_blocking(move || c.listed(ip)).await.ok().flatten()?;
-        Some(secmail::gateway::SmtpError::new(554, &format!("Client host [{ip}] blocked by {zone}")))
+        let zone = tokio::task::spawn_blocking(move || c.listed(ip))
+            .await
+            .ok()
+            .flatten()?;
+        Some(secmail::gateway::SmtpError::new(
+            554,
+            &format!("Client host [{ip}] blocked by {zone}"),
+        ))
     }
 }
 
@@ -115,7 +121,10 @@ async fn run(cfg_path: &str) -> Result<(), String> {
     // Optional inbound protections (greylisting, per-IP message rate limit).
     let mut greylist: Option<Arc<dyn secmail::gateway::Greylister>> = None;
     if cfg.greylist.enabled {
-        let gl = Arc::new(secmail::greylist::Greylist::new(cfg.greylist.delay, cfg.greylist.expiry));
+        let gl = Arc::new(secmail::greylist::Greylist::new(
+            cfg.greylist.delay,
+            cfg.greylist.expiry,
+        ));
         let sweep = gl.clone();
         tokio::spawn(async move {
             let mut t = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -128,7 +137,10 @@ async fn run(cfg_path: &str) -> Result<(), String> {
         eprintln!("greylisting enabled");
     }
     let mut rate_limit: Option<Arc<dyn secmail::gateway::RateLimiter>> = None;
-    if let Some(rl) = secmail::ratelimit::Limiter::new(cfg.smtp.rate_limit_per_ip_rps, cfg.smtp.rate_limit_per_ip_burst) {
+    if let Some(rl) = secmail::ratelimit::Limiter::new(
+        cfg.smtp.rate_limit_per_ip_rps,
+        cfg.smtp.rate_limit_per_ip_burst,
+    ) {
         let rl = Arc::new(rl);
         let sweep = rl.clone();
         tokio::spawn(async move {
@@ -144,8 +156,12 @@ async fn run(cfg_path: &str) -> Result<(), String> {
 
     // Optional DNSBL connection gate.
     let mut conn_gate: Option<Arc<dyn secmail::gateway::ConnGate>> = None;
-    if let Some(checker) = secmail::dnsbl::Checker::new(&cfg.dnsbl.zones, secmail::dnsbl::StdResolver) {
-        conn_gate = Some(Arc::new(DnsblGate { checker: Arc::new(checker) }));
+    if let Some(checker) =
+        secmail::dnsbl::Checker::new(&cfg.dnsbl.zones, secmail::dnsbl::StdResolver)
+    {
+        conn_gate = Some(Arc::new(DnsblGate {
+            checker: Arc::new(checker),
+        }));
         eprintln!("dnsbl enabled: {:?}", cfg.dnsbl.zones);
     }
 
@@ -175,8 +191,11 @@ async fn run(cfg_path: &str) -> Result<(), String> {
     // Optional outbound DLP listener.
     if cfg.outbound.enabled {
         let scanner = Arc::new(
-            secmail::dlp::Scanner::new(secmail::dlp::Options { combine_pii: true, ..Default::default() })
-                .map_err(|e| e.to_string())?,
+            secmail::dlp::Scanner::new(secmail::dlp::Options {
+                combine_pii: true,
+                ..Default::default()
+            })
+            .map_err(|e| e.to_string())?,
         );
         let policy = secmail::outbound::Policy {
             high: cfg.dlp.actions.high.clone(),
@@ -218,7 +237,10 @@ async fn run(cfg_path: &str) -> Result<(), String> {
         let out_l = tokio::net::TcpListener::bind(&out_listen)
             .await
             .map_err(|e| format!("bind outbound {out_listen}: {e}"))?;
-        eprintln!("outbound DLP proxy listening on {out_listen} -> next-hop {}", cfg.outbound.next_hop.addr);
+        eprintln!(
+            "outbound DLP proxy listening on {out_listen} -> next-hop {}",
+            cfg.outbound.next_hop.addr
+        );
         tokio::spawn(obe.serve(out_l));
     }
 
