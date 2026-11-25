@@ -18,6 +18,7 @@ pub mod http;
 pub mod internalapi;
 pub mod metrics;
 pub mod mimeproc;
+pub mod mimetree;
 pub mod model;
 pub mod outbound;
 pub mod portal;

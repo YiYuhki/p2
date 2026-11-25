@@ -1,7 +1,7 @@
 //! MIME parsing and filename sanitization. Port of the Go `internal/mimeproc`
 //! parsing/extraction surface, built on the `mailparse` crate (RFC 2047 header
 //! decoding and transfer-encoding handled by the crate). Message *rewriting*
-//! (banner insertion, attachment stripping, re-serialization) is a follow-up.
+//! (banner insertion, attachment stripping, re-serialization) lives in `mimetree`.
 
 use mailparse::{parse_mail, MailHeaderMap, ParsedMail};
 
