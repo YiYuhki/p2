@@ -11,6 +11,7 @@ use crate::model::{
 };
 
 pub mod memory;
+pub mod postgres;
 pub use memory::Memory;
 
 /// Store error.

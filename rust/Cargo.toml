@@ -32,5 +32,14 @@ uuid = { version = "1.18.1", features = ["v4"] }
 prometheus = "0.13.4"
 axum = "0.8.6"
 mailparse = "0.16.1"
+tokio-postgres = { version = "0.7.13", features = ["with-chrono-0_4", "with-serde_json-1"] }
+deadpool-postgres = "0.14.1"
+redis = { version = "0.32.5", default-features = false, features = ["tokio-comp", "aio"] }
+hickory-resolver = { version = "0.25.2", features = ["tokio"] }
+psl = "2.1.120"
+tokio-rustls = { version = "0.26.2", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls = { version = "0.23.31", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2.2.0"
+webpki-roots = "1.0.2"
 
 [dev-dependencies]
