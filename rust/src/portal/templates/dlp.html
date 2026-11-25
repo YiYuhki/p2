@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>발송 보류 메일 검토</title>
+<style nonce="{{nonce}}">
+{{styles}}
+</style>
+</head>
+<body>
+<main class="{{status}}">
+<div class="card">
+  {{badge}}
+  <h1>발송 보류 메일 검토</h1>
+  <p>외부로 발송하려던 메일에서 민감정보가 탐지되어 발송이 보류되었습니다. 내용을 확인한 뒤 승인하거나 반려하세요.</p>
+
+  <dl class="kv">
+    <dt>제목</dt><dd>{{subject}}</dd>
+    <dt>발신</dt><dd>{{from}}</dd>
+    <dt>수신</dt><dd>{{to}}</dd>
+    <dt>접수</dt><dd>{{created}}</dd>
+    {{decision}}
+  </dl>
+
+  <table class="f">
+    <tr><th>등급</th><th>항목</th><th>위치</th><th>예시(마스킹)</th></tr>
+    {{findings}}
+  </table>
+
+  {{messages}}
+  {{forms}}
+  {{userbar}}
+</div>
+<footer>보안 메일 게이트웨이 · DLP</footer>
+</main>
+</body>
+</html>
