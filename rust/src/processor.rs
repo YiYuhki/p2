@@ -266,7 +266,7 @@ fn from_header_domain(raw: &[u8]) -> String {
     // Fallback for a malformed header: the text after the first '@'.
     match from.split_once('@') {
         Some((_, rest)) => rest
-            .split(|c: char| matches!(c, '>' | ' ' | '\t' | ')' | ',' | ';'))
+            .split(['>', ' ', '\t', ')', ',', ';'])
             .next()
             .unwrap_or("")
             .trim_matches(|c| c == '.' || c == '<' || c == '>')
