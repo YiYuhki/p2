@@ -181,6 +181,9 @@ async fn run(cfg_path: &str) -> Result<(), String> {
                     cfg.upstream.helo_name.clone()
                 },
                 timeout: cfg.upstream.timeout,
+                starttls: cfg.upstream.starttls,
+                require_tls: cfg.upstream.require_tls,
+                insecure_skip_verify: cfg.upstream.insecure_skip_verify,
             },
             greylist,
             rate_limit,
@@ -229,6 +232,7 @@ async fn run(cfg_path: &str) -> Result<(), String> {
                     addr: cfg.outbound.next_hop.addr.clone(),
                     helo_name: cfg.smtp.hostname.clone(),
                     timeout: cfg.outbound.next_hop.timeout,
+                    ..Default::default()
                 },
                 ..Default::default()
             },

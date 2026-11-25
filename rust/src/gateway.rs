@@ -10,6 +10,8 @@ use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::tls::BoxIo;
+
 use crate::smtpclient::{self, Client, Options as UpstreamOptions};
 
 /// SMTP error reply.
@@ -94,6 +96,10 @@ pub struct BackendOptions {
     pub conn_gate: Option<Arc<dyn ConnGate>>,
     pub greylist: Option<Arc<dyn Greylister>>,
     pub rate_limit: Option<Arc<dyn RateLimiter>>,
+    /// Offer STARTTLS with this server configuration.
+    pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// Refuse MAIL until the client has negotiated TLS.
+    pub require_tls: bool,
 }
 
 /// The inbound/outbound backend.
@@ -127,21 +133,21 @@ impl Backend {
     }
 
     async fn handle(&self, stream: TcpStream, remote: String) -> std::io::Result<()> {
-        let (r, mut w) = tokio::io::split(stream);
-        let mut reader = BufReader::new(r);
+        let mut conn: BufReader<BoxIo> = BufReader::new(Box::new(stream));
+        let mut tls_on = false;
 
         // Connection gate (DNSBL).
         if let Some(gate) = &self.opts.conn_gate {
             if let Ok(ip) = host_only(&remote).parse::<IpAddr>() {
                 if let Some(err) = gate.gate(ip).await {
-                    reply(&mut w, err.code, &err.message).await?;
+                    reply(&mut conn, err.code, &err.message).await?;
                     return Ok(());
                 }
             }
         }
 
         reply(
-            &mut w,
+            &mut conn,
             220,
             &format!("{} ESMTP secmail", self.opts.hostname),
         )
@@ -154,20 +160,69 @@ impl Backend {
 
         loop {
             let mut line = String::new();
-            let n = reader.read_line(&mut line).await?;
+            let n = conn.read_line(&mut line).await?;
             if n == 0 {
                 break;
             }
             let line = line.trim_end().to_string();
             let (cmd, arg) = split_cmd(&line);
             match cmd.as_str() {
-                "EHLO" | "HELO" => {
+                "HELO" => {
                     helo = arg.to_string();
-                    reply(&mut w, 250, &format!("{} greets {arg}", self.opts.hostname)).await?;
+                    reply(
+                        &mut conn,
+                        250,
+                        &format!("{} greets {arg}", self.opts.hostname),
+                    )
+                    .await?;
+                }
+                "EHLO" => {
+                    helo = arg.to_string();
+                    let mut lines = vec![
+                        format!("{} greets {arg}", self.opts.hostname),
+                        "8BITMIME".to_string(),
+                        "ENHANCEDSTATUSCODES".to_string(),
+                    ];
+                    if self.opts.max_message_bytes > 0 {
+                        lines.push(format!("SIZE {}", self.opts.max_message_bytes));
+                    }
+                    if self.opts.tls.is_some() && !tls_on {
+                        lines.push("STARTTLS".to_string());
+                    }
+                    reply_multi(&mut conn, 250, &lines).await?;
+                }
+                "STARTTLS" => {
+                    let cfg = match (&self.opts.tls, tls_on) {
+                        (Some(c), false) => c.clone(),
+                        (_, true) => {
+                            reply(&mut conn, 503, "TLS already active").await?;
+                            continue;
+                        }
+                        (None, _) => {
+                            reply(&mut conn, 502, "Command not implemented").await?;
+                            continue;
+                        }
+                    };
+                    reply(&mut conn, 220, "Ready to start TLS").await?;
+                    let io = conn.into_inner();
+                    let tls = crate::tls::accept(io, cfg).await?;
+                    conn = BufReader::new(tls);
+                    tls_on = true;
+                    // RFC 3207 §4.2: discard all prior session state.
+                    helo.clear();
+                    from.clear();
+                    rcpt.clear();
+                    if let Some(mut c) = up.take() {
+                        let _ = c.quit().await;
+                    }
                 }
                 "MAIL" => {
                     from = String::new();
                     rcpt.clear();
+                    if self.opts.require_tls && !tls_on {
+                        reply(&mut conn, 530, "Must issue a STARTTLS command first").await?;
+                        continue;
+                    }
                     let addr = parse_path(arg);
                     if self
                         .opts
@@ -176,14 +231,19 @@ impl Backend {
                         .map(|r| !r.allow(&host_only(&remote)))
                         .unwrap_or(false)
                     {
-                        reply(&mut w, 451, "Message rate limit exceeded, please slow down").await?;
+                        reply(
+                            &mut conn,
+                            451,
+                            "Message rate limit exceeded, please slow down",
+                        )
+                        .await?;
                         continue;
                     }
                     if !addr.is_empty()
                         && !self.opts.sender_domains.is_empty()
                         && !domain_in(&addr, &self.opts.sender_domains)
                     {
-                        reply(&mut w, 550, "Sender domain not allowed").await?;
+                        reply(&mut conn, 550, "Sender domain not allowed").await?;
                         continue;
                     }
                     if up.is_none() {
@@ -191,7 +251,7 @@ impl Backend {
                             Ok(c) => up = Some(c),
                             Err(_) => {
                                 reply(
-                                    &mut w,
+                                    &mut conn,
                                     451,
                                     "Upstream mail server unavailable, please retry",
                                 )
@@ -203,29 +263,29 @@ impl Backend {
                     match up.as_mut().unwrap().mail(&addr).await {
                         Ok(()) => {
                             from = addr;
-                            reply(&mut w, 250, "OK").await?;
+                            reply(&mut conn, 250, "OK").await?;
                         }
                         Err(e) => {
-                            emit_upstream_err(&mut w, e, &mut up).await?;
+                            emit_upstream_err(&mut conn, e, &mut up).await?;
                         }
                     }
                 }
                 "RCPT" => {
                     if up.is_none() {
-                        reply(&mut w, 503, "Need MAIL command").await?;
+                        reply(&mut conn, 503, "Need MAIL command").await?;
                         continue;
                     }
                     let addr = parse_path(arg);
                     if !self.opts.recipient_domains.is_empty()
                         && !domain_in(&addr, &self.opts.recipient_domains)
                     {
-                        reply(&mut w, 550, "Relaying denied").await?;
+                        reply(&mut conn, 550, "Relaying denied").await?;
                         continue;
                     }
                     if !from.is_empty() {
                         if let Some(gl) = &self.opts.greylist {
                             if !gl.allow(&host_only(&remote), &from, &addr) {
-                                reply(&mut w, 451, "Greylisted, please retry shortly").await?;
+                                reply(&mut conn, 451, "Greylisted, please retry shortly").await?;
                                 continue;
                             }
                         }
@@ -233,47 +293,46 @@ impl Backend {
                     match up.as_mut().unwrap().rcpt(&addr).await {
                         Ok(()) => {
                             rcpt.push(addr);
-                            reply(&mut w, 250, "OK").await?;
+                            reply(&mut conn, 250, "OK").await?;
                         }
                         Err(e) => {
-                            emit_upstream_err(&mut w, e, &mut up).await?;
+                            emit_upstream_err(&mut conn, e, &mut up).await?;
                         }
                     }
                 }
                 "DATA" => {
                     if up.is_none() || rcpt.is_empty() {
-                        reply(&mut w, 503, "Need RCPT command").await?;
+                        reply(&mut conn, 503, "Need RCPT command").await?;
                         continue;
                     }
-                    reply(&mut w, 354, "Start mail input; end with <CRLF>.<CRLF>").await?;
-                    let raw = match smtpclient::read_data(&mut reader, self.opts.max_message_bytes)
-                        .await
-                    {
-                        Ok(b) => b,
-                        Err(_) => {
-                            if let Some(c) = up.as_mut() {
-                                let _ = c.reset().await;
+                    reply(&mut conn, 354, "Start mail input; end with <CRLF>.<CRLF>").await?;
+                    let raw =
+                        match smtpclient::read_data(&mut conn, self.opts.max_message_bytes).await {
+                            Ok(b) => b,
+                            Err(_) => {
+                                if let Some(c) = up.as_mut() {
+                                    let _ = c.reset().await;
+                                }
+                                reply(&mut conn, 552, "Message too large or read error").await?;
+                                continue;
                             }
-                            reply(&mut w, 552, "Message too large or read error").await?;
-                            continue;
-                        }
-                    };
+                        };
                     let env = Envelope {
                         mail_from: from.clone(),
                         rcpt_to: rcpt.clone(),
                         remote_addr: remote.clone(),
                         helo: helo.clone(),
-                        tls: false,
+                        tls: tls_on,
                     };
                     match self.proc.process(&env, &raw).await {
                         Ok(out) => {
                             let c = up.as_mut().unwrap();
                             match c.data(&out).await {
                                 Ok(()) => {
-                                    reply(&mut w, 250, "OK: queued").await?;
+                                    reply(&mut conn, 250, "OK: queued").await?;
                                 }
                                 Err(e) => {
-                                    emit_upstream_err(&mut w, e, &mut up).await?;
+                                    emit_upstream_err(&mut conn, e, &mut up).await?;
                                 }
                             }
                         }
@@ -281,19 +340,19 @@ impl Backend {
                             if let Some(c) = up.as_mut() {
                                 let _ = c.reset().await;
                             }
-                            reply(&mut w, 250, "OK: accepted").await?;
+                            reply(&mut conn, 250, "OK: accepted").await?;
                         }
                         Err(ProcessError::Reject(err)) => {
                             if let Some(c) = up.as_mut() {
                                 let _ = c.reset().await;
                             }
-                            reply(&mut w, err.code, &err.message).await?;
+                            reply(&mut conn, err.code, &err.message).await?;
                         }
                         Err(ProcessError::TempFail) => {
                             if let Some(c) = up.as_mut() {
                                 let _ = c.reset().await;
                             }
-                            reply(&mut w, 451, "Temporary processing failure, please retry")
+                            reply(&mut conn, 451, "Temporary processing failure, please retry")
                                 .await?;
                         }
                     }
@@ -306,18 +365,18 @@ impl Backend {
                     if let Some(c) = up.as_mut() {
                         let _ = c.reset().await;
                     }
-                    reply(&mut w, 250, "OK").await?;
+                    reply(&mut conn, 250, "OK").await?;
                 }
-                "NOOP" => reply(&mut w, 250, "OK").await?,
+                "NOOP" => reply(&mut conn, 250, "OK").await?,
                 "QUIT" => {
                     if let Some(mut c) = up.take() {
                         let _ = c.quit().await;
                     }
-                    reply(&mut w, 221, "Bye").await?;
+                    reply(&mut conn, 221, "Bye").await?;
                     break;
                 }
                 "" => {}
-                _ => reply(&mut w, 502, "Command not implemented").await?,
+                _ => reply(&mut conn, 502, "Command not implemented").await?,
             }
         }
         Ok(())
@@ -336,6 +395,20 @@ async fn emit_upstream_err<W: AsyncWriteExt + Unpin>(
             reply(w, 451, "Upstream mail server unavailable, please retry").await
         }
     }
+}
+
+async fn reply_multi<W: AsyncWriteExt + Unpin>(
+    w: &mut W,
+    code: u16,
+    lines: &[String],
+) -> std::io::Result<()> {
+    let mut out = String::new();
+    for (i, l) in lines.iter().enumerate() {
+        let sep = if i + 1 == lines.len() { ' ' } else { '-' };
+        out.push_str(&format!("{code}{sep}{l}\r\n"));
+    }
+    w.write_all(out.as_bytes()).await?;
+    w.flush().await
 }
 
 async fn reply<W: AsyncWriteExt + Unpin>(
@@ -456,10 +529,17 @@ mod tests {
     }
 
     async fn read_reply(reader: &mut (impl AsyncBufReadExt + Unpin)) -> (u16, String) {
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-        let line = line.trim_end();
-        (line[..3].parse().unwrap(), line[3..].trim().to_string())
+        let mut all = String::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let l = line.trim_end();
+            all.push_str(l.get(4..).unwrap_or(""));
+            all.push('\n');
+            if l.as_bytes().get(3) != Some(&b'-') {
+                return (l[..3].parse().unwrap(), all.trim().to_string());
+            }
+        }
     }
 
     #[tokio::test]
@@ -475,6 +555,7 @@ mod tests {
                     addr: up_addr,
                     helo_name: "gw".into(),
                     timeout: std::time::Duration::from_secs(5),
+                    ..Default::default()
                 },
                 hostname: "gw.example.com".into(),
                 ..Default::default()
@@ -525,6 +606,7 @@ mod tests {
                     addr: up_addr,
                     helo_name: "gw".into(),
                     timeout: std::time::Duration::from_secs(5),
+                    ..Default::default()
                 },
                 hostname: "gw".into(),
                 ..Default::default()
@@ -546,5 +628,82 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read_reply(&mut reader).await.0, 550);
+    }
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+
+    struct Echo;
+    #[async_trait]
+    impl MessageProcessor for Echo {
+        async fn process(&self, _e: &Envelope, raw: &[u8]) -> Result<Vec<u8>, ProcessError> {
+            Ok(raw.to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn starttls_client_and_server() {
+        let cfg = crate::tls::server_config_from_pem(
+            include_bytes!("../testdata/tls-cert.pem"),
+            include_bytes!("../testdata/tls-key.pem"),
+        )
+        .unwrap();
+        let be = Arc::new(Backend::new(
+            Arc::new(Echo),
+            BackendOptions {
+                tls: Some(cfg),
+                require_tls: true,
+                upstream: UpstreamOptions {
+                    addr: "127.0.0.1:1".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ));
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        tokio::spawn(be.serve(l));
+
+        // Plain session: MAIL refused until STARTTLS.
+        let mut plain = Client::dial(&UpstreamOptions {
+            addr: addr.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert!(!plain.is_tls());
+        match plain.mail("a@example.com").await {
+            Err(smtpclient::Error::Smtp { code, .. }) => assert_eq!(code, 530),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // STARTTLS session (self-signed → insecure_skip_verify).
+        let mut c = Client::dial(&UpstreamOptions {
+            addr: addr.clone(),
+            starttls: true,
+            require_tls: true,
+            insecure_skip_verify: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert!(c.is_tls());
+        // Past the TLS gate the (unreachable) upstream yields a 451.
+        match c.mail("a@example.com").await {
+            Err(smtpclient::Error::Smtp { code, .. }) => assert_eq!(code, 451),
+            other => panic!("unexpected {other:?}"),
+        }
+        c.quit().await.unwrap();
+
+        // Verified mode rejects the self-signed certificate.
+        assert!(Client::dial(&UpstreamOptions {
+            addr,
+            starttls: true,
+            ..Default::default()
+        })
+        .await
+        .is_err());
     }
 }

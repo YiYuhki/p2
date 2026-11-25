@@ -1,11 +1,13 @@
 //! Minimal async SMTP client used to relay to the upstream (internal) mail
 //! server. Port of the Go `internal/smtpclient` (plaintext + the EHLO/MAIL/RCPT/
-//! DATA dialog). STARTTLS is a follow-up (tokio-rustls).
+//! DATA dialog) with opportunistic or required STARTTLS via tokio-rustls.
 
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+
+use crate::tls::BoxIo;
 use tokio::time::timeout;
 
 /// Connection options.
@@ -14,6 +16,12 @@ pub struct Options {
     pub addr: String,
     pub helo_name: String,
     pub timeout: Duration,
+    /// Upgrade with STARTTLS when the server offers it.
+    pub starttls: bool,
+    /// Fail the connection unless STARTTLS succeeds.
+    pub require_tls: bool,
+    /// Skip certificate verification (private-CA internal upstreams).
+    pub insecure_skip_verify: bool,
 }
 
 impl Default for Options {
@@ -22,6 +30,9 @@ impl Default for Options {
             addr: String::new(),
             helo_name: "localhost".into(),
             timeout: Duration::from_secs(60),
+            starttls: false,
+            require_tls: false,
+            insecure_skip_verify: false,
         }
     }
 }
@@ -47,10 +58,12 @@ type Result<T> = std::result::Result<T, Error>;
 
 /// A live SMTP session with the upstream.
 pub struct Client {
-    reader: BufReader<tokio::io::ReadHalf<TcpStream>>,
-    writer: tokio::io::WriteHalf<TcpStream>,
+    conn: BufReader<BoxIo>,
     timeout: Duration,
     helo: String,
+    /// EHLO keywords (uppercase) advertised by the server.
+    ext: Vec<String>,
+    tls: bool,
 }
 
 impl Client {
@@ -70,26 +83,71 @@ impl Client {
             .await
             .map_err(|_| Error::Transport("connect timed out".into()))?
             .map_err(|e| Error::Transport(e.to_string()))?;
-        let (r, w) = tokio::io::split(stream);
         let mut c = Client {
-            reader: BufReader::new(r),
-            writer: w,
+            conn: BufReader::new(Box::new(stream) as BoxIo),
             timeout: to,
             helo,
+            ext: Vec::new(),
+            tls: false,
         };
         let (code, _) = c.read_reply().await?;
         if code != 220 {
             return Err(Error::Transport(format!("unexpected greeting {code}")));
         }
         c.ehlo().await?;
+        if opts.starttls || opts.require_tls {
+            if c.has_ext("STARTTLS") {
+                c.starttls(host_of(&opts.addr), opts.insecure_skip_verify)
+                    .await?;
+            } else if opts.require_tls {
+                let _ = c.quit().await;
+                return Err(Error::Transport(
+                    "upstream does not offer STARTTLS (require_tls)".into(),
+                ));
+            }
+        }
         Ok(c)
+    }
+
+    /// Whether the session is TLS-protected.
+    pub fn is_tls(&self) -> bool {
+        self.tls
+    }
+
+    fn has_ext(&self, kw: &str) -> bool {
+        self.ext.iter().any(|e| e == kw)
+    }
+
+    async fn starttls(&mut self, host: &str, insecure: bool) -> Result<()> {
+        self.cmd("STARTTLS", 220).await?;
+        let conn = std::mem::replace(
+            &mut self.conn,
+            BufReader::new(
+                Box::new(tokio::io::join(tokio::io::empty(), tokio::io::sink())) as BoxIo,
+            ),
+        );
+        let io = conn.into_inner();
+        let tls = timeout(self.timeout, crate::tls::connect(io, host, insecure))
+            .await
+            .map_err(|_| Error::Transport("tls handshake timed out".into()))?
+            .map_err(Error::Transport)?;
+        self.conn = BufReader::new(tls);
+        self.tls = true;
+        self.ext.clear();
+        self.ehlo().await
     }
 
     async fn ehlo(&mut self) -> Result<()> {
         let helo = self.helo.clone();
         self.write_line(&format!("EHLO {helo}")).await?;
-        let (code, _) = self.read_reply().await?;
+        let (code, lines) = self.read_reply_lines().await?;
         if code == 250 {
+            self.ext = lines
+                .iter()
+                .skip(1)
+                .filter_map(|l| l.split_whitespace().next())
+                .map(|k| k.to_ascii_uppercase())
+                .collect();
             return Ok(());
         }
         // Fall back to HELO.
@@ -119,7 +177,12 @@ impl Client {
         }
         let stuffed = dot_stuff(msg);
         self.write_all(&stuffed).await?;
-        self.write_all(b"\r\n.\r\n").await?;
+        let end: &[u8] = if stuffed.is_empty() || stuffed.ends_with(b"\r\n") {
+            b".\r\n"
+        } else {
+            b"\r\n.\r\n"
+        };
+        self.write_all(end).await?;
         let (code, m) = self.read_reply().await?;
         if (200..300).contains(&code) {
             Ok(())
@@ -154,17 +217,27 @@ impl Client {
     }
 
     async fn write_all(&mut self, data: &[u8]) -> Result<()> {
-        timeout(self.timeout, self.writer.write_all(data))
-            .await
-            .map_err(|_| Error::Transport("write timed out".into()))?
-            .map_err(|e| Error::Transport(e.to_string()))
+        timeout(self.timeout, async {
+            self.conn.write_all(data).await?;
+            self.conn.flush().await
+        })
+        .await
+        .map_err(|_| Error::Transport("write timed out".into()))?
+        .map_err(|e| Error::Transport(e.to_string()))
     }
 
     /// Reads a (possibly multi-line) SMTP reply and returns (code, last text).
     async fn read_reply(&mut self) -> Result<(u16, String)> {
+        let (code, mut lines) = self.read_reply_lines().await?;
+        Ok((code, lines.pop().unwrap_or_default()))
+    }
+
+    /// Reads a multi-line reply, returning the code and each line's text.
+    async fn read_reply_lines(&mut self) -> Result<(u16, Vec<String>)> {
+        let mut out = Vec::new();
         loop {
             let mut line = String::new();
-            let n = timeout(self.timeout, self.reader.read_line(&mut line))
+            let n = timeout(self.timeout, self.conn.read_line(&mut line))
                 .await
                 .map_err(|_| Error::Transport("read timed out".into()))?
                 .map_err(|e| Error::Transport(e.to_string()))?;
@@ -180,29 +253,43 @@ impl Client {
                 .map_err(|_| Error::Transport(format!("bad code {line:?}")))?;
             // A hyphen after the code means more lines follow.
             let more = line.as_bytes().get(3) == Some(&b'-');
+            out.push(line.get(4..).unwrap_or("").trim().to_string());
             if !more {
-                return Ok((code, line[3..].trim_start().to_string()));
+                return Ok((code, out));
             }
         }
     }
 }
 
-/// Dot-stuffs a message body per RFC 5321 §4.5.2 (a line starting with "." gets
-/// an extra ".").
+/// Dot-stuffs a message per RFC 5321 §4.5.2 (a line starting with "." gets an
+/// extra "."), normalizing bare LF to CRLF. Byte-exact for 8-bit content.
 fn dot_stuff(msg: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(msg);
-    let normalized = text.replace("\r\n", "\n");
-    let mut out = String::with_capacity(msg.len());
-    for (i, line) in normalized.split('\n').enumerate() {
-        if i > 0 {
-            out.push_str("\r\n");
+    let mut out = Vec::with_capacity(msg.len() + 64);
+    let mut bol = true;
+    let mut prev = 0u8;
+    for &b in msg {
+        if bol && b == b'.' {
+            out.push(b'.');
         }
-        if line.starts_with('.') {
-            out.push('.');
+        if b == b'\n' && prev != b'\r' {
+            out.push(b'\r');
         }
-        out.push_str(line);
+        out.push(b);
+        bol = b == b'\n';
+        prev = b;
     }
-    out.into_bytes()
+    out
+}
+
+/// The host part of "host:port" (for TLS server-name verification).
+fn host_of(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match addr.rsplit_once(':') {
+        Some((h, _)) => h,
+        None => addr,
+    }
 }
 
 /// Connects, sends one message and quits.
@@ -234,6 +321,9 @@ pub async fn read_data<R: AsyncReadExt + Unpin>(
             ));
         }
         buf.push(byte[0]);
+        if buf == b".\r\n" {
+            return Ok(Vec::new()); // empty message
+        }
         if buf.ends_with(b"\r\n.\r\n") {
             buf.truncate(buf.len() - 3); // drop ".\r\n", keep trailing CRLF
             break;
@@ -249,20 +339,17 @@ pub async fn read_data<R: AsyncReadExt + Unpin>(
 }
 
 fn un_dot_stuff(msg: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(msg);
-    let normalized = text.replace("\r\n", "\n");
-    let mut out = String::with_capacity(msg.len());
-    for (i, line) in normalized.split('\n').enumerate() {
-        if i > 0 {
-            out.push_str("\r\n");
+    let mut out = Vec::with_capacity(msg.len());
+    let mut bol = true;
+    for &b in msg {
+        if bol && b == b'.' {
+            bol = false;
+            continue;
         }
-        if let Some(stripped) = line.strip_prefix('.') {
-            out.push_str(stripped);
-        } else {
-            out.push_str(line);
-        }
+        out.push(b);
+        bol = b == b'\n';
     }
-    out.into_bytes()
+    out
 }
 
 #[cfg(test)]
