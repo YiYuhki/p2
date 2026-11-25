@@ -244,6 +244,24 @@ impl Part {
         );
     }
 
+    /// Removes every header field for which `f(lowercase_name, value)` is true.
+    pub fn remove_headers(&mut self, f: impl Fn(&str, &str) -> bool) {
+        self.fields.retain(|fl| !f(&fl.name, &fl.value()));
+    }
+
+    /// Renames every instance of header `from` to `to`, keeping values and
+    /// positions.
+    pub fn rename_header(&mut self, from: &str, to: &str) {
+        let n = from.to_ascii_lowercase();
+        for fl in self.fields.iter_mut().filter(|f| f.name == n) {
+            let c = fl.raw.iter().position(|&b| b == b':').unwrap_or(0);
+            let mut raw = to.as_bytes().to_vec();
+            raw.extend_from_slice(&fl.raw[c..]);
+            fl.raw = raw;
+            fl.name = to.to_ascii_lowercase();
+        }
+    }
+
     fn clear_content_headers(&mut self) {
         self.fields.retain(|f| !f.name.starts_with("content-"));
     }

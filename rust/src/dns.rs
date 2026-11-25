@@ -39,6 +39,19 @@ pub trait Resolver: Send + Sync {
     async fn mx(&self, name: &str) -> Result<Vec<String>>;
 }
 
+#[async_trait]
+impl<T: Resolver + ?Sized> Resolver for std::sync::Arc<T> {
+    async fn txt(&self, name: &str) -> Result<Vec<String>> {
+        (**self).txt(name).await
+    }
+    async fn ip(&self, name: &str) -> Result<Vec<IpAddr>> {
+        (**self).ip(name).await
+    }
+    async fn mx(&self, name: &str) -> Result<Vec<String>> {
+        (**self).mx(name).await
+    }
+}
+
 fn fqdn(name: &str) -> String {
     let n = name.trim();
     if n.ends_with('.') {
