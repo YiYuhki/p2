@@ -32,6 +32,9 @@ A ground-up Rust reimplementation of the Go `secmail` secure mail gateway
 | `smtp.tls_cert_file` / `tls_key_file` | enables inbound STARTTLS |
 | `upstream.starttls` / `require_tls` / `insecure_skip_verify` | upstream STARTTLS |
 | `portal.tls_cert_file` / `tls_key_file` | serves the portal over HTTPS |
+| `portal.trusted_proxies` | proxies allowed to set `X-Forwarded-For` / the header-mode identity header (required with `trust_proxy_headers` or `auth.mode: header`) |
+| `outbound.allowed_clients` | required: internal mail servers allowed to submit to the outbound listener (open-relay protection) |
+| `smtp.read_timeout`, `max_connections`, `max_connections_per_ip`, `max_recipients`, `max_line_length` | SMTP session limits (both listeners) |
 
 ## Modules
 

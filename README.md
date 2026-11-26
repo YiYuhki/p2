@@ -159,7 +159,7 @@ go test -count=1 ./...
 - 저장소 적합성: 같은 테스트를 메모리/PostgreSQL, 파일시스템/S3에 각각 실행, Redis 큐 우선순위·dead-letter, Redis 티켓/OTP
 
 ## 운영 시 참고
-- 포털은 반드시 HTTPS 리버스 프록시 뒤에 두고 `trust_proxy_headers: true`를 설정하세요.
+- 포털은 반드시 HTTPS 리버스 프록시 뒤에 두고 `trust_proxy_headers: true`와 `trusted_proxies`(프록시 IP/CIDR)를 함께 설정하세요.
 - Internal API는 분석 네트워크에서만 접근 가능하도록 제한하세요. `:8081`에 `/metrics`(Prometheus), `/healthz`(liveness), `/readyz`(DB·스토리지 준비)도 여기 붙습니다.
 - 부팅 시 DB·스토리지·Redis가 준비될 때까지 최대 30초(지수 백오프) 기다립니다. PostgreSQL 풀 크기와 Redis 풀·타임아웃은 설정에서 조정합니다.
 - 내부 메일 서버가 게이트웨이를 신뢰하도록(SPF/DKIM 재검사 제외, `TrustedAuthservIDs`=게이트웨이 hostname, 우회 차단) 설정해야 합니다 → [docs/deployment.md](docs/deployment.md)

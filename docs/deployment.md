@@ -65,7 +65,9 @@ Set-TransportConfig -InternalSMTPServers @{Add="10.0.5.20"}
 ## 3. 포털
 
 - 반드시 HTTPS 리버스 프록시 뒤에 둡니다 (쿠키 `Secure` 플래그는 `public_base_url`이 `https://`면 자동 적용).
-- 프록시 뒤라면 `trust_proxy_headers: true` (IP별 rate limit이 `X-Forwarded-For` 기준으로 동작).
+- 프록시 뒤라면 `trust_proxy_headers: true`와 함께 **`trusted_proxies`에 프록시 주소(IP/CIDR)를 반드시 지정**하세요. 직접 연결한 상대가 이 목록에 있을 때만 `X-Forwarded-For`를 오른쪽부터 읽어 신뢰되지 않은 첫 주소를 클라이언트 IP로 씁니다(클라이언트가 위조한 값으로 IP별 제한을 우회하지 못함). `trusted_proxies` 없이 `trust_proxy_headers`만 켜면 설정 검증에서 거부됩니다.
+- `portal.auth.mode: header`(SSO 프록시가 인증 이메일 헤더를 넣는 방식)도 `trusted_proxies`가 필요합니다. 신뢰된 프록시에서 온 요청의 헤더만 인정합니다.
+- OTP 로그인은 주소별 실패 횟수를 코드 재발송과 무관하게 누적해 잠급니다(기본 1시간에 10회, `portal.auth.otp_lockout_failures` / `otp_lockout_window`).
 
 ### 토큰 추측·열거 방어
 
@@ -210,3 +212,9 @@ Internal API 리스너(`internal_api.listen`, 기본 8081)에서 다음을 인�
 | `secmail_inbound_auth_total{method,result}` | 인바운드 인증 결과(spf/dkim × pass/fail/none/…) — fail·none 급증은 스푸핑 신호 |
 
 Kubernetes 예: livenessProbe → `/healthz`, readinessProbe → `/readyz`. Prometheus scrape 대상은 `<secmail>:8081/metrics`.
+
+## 분석기(analyzer)와 Redis 보안
+
+- Redis는 분석 작업과 판정 결과가 오가는 신뢰 경계입니다. 반드시 비밀번호(`requirepass`)를 설정하고 `redis.password`에 넣으세요. docker-compose는 `SECMAIL_REDIS_PASSWORD` 환경 변수로 설정합니다.
+- 분석기(`analyzer`, `mock-analyzer`)는 `-redis-password`(또는 `SECMAIL_REDIS_PASSWORD`)와 `-api-base`(또는 `SECMAIL_API_BASE`, 예: `http://secmail:8081`)가 필요합니다. 작업에 담긴 `content_url`/`verdict_url`이 `-api-base` 아래가 아니면 토큰을 보내지 않고 거부합니다.
+- 분석기는 일시적 오류(네트워크, 5xx, 타임아웃)에는 판정을 보내지 않고, 게이트웨이의 재시도(janitor)가 작업을 다시 넣습니다. 크기 초과나 SHA-256 불일치는 ERROR로 판정합니다.
