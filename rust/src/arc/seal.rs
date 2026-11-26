@@ -1,16 +1,20 @@
-//! ARC (RFC 8617) sealing. Port of the Go `internal/arc` sealer: builds a fresh
-//! i=1, cv=none ARC set (ARC-Authentication-Results, ARC-Message-Signature,
-//! ARC-Seal) and signs it with the gateway RSA key (RSA-SHA256).
+//! ARC (RFC 8617) sealing. Port of the Go `internal/arc` sealer: builds the
+//! next ARC set (ARC-Authentication-Results, ARC-Message-Signature, ARC-Seal)
+//! and signs it with the gateway RSA key (RSA-SHA256).
 //!
 //! Canonicalization works on the raw bytes (the DKIM relaxed canonicalization
 //! in [`crate::dkim`]), so 8-bit content is hashed and relayed exactly as
 //! received. Header instances are selected bottom-up as a verifier does.
 //!
-//! Only a first ARC set is produced: a message that already carries ARC
-//! headers is **not** sealed (an error is returned and the caller relays it
-//! unsealed). Adding set i=n+1 requires validating the existing chain to
-//! assert cv=pass/fail honestly, which this sealer does not implement; sealing
-//! with i=1 or an unverified cv=pass would produce a broken or misleading chain.
+//! The chain validation status is never assumed: [`Sealer::seal_with_chain`]
+//! validates the existing sets ([`super::validate`]) and seals i=n+1 with
+//! cv=none (no chain), cv=pass (every seal and the newest AMS verified) or
+//! cv=fail. [`Sealer::seal`], for callers without a resolver, asserts
+//! cv=fail whenever ARC headers are present. A cv=pass seal covers every
+//! earlier set; a cv=fail seal covers only its own set (the earlier ones may
+//! be malformed, and validators stop at a failed chain anyway). More than 50
+//! sets cannot be extended: an error is returned and the message is relayed
+//! unsealed.
 
 use base64::Engine;
 use rsa::pkcs1::DecodeRsaPrivateKey;
@@ -18,7 +22,9 @@ use rsa::pkcs8::DecodePrivateKey;
 use rsa::{Pkcs1v15Sign, PrivateKey};
 use sha2::{Digest, Sha256};
 
+use super::validate::{self, ChainStatus, Cv, MAX_INSTANCES};
 use crate::dkim::{canon_body, canon_header, crlf, split, Canon, Field};
+use crate::dns::Resolver;
 
 /// Header set the ARC-Message-Signature covers when present (mirrors the Go
 /// `amsHeaders`). Authentication-Results is deliberately absent: RFC 8617
@@ -81,23 +87,74 @@ impl Sealer {
         self
     }
 
-    /// Prepends a fresh ARC set (i=1, cv=none) to `raw`. `auth_results` is the
-    /// RFC 8601 method list without the leading authserv-id. Fails (leaving
-    /// the caller to relay unsealed) when the message has no header/body
-    /// separator or already carries ARC headers (see the module docs).
+    /// Prepends the next ARC set to `raw` without validating the existing
+    /// chain (no resolver): cv=none when there is none, otherwise cv=fail.
+    /// `auth_results` is the RFC 8601 method list without the leading
+    /// authserv-id. Fails (leaving the caller to relay unsealed) when the
+    /// message has no header/body separator or already has 50 sets.
     pub fn seal(&self, raw: &[u8], auth_results: &str) -> Result<Vec<u8>, String> {
+        let status = if validate::has_arc_headers(raw) {
+            ChainStatus {
+                cv: Cv::Fail,
+                instances: validate::highest_instance(raw),
+            }
+        } else {
+            ChainStatus::NONE
+        };
+        self.seal_with(raw, auth_results, &status)
+    }
+
+    /// Validates the existing chain with `resolver` and seals i=n+1. The
+    /// hashing runs inline; callers on an async runtime should prefer
+    /// validating with [`validate::prepare`] on a blocking thread and then
+    /// calling [`Sealer::seal_with`].
+    pub async fn seal_with_chain<R: Resolver + ?Sized>(
+        &self,
+        raw: &[u8],
+        auth_results: &str,
+        resolver: &R,
+    ) -> Result<Vec<u8>, String> {
+        let status = validate::validate(raw, resolver).await;
+        self.seal_with(raw, auth_results, &status)
+    }
+
+    /// Prepends ARC set i=`status.instances`+1 asserting `status.cv`.
+    pub fn seal_with(
+        &self,
+        raw: &[u8],
+        auth_results: &str,
+        status: &ChainStatus,
+    ) -> Result<Vec<u8>, String> {
         let msg = crlf(raw);
         if !(msg.starts_with(b"\r\n") || msg.windows(4).any(|w| w == b"\r\n\r\n")) {
             return Err("arc: message has no header/body separator".into());
         }
         let (fields, body) = split(&msg);
-        if fields.iter().any(|f| {
+        let has_arc = fields.iter().any(|f| {
             matches!(
                 f.name.as_str(),
                 "arc-seal" | "arc-message-signature" | "arc-authentication-results"
             )
-        }) {
-            return Err("arc: message already carries an ARC chain; not sealed".into());
+        });
+        let mut cv = status.cv;
+        if cv == Cv::None && has_arc {
+            cv = Cv::Fail; // never claim "no chain" over existing ARC headers
+        }
+        let i = status.instances + 1;
+        if i > MAX_INSTANCES {
+            return Err("arc: chain already has 50 sets; not sealed".into());
+        }
+        // A passing chain is covered by the new seal (RFC 8617 §5.1.1).
+        let mut prior: Vec<u8> = Vec::new();
+        if cv == Cv::Pass {
+            let sets = validate::sets(&fields)
+                .filter(|s| s.len() == status.instances)
+                .ok_or("arc: chain changed since validation; not sealed")?;
+            for s in sets {
+                for idx in s {
+                    prior.extend_from_slice(&canon_header(&fields[idx].raw, Canon::Relaxed));
+                }
+            }
         }
         let t = (self.now)();
 
@@ -106,12 +163,12 @@ impl Sealer {
         } else {
             auth_results
         };
-        let aar = format!("i=1; {}; {}", self.authserv, auth_results);
+        let aar = format!("i={i}; {}; {}", self.authserv, auth_results);
 
         let bh = b64(&Sha256::digest(canon_body(body, Canon::Relaxed)));
         let (names, mut ams_input) = select_headers(&fields, AMS_HEADERS);
         let ams_tags = format!(
-            "i=1; a=rsa-sha256; c=relaxed/relaxed; d={}; s={}; t={}; bh={}; h={}; b=",
+            "i={i}; a=rsa-sha256; c=relaxed/relaxed; d={}; s={}; t={}; bh={}; h={}; b=",
             self.domain,
             self.selector,
             t,
@@ -122,13 +179,15 @@ impl Sealer {
         let ams_full = format!("{ams_tags}{}", self.sign(&ams_input)?);
 
         let as_tags = format!(
-            "i=1; a=rsa-sha256; cv=none; d={}; s={}; t={}; b=",
-            self.domain, self.selector, t
+            "i={i}; a=rsa-sha256; cv={}; d={}; s={}; t={}; b=",
+            cv.as_str(),
+            self.domain,
+            self.selector,
+            t
         );
-        let as_full = format!(
-            "{as_tags}{}",
-            self.sign(&seal_signing_input(&aar, &ams_full, &as_tags))?
-        );
+        let mut seal_input = prior;
+        seal_input.extend_from_slice(&seal_signing_input(&aar, &ams_full, &as_tags));
+        let as_full = format!("{as_tags}{}", self.sign(&seal_input)?);
 
         let mut out = Vec::with_capacity(msg.len() + 2048);
         out.extend_from_slice(fold("ARC-Seal", &as_full).as_bytes());
@@ -354,11 +413,90 @@ mod tests {
     }
 
     #[test]
-    fn existing_chain_is_not_resealed() {
+    fn existing_chain_is_never_skipped() {
         let (s, _) = sealer();
+        // Without a resolver an existing (here: forged) chain is cv=fail and
+        // the next instance is sealed — a fake ARC-Seal no longer suppresses
+        // sealing.
         let raw = b"ARC-Seal: i=1; a=rsa-sha256; cv=none; d=a.example; s=s; b=x\r\nFrom: a@x\r\n\r\nb\r\n";
-        assert!(s.seal(raw, "spf=pass").is_err());
+        let out = String::from_utf8(s.seal(raw, "spf=pass").unwrap()).unwrap();
+        assert!(
+            out.starts_with("ARC-Seal: i=2; a=rsa-sha256; cv=fail;"),
+            "{out}"
+        );
+        assert!(out.contains("ARC-Authentication-Results: i=2; gw.example.com; spf=pass"));
         assert!(s.seal(b"From: a@x\r\n", "spf=pass").is_err());
+        // 50 sets cannot be extended.
+        let raw = b"ARC-Seal: i=50; a=rsa-sha256; cv=pass; d=a.example; s=s; b=x\r\nFrom: a@x\r\n\r\nb\r\n";
+        assert!(s.seal(raw, "spf=pass").is_err());
+    }
+
+    fn resolver_for(pk: &PublicKey) -> crate::dns::Static {
+        use rsa::pkcs8::EncodePublicKey;
+        let der = pk.to_public_key_der().unwrap();
+        crate::dns::Static::default().with_txt(
+            "arc1._domainkey.gw.example.com",
+            &[&format!("v=DKIM1; k=rsa; p={}", b64(der.as_bytes()))],
+        )
+    }
+
+    #[tokio::test]
+    async fn chain_is_validated_and_extended() {
+        use super::validate::{validate, ChainStatus, Cv};
+        let (s, pk) = sealer();
+        let r = resolver_for(&pk);
+        let raw = b"From: sender@ext.org\r\nTo: user@example.com\r\nSubject: hi\r\n\r\nhello\r\n";
+        assert_eq!(validate(raw, &r).await, ChainStatus::NONE);
+        // Hop 1, then hop 2 validating hop 1.
+        let one = s.seal_with_chain(raw, "spf=pass", &r).await.unwrap();
+        assert_eq!(
+            validate(&one, &r).await,
+            ChainStatus {
+                cv: Cv::Pass,
+                instances: 1
+            }
+        );
+        let mut relayed = b"Received: from hop1\r\n".to_vec();
+        relayed.extend_from_slice(&one);
+        let two = s.seal_with_chain(&relayed, "arc=pass", &r).await.unwrap();
+        let text = String::from_utf8_lossy(&two);
+        assert!(
+            text.starts_with("ARC-Seal: i=2; a=rsa-sha256; cv=pass;"),
+            "{text}"
+        );
+        assert_eq!(
+            validate(&two, &r).await,
+            ChainStatus {
+                cv: Cv::Pass,
+                instances: 2
+            }
+        );
+        // A body change breaks the newest AMS: the chain fails, and the next
+        // seal records cv=fail.
+        let tampered = String::from_utf8_lossy(&two).replace("hello", "HELLO");
+        let st = validate(tampered.as_bytes(), &r).await;
+        assert_eq!(st.cv, Cv::Fail);
+        let three = s.seal_with(tampered.as_bytes(), "arc=fail", &st).unwrap();
+        assert!(
+            String::from_utf8_lossy(&three).starts_with("ARC-Seal: i=3; a=rsa-sha256; cv=fail;")
+        );
+        assert_eq!(validate(&three, &r).await.cv, Cv::Fail);
+        // A tampered earlier seal fails too.
+        let forged = String::from_utf8_lossy(&two).replacen("spf=pass", "spf=fail", 1);
+        assert_eq!(validate(forged.as_bytes(), &r).await.cv, Cv::Fail);
+        // Unknown key / missing set / duplicate set.
+        assert_eq!(
+            validate(&two, &crate::dns::Static::default()).await.cv,
+            Cv::Fail
+        );
+        let gap = String::from_utf8_lossy(&two).replacen("ARC-Seal: i=2", "ARC-Seal: i=3", 1);
+        assert_eq!(validate(gap.as_bytes(), &r).await.cv, Cv::Fail);
+        let fake = b"ARC-Seal: i=1; a=rsa-sha256; cv=none; d=gw.example.com; s=arc1; b=AAAA\r\nARC-Message-Signature: i=1; a=rsa-sha256; d=gw.example.com; s=arc1; h=from; bh=AAAA; b=AAAA\r\nARC-Authentication-Results: i=1; x; spf=pass\r\nFrom: a@x\r\n\r\nb\r\n";
+        assert_eq!(validate(fake, &r).await.cv, Cv::Fail);
+        // >50 instances is a failed chain.
+        let many =
+            b"ARC-Seal: i=51; a=rsa-sha256; cv=pass; d=a; s=s; b=x\r\nFrom: a@x\r\n\r\nb\r\n";
+        assert_eq!(validate(many, &r).await.cv, Cv::Fail);
     }
 
     #[test]

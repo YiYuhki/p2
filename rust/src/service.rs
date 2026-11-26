@@ -83,15 +83,22 @@ impl Service {
     /// Quarantines attachments and returns the rewritten message. When the
     /// message has no attachments it is relayed unchanged.
     pub async fn quarantine(&self, env: &Envelope, raw: &[u8]) -> Result<Vec<u8>, ProcessError> {
-        let mut root = crate::mimetree::parse(raw);
-        // The blocked-extension gate also applies to parts the rewrite policy
-        // would keep inline (e.g. an inline image named "x.exe" is extracted).
-        let blocked = |name: &str| {
-            file_ext(name)
-                .map(|e| self.blocked_extensions.contains(&e))
-                .unwrap_or(false)
-        };
-        let res = match crate::mimetree::extract_with(&mut root, &self.rewrite, &blocked) {
+        // MIME parsing / extraction (and below, banner insertion) is CPU-bound
+        // and proportional to the message: it runs on the blocking pool.
+        let set = self.blocked_extensions.clone();
+        let opts = self.rewrite.clone();
+        let owned = raw.to_vec();
+        let (mut root, res) = tokio::task::spawn_blocking(move || {
+            let mut root = crate::mimetree::parse(&owned);
+            // The blocked-extension gate also applies to parts the rewrite
+            // policy would keep (e.g. an inline image named "x.exe").
+            let blocked = |name: &str| is_blocked(&set, name);
+            let r = crate::mimetree::extract_with(&mut root, &opts, &blocked);
+            (root, r)
+        })
+        .await
+        .map_err(|_| ProcessError::TempFail)?;
+        let res = match res {
             Ok(r) => r,
             Err(crate::mimetree::ExtractError::Encrypted) => {
                 return Err(ProcessError::Reject(crate::gateway::SmtpError::new(
@@ -103,7 +110,7 @@ impl Service {
         if res.attachments.is_empty() {
             return Ok(raw.to_vec());
         }
-        let subject = crate::mimeproc::decode_header(&root.header("subject").unwrap_or_default());
+        let subject = crate::mimeproc::subject_of(&root);
         let now = Utc::now();
         let msg_id = uuid::Uuid::new_v4().to_string();
         let mut atts: Vec<Attachment> = Vec::new();
@@ -114,9 +121,7 @@ impl Service {
             let id = uuid::Uuid::new_v4().to_string();
             let key = format!("attachments/{}/{}", now.format("%Y/%m/%d"), id);
             let token = random_token();
-            let blocked = file_ext(&a.filename)
-                .map(|e| self.blocked_extensions.contains(&e))
-                .unwrap_or(false);
+            let blocked = is_blocked(&self.blocked_extensions, &a.filename);
             let (status, threat, analyzed) = if blocked {
                 (
                     Status::Malicious,
@@ -212,20 +217,27 @@ impl Service {
             ""
         };
         let banner = build_banner(&links, now + self.link_ttl, notice);
-        crate::mimetree::insert_banner(&mut root, &banner);
-        if root.header("mime-version").is_none() {
-            root.set_header("MIME-Version", "1.0");
-        }
-        root.set_header(
-            "X-SecMail-Processed",
-            &format!(
-                "{}; attachments={}; id={msg_id}",
-                self.gateway_id,
-                links.len()
-            ),
+        let marker = format!(
+            "{}; attachments={}; id={msg_id}",
+            self.gateway_id,
+            links.len()
         );
-        Ok(root.to_bytes())
+        tokio::task::spawn_blocking(move || {
+            crate::mimetree::insert_banner(&mut root, &banner);
+            if root.header("mime-version").is_none() {
+                root.set_header("MIME-Version", "1.0");
+            }
+            root.set_header("X-SecMail-Processed", &marker);
+            root.to_bytes()
+        })
+        .await
+        .map_err(|_| ProcessError::TempFail)
     }
+}
+
+/// The name's final extension is blocked.
+fn is_blocked(set: &std::collections::HashSet<String>, name: &str) -> bool {
+    file_ext(name).map(|e| set.contains(&e)).unwrap_or(false)
 }
 
 #[async_trait::async_trait]
@@ -376,7 +388,7 @@ mod tests {
             encrypted_reject: true,
             ..Default::default()
         });
-        let raw = b"From: a@x.org\r\nContent-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=E\r\n\r\n--E\r\nContent-Type: application/pgp-encrypted\r\n\r\nVersion: 1\r\n--E\r\nContent-Type: application/octet-stream\r\n\r\nx\r\n--E--\r\n";
+        let raw = b"From: a@x.org\r\nContent-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=E\r\n\r\n--E\r\nContent-Type: application/pgp-encrypted\r\n\r\nVersion: 1\r\n--E\r\nContent-Type: application/octet-stream\r\n\r\n-----BEGIN PGP MESSAGE-----\r\n--E--\r\n";
         match s.quarantine(&Envelope::default(), raw).await {
             Err(ProcessError::Reject(e)) => assert_eq!(e.code, 554),
             other => panic!("unexpected {other:?}"),
@@ -488,8 +500,8 @@ Content-Disposition: attachment; filename=\"evil.exe.\"\r\n\r\nMZ\r\n--B--\r\n";
         let raw = b"From: a@ext.org\r\nSubject: x\r\nMIME-Version: 1.0\r\n\
 Content-Type: multipart/related; boundary=\"B\"\r\n\r\n\
 --B\r\nContent-Type: text/html\r\n\r\n<img src=cid:a>\r\n\
---B\r\nContent-Type: image/png\r\nContent-ID: <a>\r\n\r\nPNG\r\n\
---B\r\nContent-Type: image/gif; name=\"x.gif\"\r\nContent-ID: <b>\r\n\r\nGIF\r\n--B--\r\n";
+--B\r\nContent-Type: image/png\r\nContent-ID: <a>\r\nContent-Transfer-Encoding: base64\r\n\r\niVBORw0K\r\n\
+--B\r\nContent-Type: image/gif; name=\"x.gif\"\r\nContent-ID: <b>\r\n\r\nGIF89a\r\n--B--\r\n";
         let out = s.quarantine(&Envelope::default(), raw).await.unwrap();
         let o = String::from_utf8_lossy(&out);
         assert!(o.contains("Content-ID: <a>"), "nameless raster image kept");
@@ -504,6 +516,31 @@ Content-Type: multipart/related; boundary=\"B\"\r\n\r\n\
         let raw = b"Subject: hi\r\nContent-Type: text/plain\r\n\r\njust text\r\n";
         let env = Envelope::default();
         assert_eq!(s.quarantine(&env, raw).await.unwrap(), raw);
+    }
+
+    #[tokio::test]
+    async fn plain_non_mime_mail_passes_through_unchanged() {
+        let (s, store, queue) = svc(&["exe".into()]).await;
+        let env = Envelope::default();
+        for raw in [
+            &b"From: a@ext.org\r\nTo: b@example.com\r\nSubject: hi\r\n\r\nhello\r\n"[..],
+            b"From: a@ext.org\r\nMIME-Version: 1.0\r\n\r\n\xc7\xd1\xb1\xdb 8-bit body\r\n",
+            b"From: a@ext.org\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\n\r\nno content-type\r\n--B--\r\n",
+            b"From: a@ext.org\nSubject: lf only\n\nhello\n",
+        ] {
+            let out = s.quarantine(&env, raw).await.unwrap();
+            assert_eq!(out, raw, "{:?}", String::from_utf8_lossy(raw));
+        }
+        assert!(queue.snapshot().is_empty());
+        let _ = store;
+        // A uuencoded executable in plain text is quarantined (and blocked).
+        let raw = b"From: a@ext.org\r\nSubject: s\r\n\r\nsee attached\r\n\r\nbegin 644 evil.exe\r\n#35H*\r\n`\r\nend\r\n";
+        let out = s.quarantine(&env, raw).await.unwrap();
+        let o = String::from_utf8_lossy(&out);
+        assert!(!o.contains("begin 644"));
+        assert!(bodies(&out).contains("evil.exe"));
+        assert!(bodies(&out).contains("[차단됨]"));
+        assert!(bodies(&out).contains("see attached"));
     }
 
     #[tokio::test]

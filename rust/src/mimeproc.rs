@@ -2,21 +2,27 @@
 //! parsing/extraction surface used by the DLP scanner. Structure comes from
 //! [`crate::mimetree`] (the same parser the quarantine rewrite uses, so DLP
 //! inspects exactly what recipients receive); `mailparse` only decodes single
-//! leaves (RFC 2047 headers, transfer encodings, charsets).
+//! leaves (transfer encodings). RFC 2047 header decoding and charset
+//! decoding are done here in linear time ([`decode_header`], [`decode_text`]).
 
-use mailparse::{parse_mail, MailHeaderMap};
+use base64::Engine;
 
-use crate::mimetree::{self, Part};
+use crate::mimetree::{self, Opaque, Part};
 
 /// Maximum depth of message/rfc822 messages embedded in each other that is
 /// unpacked for inspection; deeper ones are reported as uninspectable.
 const MAX_EMBEDDED: usize = 8;
+
+/// Longest raw Subject value decoded (its head).
+pub const MAX_RAW_SUBJECT: usize = 8 * 1024;
 
 /// An attachment extracted from a message.
 #[derive(Clone, Debug)]
 pub struct Attachment {
     pub filename: String,
     pub content_type: String,
+    /// Declared charset (lowercase), if any.
+    pub charset: Option<String>,
     pub data: Vec<u8>,
 }
 
@@ -45,6 +51,26 @@ pub struct Parsed {
     pub encrypted: Vec<String>,
 }
 
+/// The first `max` bytes of `s` (snapped to a char boundary).
+pub fn head_str(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut i = max;
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    &s[..i]
+}
+
+/// Decoded Subject of an entity (only its first [`MAX_RAW_SUBJECT`] bytes).
+pub fn subject_of(p: &Part) -> String {
+    decode_header(head_str(
+        &p.header("subject").unwrap_or_default(),
+        MAX_RAW_SUBJECT,
+    ))
+}
+
 /// Parses a raw message, decoding headers/bodies and collecting the subject,
 /// every text-like leaf and every other leaf as an attachment. Every leaf ends
 /// up in exactly one of `text_parts`, `attachments`, `uninspectable` or
@@ -52,20 +78,36 @@ pub struct Parsed {
 pub fn parse(raw: &[u8]) -> Result<Parsed, String> {
     let root = mimetree::parse(raw);
     let mut out = Parsed {
-        subject: decode_header(&root.header("subject").unwrap_or_default()),
+        subject: subject_of(&root),
         ..Default::default()
     };
     walk(&root, 0, "", &mut out);
     Ok(out)
 }
 
-fn walk(part: &Part, msg_depth: usize, prefix: &str, out: &mut Parsed) {
-    let (mt, _) = part.media_type();
-    if part.is_truncated() {
-        out.uninspectable.push(format!(
-            "{prefix}MIME 중첩이 {}단계를 초과하여 검사할 수 없는 파트",
+fn opaque_reason(o: Opaque) -> String {
+    match o {
+        Opaque::Depth => format!(
+            "MIME 중첩이 {}단계를 초과하여 검사할 수 없는 파트",
             mimetree::MAX_DEPTH
-        ));
+        ),
+        Opaque::Parts => format!(
+            "MIME 파트 수가 {}개를 초과하여 나머지를 검사할 수 없음",
+            mimetree::MAX_PARTS
+        ),
+        Opaque::Ambiguous => "Content-* 헤더가 중복·충돌하여 해석이 모호한 파트".into(),
+        Opaque::Headers => format!(
+            "헤더 필드가 {}개를 초과하여 검사할 수 없는 파트",
+            mimetree::MAX_FIELDS
+        ),
+    }
+}
+
+fn walk(part: &Part, msg_depth: usize, prefix: &str, out: &mut Parsed) {
+    let (mt, params) = part.media_type();
+    if let Some(o) = part.opaque() {
+        out.uninspectable
+            .push(format!("{prefix}{}", opaque_reason(o)));
         return;
     }
     if mimetree::is_opaque_encrypted(part) {
@@ -86,7 +128,7 @@ fn walk(part: &Part, msg_depth: usize, prefix: &str, out: &mut Parsed) {
         }
         let inner = mimetree::parse(&part.decode_body());
         let p = format!("{prefix}첨부 메일 ");
-        let subject = decode_header(&inner.header("subject").unwrap_or_default());
+        let subject = subject_of(&inner);
         if !subject.is_empty() {
             out.text_parts.push(TextPart {
                 location: format!("{p}제목"),
@@ -97,6 +139,10 @@ fn walk(part: &Part, msg_depth: usize, prefix: &str, out: &mut Parsed) {
         walk(&inner, msg_depth + 1, &p, out);
         return;
     }
+    let charset = params
+        .get("charset")
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| !c.is_empty());
     // A part with a filename (or an "attachment" disposition) is an attachment.
     let (disp, _) = part.disposition();
     let raw_name = part.filename();
@@ -108,14 +154,39 @@ fn walk(part: &Part, msg_depth: usize, prefix: &str, out: &mut Parsed) {
         out.attachments.push(Attachment {
             filename: format!("{prefix}{name}"),
             content_type: mt,
+            charset,
             data: part.decode_body(),
         });
         return;
     }
     if is_text_like(&mt) {
-        let text = part
-            .text()
-            .unwrap_or_else(|| String::from_utf8_lossy(&part.decode_body()).into_owned());
+        let mut body = part.decode_body();
+        let mut stripped = false;
+        if mt == "text/plain" {
+            // uuencoded files inside the text are attachments to recipients.
+            let (rest, blocks) = mimetree::split_uuencode(&body);
+            for b in blocks {
+                let mut name = sanitize_filename(&b.name);
+                if name.is_empty() {
+                    name = "attachment".into();
+                }
+                out.attachments.push(Attachment {
+                    filename: format!("{prefix}{name}"),
+                    content_type: "application/octet-stream".into(),
+                    charset: None,
+                    data: b.data,
+                });
+            }
+            stripped = body.len() != rest.len();
+            body = rest;
+        }
+        let text = match decode_text(&body, charset.as_deref()) {
+            Decoded::Text(t) => t,
+            // A charset encoding_rs does not know (e.g. UTF-7): mailparse's
+            // charset support, then the heuristic text.
+            Decoded::UnknownCharset(t) | Decoded::Lossy(t) if stripped => t,
+            Decoded::UnknownCharset(t) | Decoded::Lossy(t) => part.text().unwrap_or(t),
+        };
         out.text_parts.push(TextPart {
             location: format!("{prefix}본문"),
             text,
@@ -128,12 +199,13 @@ fn walk(part: &Part, msg_depth: usize, prefix: &str, out: &mut Parsed) {
     out.attachments.push(Attachment {
         filename: format!("{prefix}(이름 없는 {mt} 파트)"),
         content_type: mt,
+        charset,
         data: part.decode_body(),
     });
 }
 
 /// Media types whose content is text and is scanned as such.
-fn is_text_like(mt: &str) -> bool {
+pub fn is_text_like(mt: &str) -> bool {
     if mt.starts_with("text/") || mt.starts_with("multipart/") {
         return true; // a multipart without a usable boundary: scan the raw body
     }
@@ -163,19 +235,245 @@ fn is_text_like(mt: &str) -> bool {
     )
 }
 
-/// Decodes an RFC 2047 encoded-word header value.
-pub fn decode_header(v: &str) -> String {
-    // mailparse exposes header decoding via a parsed header; wrap the value.
-    let synthetic = format!("X: {v}\r\n\r\n");
-    match parse_mail(synthetic.as_bytes()) {
-        Ok(m) => m
-            .headers
-            .get_first_value("X")
-            .unwrap_or_else(|| v.to_string()),
-        Err(_) => v.to_string(),
+/// Result of [`decode_text`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum Decoded {
+    /// Decoded with confidence (BOM, declared charset, valid UTF-8, UTF-16
+    /// by NUL density, or error-free EUC-KR/CP949).
+    Text(String),
+    /// The declared charset is unknown; best-effort heuristic text.
+    UnknownCharset(String),
+    /// Last resort: lossy UTF-8 with NULs removed (likely binary).
+    Lossy(String),
+}
+
+impl Decoded {
+    pub fn into_string(self) -> String {
+        match self {
+            Decoded::Text(s) | Decoded::UnknownCharset(s) | Decoded::Lossy(s) => s,
+        }
     }
 }
 
+/// Decodes text content: a BOM (UTF-8, UTF-16LE/BE) wins, then the declared
+/// charset, then valid UTF-8, UTF-16 detected by NUL density, EUC-KR/CP949,
+/// and finally lossy UTF-8 with NULs stripped.
+pub fn decode_text(data: &[u8], charset: Option<&str>) -> Decoded {
+    use encoding_rs::{Encoding, UTF_8};
+    if let Some((enc, bom)) = Encoding::for_bom(data) {
+        return Decoded::Text(enc.decode_without_bom_handling(&data[bom..]).0.into_owned());
+    }
+    let mut unknown = false;
+    if let Some(cs) = charset {
+        let cs = cs.trim().trim_matches('"').to_ascii_lowercase();
+        let ascii = matches!(
+            cs.as_str(),
+            "us-ascii" | "ascii" | "us_ascii" | "ansi_x3.4-1968"
+        );
+        if cs == "utf-16" {
+            if let Some(enc) = utf16_guess(data) {
+                return Decoded::Text(enc.decode_without_bom_handling(data).0.into_owned());
+            }
+        } else if !ascii {
+            match Encoding::for_label(cs.as_bytes()) {
+                // Declared UTF-8 that is not: fall through to the heuristics.
+                Some(enc) if enc == UTF_8 => {}
+                Some(enc) => {
+                    let (t, had_errors) = enc.decode_without_bom_handling(data);
+                    if !had_errors || utf16_guess(data).is_none() {
+                        return Decoded::Text(t.into_owned());
+                    }
+                }
+                None => unknown = true,
+            }
+        }
+    }
+    match heuristic_text(data) {
+        Decoded::Text(t) | Decoded::UnknownCharset(t) | Decoded::Lossy(t) if unknown => {
+            Decoded::UnknownCharset(t)
+        }
+        d => d,
+    }
+}
+
+/// Undeclared charset: valid UTF-8, UTF-16 by NUL density, EUC-KR/CP949,
+/// else lossy UTF-8 without NULs.
+fn heuristic_text(data: &[u8]) -> Decoded {
+    let utf16 = utf16_guess(data);
+    if let (Ok(s), None) = (std::str::from_utf8(data), utf16) {
+        return Decoded::Text(s.to_string());
+    }
+    if let Some(enc) = utf16 {
+        return Decoded::Text(enc.decode_without_bom_handling(data).0.into_owned());
+    }
+    let (t, had_errors) = encoding_rs::EUC_KR.decode_without_bom_handling(data);
+    if !had_errors {
+        return Decoded::Text(t.into_owned());
+    }
+    Decoded::Lossy(
+        String::from_utf8_lossy(data)
+            .chars()
+            .filter(|&c| c != '\0')
+            .collect(),
+    )
+}
+
+/// UTF-16 without a BOM, recognized by NULs concentrated on odd (LE) or even
+/// (BE) byte positions of the first 64 KiB.
+fn utf16_guess(data: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    let s = &data[..data.len().min(64 * 1024)];
+    if s.len() < 4 {
+        return None;
+    }
+    let (mut even, mut odd) = (0usize, 0usize);
+    for (i, &b) in s.iter().enumerate() {
+        if b == 0 {
+            if i % 2 == 0 {
+                even += 1;
+            } else {
+                odd += 1;
+            }
+        }
+    }
+    let half = s.len() / 2;
+    if odd * 10 >= half * 3 && even * 10 < half {
+        Some(encoding_rs::UTF_16LE)
+    } else if even * 10 >= half * 3 && odd * 10 < half {
+        Some(encoding_rs::UTF_16BE)
+    } else {
+        None
+    }
+}
+
+/// Decodes RFC 2047 encoded words in a header value, in linear time.
+/// Whitespace between adjacent encoded words is dropped; adjacent words in
+/// the same charset are decoded together (a multi-byte character may be
+/// split across words). Unknown charsets decode as lossy UTF-8; malformed
+/// words are kept verbatim.
+pub fn decode_header(v: &str) -> String {
+    if !v.contains("=?") {
+        return v.to_string();
+    }
+    let b = v.as_bytes();
+    let mut out = String::with_capacity(v.len());
+    // Pending run of adjacent encoded words: (charset, decoded bytes).
+    let mut run: Option<(String, Vec<u8>)> = None;
+    let mut lit = 0; // start of pending literal text
+    let mut i = 0;
+    let flush = |out: &mut String, run: &mut Option<(String, Vec<u8>)>| {
+        if let Some((cs, bytes)) = run.take() {
+            out.push_str(&decode_charset(&cs, &bytes));
+        }
+    };
+    while i + 1 < b.len() {
+        if !(b[i] == b'=' && b[i + 1] == b'?') {
+            i += 1;
+            continue;
+        }
+        match parse_encoded_word(b, i) {
+            Some((cs, bytes, end)) => {
+                let between = &v[lit..i];
+                let adjacent = run.is_some() && between.bytes().all(|c| c == b' ' || c == b'\t');
+                if adjacent {
+                    let r = run.as_mut().unwrap();
+                    if r.0.eq_ignore_ascii_case(&cs) {
+                        r.1.extend_from_slice(&bytes);
+                    } else {
+                        flush(&mut out, &mut run);
+                        run = Some((cs, bytes));
+                    }
+                } else {
+                    flush(&mut out, &mut run);
+                    out.push_str(between);
+                    run = Some((cs, bytes));
+                }
+                i = end;
+                lit = end;
+            }
+            None => i += 2,
+        }
+    }
+    flush(&mut out, &mut run);
+    out.push_str(&v[lit..]);
+    out
+}
+
+/// Parses "=?charset?B|Q?text?=" at `s`; returns (charset, bytes, end).
+/// Scans stop at the first '?' or whitespace, so a failed attempt never
+/// re-reads more than it skips (linear overall).
+fn parse_encoded_word(b: &[u8], s: usize) -> Option<(String, Vec<u8>, usize)> {
+    let mut i = s + 2;
+    let cs_start = i;
+    while i < b.len() && b[i] != b'?' {
+        if b[i].is_ascii_whitespace() || i - cs_start > 64 {
+            return None;
+        }
+        i += 1;
+    }
+    if i >= b.len() || i == cs_start {
+        return None;
+    }
+    let charset = String::from_utf8_lossy(&b[cs_start..i]).into_owned();
+    // RFC 2231 language suffix: "utf-8*ko".
+    let charset = charset.split('*').next().unwrap_or("").to_string();
+    let enc = *b.get(i + 1)?;
+    if b.get(i + 2) != Some(&b'?') {
+        return None;
+    }
+    i += 3;
+    let t_start = i;
+    while i < b.len() && b[i] != b'?' {
+        if b[i] == b' ' || b[i] == b'\t' {
+            return None;
+        }
+        i += 1;
+    }
+    if b.get(i + 1) != Some(&b'=') {
+        return None;
+    }
+    let text = &b[t_start..i];
+    let bytes = match enc {
+        b'B' | b'b' => {
+            let t: Vec<u8> = text.iter().copied().filter(|&c| c != b'=').collect();
+            base64::engine::general_purpose::STANDARD_NO_PAD
+                .decode(&t)
+                .ok()?
+        }
+        b'Q' | b'q' => {
+            let mut o = Vec::with_capacity(text.len());
+            let mut k = 0;
+            while k < text.len() {
+                match text[k] {
+                    b'_' => o.push(b' '),
+                    b'=' if k + 2 < text.len() => match (hex(text[k + 1]), hex(text[k + 2])) {
+                        (Some(h), Some(l)) => {
+                            o.push(h << 4 | l);
+                            k += 2;
+                        }
+                        _ => o.push(b'='),
+                    },
+                    c => o.push(c),
+                }
+                k += 1;
+            }
+            o
+        }
+        _ => return None,
+    };
+    Some((charset, bytes, i + 2))
+}
+
+fn hex(c: u8) -> Option<u8> {
+    (c as char).to_digit(16).map(|d| d as u8)
+}
+
+/// Decodes bytes in a named charset (lossy UTF-8 when unknown).
+pub fn decode_charset(cs: &str, bytes: &[u8]) -> String {
+    match encoding_rs::Encoding::for_label(cs.trim().as_bytes()) {
+        Some(enc) => enc.decode_without_bom_handling(bytes).0.into_owned(),
+        None => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
 /// Unicode format characters (general category Cf): invisible characters
 /// such as zero-width spaces/joiners, the soft hyphen, BOM, bidi embeddings,
 /// overrides and isolates, and tag characters.
@@ -206,7 +504,7 @@ pub fn is_format_char(c: char) -> bool {
 
 /// Longest raw name inspected: anything before the last 8 KiB cannot be part
 /// of the base name or extension the gate needs.
-const MAX_RAW_NAME: usize = 8 * 1024;
+pub(crate) const MAX_RAW_NAME: usize = 8 * 1024;
 /// Longest sanitized name, in characters.
 const MAX_NAME_CHARS: usize = 200;
 
@@ -376,7 +674,7 @@ JVBERi0xLjQK\r\n--B--\r\n";
 --B\r\nContent-Type: application/json\r\n\r\n{\"rrn\":\"900101-1234567\"}\r\n\
 --B\r\nContent-Type: application/octet-stream\r\n\r\n\x00\x01binary\r\n\
 --B\r\nContent-Type: message/rfc822\r\n\r\nSubject: inner\r\nContent-Type: text/html\r\n\r\n<p>x</p>\r\n\
---B\r\nContent-Type: application/pkcs7-mime; smime-type=enveloped-data\r\n\r\nMIAG\r\n--B--\r\n";
+--B\r\nContent-Type: application/pkcs7-mime; smime-type=enveloped-data\r\nContent-Transfer-Encoding: base64\r\n\r\nMIAG\r\n--B--\r\n";
         let p = parse(raw).unwrap();
         assert!(p
             .text_parts
@@ -404,6 +702,43 @@ JVBERi0xLjQK\r\n--B--\r\n";
             .unwrap();
         let p = h.join().expect("no stack overflow");
         assert_eq!(p.uninspectable.len(), 1);
+    }
+
+    #[test]
+    fn decode_header_rfc2047() {
+        assert_eq!(decode_header("=?utf-8?B?7ZWc6riA?="), "한글");
+        assert_eq!(decode_header("=?utf-8?q?a?= =?utf-8?q?b?="), "ab");
+        assert_eq!(decode_header("x =?utf-8?q?a_b?= y"), "x a b y");
+        assert_eq!(decode_header("=?UTF-8?Q?=EC=9D=B4?="), "이");
+        // A character split across adjacent words.
+        assert_eq!(decode_header("=?utf-8?B?7ZU=?= =?utf-8?B?nA==?="), "한");
+        assert_eq!(decode_header("=?euc-kr?B?x9Gx2w==?="), "한글");
+        assert_eq!(decode_header("=?utf-8*ko?q?x?="), "x");
+        for keep in ["=?utf-8?x?abc?=", "=?", "a=?b", "=?utf-8?q?a b?=", "plain"] {
+            assert_eq!(decode_header(keep), keep);
+        }
+    }
+
+    #[test]
+    fn decode_header_is_linear() {
+        for v in [
+            "=?utf-8?q?a?= ".repeat(150_000),
+            "=?a?b?".repeat(300_000),
+            "=?".repeat(1_000_000),
+            format!("=?utf-8?q?{}", "a".repeat(2_000_000)),
+        ] {
+            let t = std::time::Instant::now();
+            let _ = decode_header(&v);
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(2),
+                "{:?}",
+                t.elapsed()
+            );
+        }
+        // Subjects are decoded from their first 8 KiB only.
+        let raw = format!("Subject: {}\r\n\r\nx", "=?utf-8?q?a?= ".repeat(150_000));
+        let p = parse(raw.as_bytes()).unwrap();
+        assert!(p.subject.len() <= MAX_RAW_SUBJECT);
     }
 
     #[test]

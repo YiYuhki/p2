@@ -7,14 +7,18 @@
 //!    authserv-id are stripped (RFC 8601 §5) so senders cannot forge them.
 //! 3. Attachments are quarantined and replaced by download links.
 //! 4. Authentication-Results and Received are added, the message is ARC-sealed
-//!    with the real results, then optionally DKIM-signed by the gateway.
+//!    with the real results (set i=n+1, asserting the validated chain status
+//!    of any existing ARC sets), then optionally DKIM-signed by the gateway.
+//!
+//! Everything proportional to the message size (hashing, MIME parsing,
+//! extraction, banner insertion) runs on the blocking pool.
 
 use std::net::IpAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::arc::Sealer;
+use crate::arc::{ChainStatus, Cv, Sealer};
 use crate::dns::Resolver;
 use crate::gateway::{Envelope, MessageProcessor, ProcessError, SmtpError};
 use crate::metrics::Metrics;
@@ -53,6 +57,8 @@ pub struct InboundProcessor {
 struct AuthOutcome {
     results: String,
     dmarc_rejects: bool,
+    /// Status of the message's existing ARC chain (when sealing).
+    arc: ChainStatus,
 }
 
 impl InboundProcessor {
@@ -98,6 +104,24 @@ impl InboundProcessor {
                 .unwrap_or_else(|_| crate::dkim::prepare(raw));
             dkim = crate::dkim::verify_prepared(&prepared, res.as_ref()).await;
             methods.push(crate::dkim::auth_results(&dkim));
+        }
+        // ARC chain validation (only needed when sealing): hashing on the
+        // blocking pool, key lookups with the DKIM resolver. Without a
+        // resolver an existing chain cannot pass.
+        let mut arc = ChainStatus::NONE;
+        if self.arc.is_some() {
+            let owned = raw.to_vec();
+            let prepared =
+                tokio::task::spawn_blocking(move || crate::arc::validate::prepare(&owned))
+                    .await
+                    .unwrap_or_else(|_| crate::arc::validate::prepare(raw));
+            arc = match &a.dkim {
+                Some(res) => crate::arc::validate::verify(&prepared, res.as_ref()).await,
+                None => prepared.unverified(),
+            };
+            if arc.cv != Cv::None {
+                methods.push(format!("arc={}", arc.cv.as_str()));
+            }
         }
         let mut rejects = false;
         if let Some(ev) = &a.dmarc {
@@ -145,6 +169,7 @@ impl InboundProcessor {
         AuthOutcome {
             results,
             dmarc_rejects: rejects,
+            arc,
         }
     }
 
@@ -180,13 +205,15 @@ impl MessageProcessor for InboundProcessor {
         // Strip forged gateway markers / Authentication-Results claiming our
         // authserv-id before anything else reads the headers.
         let id = self.opts.hostname.to_ascii_lowercase();
-        let mut pre = crate::mimetree::parse(raw);
-        pre.remove_headers(|name, value| {
-            name.starts_with("x-secmail-")
-                || (name == "authentication-results" && auth_results_id(value) == id)
-        });
-        let cleaned = pre.to_bytes();
-        drop(pre);
+        let owned = raw.to_vec();
+        let cleaned = tokio::task::spawn_blocking(move || {
+            strip_header_fields(&owned, |name, value| {
+                name.starts_with("x-secmail-")
+                    || (name == "authentication-results" && auth_results_id(value) == id)
+            })
+        })
+        .await
+        .map_err(|_| ProcessError::TempFail)?;
 
         // Quarantine; `modified` tells whether the body changed.
         let (body, modified) = match &self.service {
@@ -199,9 +226,13 @@ impl MessageProcessor for InboundProcessor {
             None => (cleaned, false),
         };
         let body = if modified && self.opts.strip_original_dkim {
-            let mut root = crate::mimetree::parse(&body);
-            root.rename_header("DKIM-Signature", "X-SecMail-Original-DKIM-Signature");
-            root.to_bytes()
+            tokio::task::spawn_blocking(move || {
+                let mut root = crate::mimetree::parse(&body);
+                root.rename_header("DKIM-Signature", "X-SecMail-Original-DKIM-Signature");
+                root.to_bytes()
+            })
+            .await
+            .map_err(|_| ProcessError::TempFail)?
         } else {
             body
         };
@@ -230,8 +261,9 @@ impl MessageProcessor for InboundProcessor {
                 auth.results.clone()
             };
             let sealer = sealer.clone();
+            let status = auth.arc;
             let (input, sealed) = tokio::task::spawn_blocking(move || {
-                let r = sealer.seal(&out, &ar);
+                let r = sealer.seal_with(&out, &ar, &status);
                 (out, r)
             })
             .await
@@ -302,13 +334,68 @@ fn sanitize_header_value(s: &str) -> String {
     s.chars().filter(|&c| !(c < ' ' || c == '\u{7f}')).collect()
 }
 
+/// Removes the header fields for which `drop(lowercase_name, unfolded_value)`
+/// is true, keeping every other byte (line breaks normalized to CRLF, as the
+/// MIME parser does). Unlike the MIME tree this has no field limit, so a
+/// forged field cannot hide behind thousands of others.
+fn strip_header_fields(raw: &[u8], drop: impl Fn(&str, &str) -> bool) -> Vec<u8> {
+    let msg = crate::mimetree::crlf(raw);
+    let head_end = if msg.starts_with(b"\r\n") {
+        0
+    } else {
+        msg.windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|i| i + 2)
+            .unwrap_or(msg.len())
+    };
+    let mut out = Vec::with_capacity(msg.len());
+    let mut field: Vec<u8> = Vec::new();
+    let flush = |field: &mut Vec<u8>, out: &mut Vec<u8>| {
+        if field.is_empty() {
+            return;
+        }
+        let keep = match field.iter().position(|&b| b == b':') {
+            Some(c) => {
+                let name = String::from_utf8_lossy(&field[..c])
+                    .trim()
+                    .to_ascii_lowercase();
+                let value: Vec<u8> = field[c + 1..]
+                    .iter()
+                    .copied()
+                    .filter(|&b| b != b'\r' && b != b'\n')
+                    .collect();
+                !drop(&name, String::from_utf8_lossy(&value).trim())
+            }
+            None => true,
+        };
+        if keep {
+            out.extend_from_slice(field);
+        }
+        field.clear();
+    };
+    for line in msg[..head_end].split_inclusive(|&b| b == b'\n') {
+        if !(line[0] == b' ' || line[0] == b'\t') || field.is_empty() {
+            flush(&mut field, &mut out);
+        }
+        field.extend_from_slice(line);
+    }
+    flush(&mut field, &mut out);
+    out.extend_from_slice(&msg[head_end..]);
+    out
+}
+
 /// Most distinct From domains evaluated; more is treated as a DMARC failure.
 const MAX_FROM_DOMAINS: usize = 5;
 
 /// Distinct domains (lowercased, in order) of every address in every From
-/// header. An empty vector when no domain could be found.
+/// header, plus every domain that follows an '@' anywhere in the raw header
+/// text (DMARC then evaluates all of them; the worst verdict wins). The raw
+/// value is parsed *before* any RFC 2047 decoding, so encoded words cannot
+/// inject quotes or brackets that hide an address. Only the header block is
+/// parsed. An empty vector when no domain could be found.
 fn from_header_domains(raw: &[u8]) -> Vec<String> {
-    let root = crate::mimetree::parse(raw);
+    let head = header_block(raw);
+    let root = crate::mimetree::parse(head);
     let domain_of = |a: &str| {
         a.rsplit_once('@')
             .map(|(_, d)| {
@@ -326,38 +413,41 @@ fn from_header_domains(raw: &[u8]) -> Vec<String> {
         }
     };
     for value in root.headers("from") {
-        let from = crate::mimeproc::decode_header(&value);
-        let mut found = false;
-        if let Ok(list) = mailparse::addrparse(&from) {
+        if let Ok(list) = mailparse::addrparse(&value) {
             for a in list.iter() {
                 match a {
-                    mailparse::MailAddr::Single(s) => {
-                        found = true;
-                        push(domain_of(&s.addr));
-                    }
+                    mailparse::MailAddr::Single(s) => push(domain_of(&s.addr)),
                     mailparse::MailAddr::Group(g) => {
                         for s in &g.addrs {
-                            found = true;
                             push(domain_of(&s.addr));
                         }
                     }
                 }
             }
         }
-        if !found {
-            // Fallback for a malformed header: the text after each '@'.
-            for (i, _) in from.match_indices('@') {
-                let d = from[i + 1..]
-                    .split(['>', ' ', '\t', ')', ',', ';'])
-                    .next()
-                    .unwrap_or("")
-                    .trim_matches(|c| c == '.' || c == '<' || c == '>')
-                    .to_ascii_lowercase();
-                push(d);
-            }
+        // Every "@domain" in the raw text, whatever the structure says.
+        for (i, _) in value.match_indices('@') {
+            let d: String = value[i + 1..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_'))
+                .collect();
+            push(d.trim_matches('.').to_ascii_lowercase());
         }
     }
     out
+}
+
+/// The header block of a message (through the first empty line).
+fn header_block(raw: &[u8]) -> &[u8] {
+    for (i, w) in raw.windows(2).enumerate() {
+        if w == b"\n\n" {
+            return &raw[..i + 1];
+        }
+        if w[0] == b'\n' && raw.get(i + 1..i + 3) == Some(b"\r\n") {
+            return &raw[..i + 1];
+        }
+    }
+    raw
 }
 
 #[cfg(test)]
@@ -564,5 +654,161 @@ mod tests {
         assert!(String::from_utf8_lossy(&out).contains("ARC-Seal: i=1;"));
         let r = Static::default().with_txt("gw._domainkey.corp.test", &[&txt]);
         assert_eq!(crate::dkim::verify(&out, &r).await[0].value, "pass");
+    }
+}
+
+/// Round-2 review regressions: From parsing, ARC chains, forged headers.
+#[cfg(test)]
+mod r2_tests {
+    use super::*;
+    use crate::dns::Static;
+    use std::time::Duration;
+
+    #[test]
+    fn encoded_words_cannot_hide_from_domains() {
+        for (m, want) in [
+            (&b"From: =?utf-8?q?=22x?= <ceo@victim.com>, =?utf-8?q?y=22?= <a@attacker.net>\r\n\r\n"[..], &["victim.com", "attacker.net"][..]),
+            (b"From: =?utf-8?q?=28?= <ceo@victim.com> =?utf-8?q?=29?= <a@attacker.net>\r\n\r\n", &["victim.com", "attacker.net"]),
+            (b"From: ceo@victim.com (\r\n\r\n", &["victim.com"]),
+            (b"From: a@attacker.net\r\nFrom : ceo@victim.com\r\n\r\n", &["attacker.net", "victim.com"]),
+            (b"from:a@attacker.net\r\nFrom\t: ceo@victim.com\r\n\r\n", &["attacker.net", "victim.com"]),
+            (b"From: \"x@victim.com\" <a@attacker.net>\r\n\r\nbody From: z@other.org\r\n", &["attacker.net", "victim.com"]),
+        ] {
+            let got = from_header_domains(m);
+            for w in want {
+                assert!(got.iter().any(|d| d == w), "{:?}: {got:?}", String::from_utf8_lossy(m));
+            }
+            assert!(!got.iter().any(|d| d == "other.org"), "body is not a header");
+        }
+    }
+
+    fn auth(resolver: Static, enforce: bool) -> AuthOptions {
+        let r: Arc<dyn Resolver> = Arc::new(resolver);
+        AuthOptions {
+            spf: Some(Arc::new(crate::spf::Checker::new(
+                r.clone(),
+                Duration::from_secs(2),
+            ))),
+            dkim: Some(r.clone()),
+            dmarc: Some(Arc::new(crate::dmarc::Evaluator::new(
+                r,
+                Duration::from_secs(2),
+            ))),
+            enforce_dmarc: enforce,
+        }
+    }
+
+    fn env() -> Envelope {
+        Envelope {
+            mail_from: "x@attacker.net".into(),
+            rcpt_to: vec!["bob@corp.test".into()],
+            remote_addr: "192.0.2.10:52000".into(),
+            helo: "mx.attacker.net".into(),
+            tls: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn encoded_word_from_cannot_dodge_dmarc_reject() {
+        let r = Static::default()
+            .with_txt("attacker.net", &["v=spf1 ip4:192.0.2.0/24 -all"])
+            .with_txt("_dmarc.attacker.net", &["v=DMARC1; p=none"])
+            .with_txt("_dmarc.victim.com", &["v=DMARC1; p=reject"]);
+        let p = InboundProcessor::with_options(
+            None,
+            None,
+            Options {
+                hostname: "gw.corp.test".into(),
+                auth: auth(r, true),
+                ..Default::default()
+            },
+        );
+        let msg = b"From: =?utf-8?q?=22x?= <ceo@victim.com>, =?utf-8?q?y=22?= <a@attacker.net>\r\nSubject: pay\r\n\r\nhi\r\n";
+        assert!(matches!(
+            p.process(&env(), msg).await,
+            Err(ProcessError::Reject(_))
+        ));
+    }
+
+    #[test]
+    fn forged_headers_are_stripped_beyond_any_field_limit() {
+        let mut m = Vec::new();
+        for _ in 0..1500 {
+            m.extend_from_slice(b"X-Junk: a\r\n");
+        }
+        m.extend_from_slice(b"Authentication-Results: gw.corp.test;\r\n dkim=pass\r\nX-SecMail-Processed: x\r\nFrom: a@b\r\n\r\nAuthentication-Results: gw.corp.test; body\r\n");
+        let out = strip_header_fields(&m, |n, v| {
+            n.starts_with("x-secmail-")
+                || (n == "authentication-results" && auth_results_id(v) == "gw.corp.test")
+        });
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("dkim=pass") && !s.contains("X-SecMail-Processed"));
+        assert!(s.ends_with("From: a@b\r\n\r\nAuthentication-Results: gw.corp.test; body\r\n"));
+        assert_eq!(s.matches("X-Junk").count(), 1500);
+        // Untouched messages are byte-identical.
+        let plain = b"Subject: a\r\n folded\r\nbogus\r\n\r\nbody\r\n";
+        assert_eq!(strip_header_fields(plain, |_, _| false), plain);
+    }
+
+    fn arc_setup() -> (Arc<Sealer>, Static) {
+        use base64::Engine;
+        use rsa::pkcs8::EncodePublicKey;
+        let key = rsa::PrivateKey::new(&mut getrandom::SysRng, 1024).unwrap();
+        let txt = format!(
+            "v=DKIM1; k=rsa; p={}",
+            base64::engine::general_purpose::STANDARD
+                .encode(key.to_public_key().to_public_key_der().unwrap().as_bytes())
+        );
+        let sealer = Sealer::new("corp.test", "arc", "gw.corp.test", key).unwrap();
+        let r = Static::default().with_txt("arc._domainkey.corp.test", &[&txt]);
+        (Arc::new(sealer), r)
+    }
+
+    #[tokio::test]
+    async fn arc_chain_is_validated_and_extended() {
+        let (sealer, r) = arc_setup();
+        let rr: Arc<dyn Resolver> = Arc::new(r.clone());
+        let p = InboundProcessor::with_options(
+            None,
+            Some(sealer.clone()),
+            Options {
+                hostname: "gw.corp.test".into(),
+                auth: AuthOptions {
+                    dkim: Some(rr),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        // A forged ARC-Seal no longer suppresses sealing: cv=fail, i=2.
+        let forged = b"ARC-Seal: i=1; a=rsa-sha256; cv=none; d=x.example; s=s; b=AAAA\r\nFrom: a@x.example\r\n\r\nhi\r\n";
+        let out = String::from_utf8(p.process(&env(), forged).await.unwrap()).unwrap();
+        assert!(
+            out.starts_with("ARC-Seal: i=2; a=rsa-sha256; cv=fail;"),
+            "{out}"
+        );
+        assert!(out.contains("arc=fail"));
+        // A genuine upstream chain (sealed by a trusted hop) passes.
+        let upstream = sealer
+            .seal(b"From: a@x.example\r\nSubject: s\r\n\r\nhi\r\n", "spf=pass")
+            .unwrap();
+        let out = String::from_utf8(p.process(&env(), &upstream).await.unwrap()).unwrap();
+        assert!(
+            out.starts_with("ARC-Seal: i=2; a=rsa-sha256; cv=pass;"),
+            "{out}"
+        );
+        assert!(out.contains("arc=pass"));
+        let v = crate::arc::validate::validate(out.as_bytes(), &r).await;
+        assert_eq!(v.cv, Cv::Pass);
+        assert_eq!(v.instances, 2);
+        // No chain: i=1, cv=none, and no arc= result.
+        let out = String::from_utf8(
+            p.process(&env(), b"From: a@x.example\r\n\r\nhi\r\n")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(out.starts_with("ARC-Seal: i=1; a=rsa-sha256; cv=none;"));
+        assert!(!out.contains("arc="));
     }
 }
