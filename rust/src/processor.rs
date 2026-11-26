@@ -290,6 +290,12 @@ fn fold_header(name: &str, value: &str) -> String {
     let mut out = format!("{name}:");
     let mut col = out.len();
     for word in value.split(' ').filter(|w| !w.is_empty()) {
+        // A single token can't be folded; cap it so the line stays under the
+        // RFC 5322 998-octet limit (HELO names and domains are attacker input).
+        let word = match word.char_indices().nth(255) {
+            Some((i, _)) => &word[..i],
+            None => word,
+        };
         if col + 1 + word.len() > 900 && col > name.len() + 1 {
             out.push_str("\r\n\t");
             col = 1;

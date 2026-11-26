@@ -431,6 +431,10 @@ pub enum DataError {
     TooLarge,
     /// No data arrived within the idle timeout (stream position unknown).
     Timeout,
+    /// The client is too slow (below [`MIN_DATA_RATE`] after the grace
+    /// period); the caller should reply 421 and close (stream position
+    /// unknown).
+    Abort(&'static str),
     /// Transport error or premature EOF (stream position unknown).
     Io(std::io::Error),
 }
@@ -440,6 +444,7 @@ impl std::fmt::Display for DataError {
         match self {
             DataError::TooLarge => write!(f, "message too large"),
             DataError::Timeout => write!(f, "timed out reading message"),
+            DataError::Abort(m) => write!(f, "aborted: {m}"),
             DataError::Io(e) => write!(f, "reading message: {e}"),
         }
     }
@@ -459,6 +464,12 @@ pub async fn read_data<R: AsyncBufRead + Unpin>(
 }
 
 /// Like [`read_data`], with an idle timeout applied to every read.
+/// Minimum average upload rate (bytes/second) enforced after
+/// [`MIN_RATE_GRACE`], so slow-drip clients cannot hold DATA slots.
+pub const MIN_DATA_RATE: f64 = 256.0;
+/// Time before the minimum rate is enforced.
+pub const MIN_RATE_GRACE: Duration = Duration::from_secs(60);
+
 pub async fn read_data_timeout<R: AsyncBufRead + Unpin>(
     r: &mut R,
     max_bytes: usize,
@@ -474,6 +485,8 @@ pub async fn read_data_timeout<R: AsyncBufRead + Unpin>(
     // Whether the current line starts right after a CRLF (or at the start).
     let mut bol = true;
     let mut too_large = false;
+    let started = std::time::Instant::now();
+    let mut total: usize = 0;
     loop {
         let avail = match idle {
             Some(d) => timeout(d, r.fill_buf())
@@ -502,7 +515,15 @@ pub async fn read_data_timeout<R: AsyncBufRead + Unpin>(
             cur.extend_from_slice(&avail[..n]);
         }
         cur_len += n;
+        total += n;
         r.consume(n);
+        let elapsed = started.elapsed();
+        if elapsed > MIN_RATE_GRACE && (total as f64) / elapsed.as_secs_f64() < MIN_DATA_RATE {
+            return Err(DataError::Abort(
+                "4.4.2 Transfer too slow, closing connection",
+            ));
+        }
+
         if !too_large && max_bytes != 0 && out.len() + cur_len > max_bytes {
             too_large = true;
             out = Vec::new();

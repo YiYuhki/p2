@@ -87,7 +87,6 @@ fn limits(cfg: &Config) -> BackendOptions {
         max_line_length: n(cfg.smtp.max_line_length),
         session_timeout: cfg.smtp.session_timeout,
         data_timeout: cfg.smtp.data_timeout,
-        process_timeout: cfg.smtp.process_timeout,
         max_concurrent_data: n(cfg.smtp.max_concurrent_data),
         max_data_per_ip: n(cfg.smtp.max_data_per_ip),
         ..Default::default()

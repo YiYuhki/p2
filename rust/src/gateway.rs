@@ -44,8 +44,6 @@ pub const DEFAULT_MAX_CONCURRENT_DATA: usize = 32;
 pub const DEFAULT_DATA_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Concurrent DATA phases from one client IP (or IPv6 /64).
 pub const DEFAULT_MAX_DATA_PER_IP: usize = 8;
-/// Limit on processing one message (quarantine, auth, signing).
-pub const DEFAULT_PROCESS_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// How long DATA waits for a free slot before answering 451.
 const DATA_SLOT_WAIT: Duration = Duration::from_secs(30);
 /// Protocol errors tolerated before the session is dropped.
@@ -164,8 +162,6 @@ pub struct BackendOptions {
     pub data_timeout: Duration,
     /// Concurrent DATA phases per client IP (0 -> [`DEFAULT_MAX_DATA_PER_IP`]).
     pub max_data_per_ip: usize,
-    /// Limit on processing one message (0 -> [`DEFAULT_PROCESS_TIMEOUT`]).
-    pub process_timeout: Duration,
 }
 
 /// An IP network (address + prefix length) from `allowed_clients`.
@@ -289,7 +285,6 @@ struct Limits {
     max_recipients: usize,
     max_line: usize,
     data: Duration,
-    process: Duration,
 }
 
 /// The inbound/outbound backend.
@@ -342,7 +337,6 @@ impl Backend {
             max_recipients: or_default(opts.max_recipients, DEFAULT_MAX_RECIPIENTS),
             max_line: or_default(opts.max_line_length, DEFAULT_MAX_LINE_LENGTH),
             data: or_default(opts.data_timeout, DEFAULT_DATA_TIMEOUT),
-            process: or_default(opts.process_timeout, DEFAULT_PROCESS_TIMEOUT),
         };
         let max_data_per_ip = or_default(opts.max_data_per_ip, DEFAULT_MAX_DATA_PER_IP);
         let max_conn = or_default(opts.max_connections, DEFAULT_MAX_CONNECTIONS);
@@ -699,7 +693,8 @@ impl Backend {
                         }
                     };
                     if txn.rcpt.len() >= lim.max_recipients {
-                        errors += 1;
+                        // Not a protocol error: the client sends DATA for the
+                        // accepted recipients and retries the rest later.
                         conn.reply(452, "4.5.3 Too many recipients").await?;
                         continue;
                     }
@@ -717,7 +712,10 @@ impl Backend {
                             txn.from.as_str()
                         };
                         if !gl.allow(&key, sender, &addr) {
-                            errors += 1;
+                            // Not counted as a protocol error (a first-time
+                            // sender to many recipients would never get
+                            // through); the greylist's per-IP quota bounds
+                            // what one client can insert.
                             conn.reply(451, "4.7.1 Greylisted, please retry shortly")
                                 .await?;
                             continue;
@@ -792,6 +790,12 @@ impl Backend {
                             conn.reply(552, "5.3.4 Message too big").await?;
                             continue;
                         }
+                        Ok(Err(DataError::Abort(msg))) => {
+                            txn.abort().await;
+                            let code = if msg.starts_with('5') { 552 } else { 421 };
+                            let _ = conn.reply(code, msg).await;
+                            break;
+                        }
                         Ok(Err(DataError::Timeout)) => {
                             txn.abort().await;
                             conn.reply(421, "4.4.2 Idle timeout, closing connection")
@@ -821,13 +825,9 @@ impl Backend {
                         helo: helo.clone(),
                         tls: tls_on,
                     };
-                    let outcome = match timeout(lim.process, self.proc.process(&env, &raw)).await {
-                        Ok(o) => o,
-                        Err(_) => {
-                            eprintln!("smtp {}: message processing timed out", self.opts.name);
-                            Err(ProcessError::TempFail)
-                        }
-                    };
+                    // Not cancelled midway: a hold or records may already be
+                    // committed, and a client retry would duplicate them.
+                    let outcome = self.proc.process(&env, &raw).await;
                     drop(raw);
                     match outcome {
                         Ok(out) => {
@@ -1796,6 +1796,33 @@ mod r2_tests {
         (addr, log)
     }
 
+    /// Upstream that accepts everything (DATA included).
+    async fn strict_upstream_accepting() -> (String, ()) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let (r, mut w) = tokio::io::split(s);
+                    let mut r = BufReader::new(r);
+                    let _ = w.write_all(b"220 up\r\n").await;
+                    loop {
+                        let mut line = String::new();
+                        if r.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            break;
+                        }
+                        if line.trim_end().eq_ignore_ascii_case("DATA") {
+                            let _ = w.write_all(b"354 go\r\n").await;
+                            let _ = crate::smtpclient::read_data(&mut r, 0).await;
+                        }
+                        let _ = w.write_all(b"250 ok\r\n").await;
+                    }
+                });
+            }
+        });
+        (addr, ())
+    }
+
     struct Pass;
     #[async_trait]
     impl MessageProcessor for Pass {
@@ -1870,7 +1897,8 @@ mod r2_tests {
         let (up, _log) = strict_upstream().await;
         let gl = Arc::new(
             crate::greylist::Greylist::new(Duration::from_secs(3600), Duration::ZERO)
-                .with_max_entries(500),
+                .with_max_entries(500)
+                .with_max_pending_per_ip(50),
         );
         let backend = Arc::new(Backend::new(
             Arc::new(Pass),
@@ -1882,6 +1910,7 @@ mod r2_tests {
                     ..Default::default()
                 },
                 greylist: Some(gl.clone()),
+                max_recipients: 1000,
                 ..Default::default()
             },
         ));
@@ -1896,37 +1925,65 @@ mod r2_tests {
             .unwrap();
         line(&mut r).await;
         line(&mut r).await;
-        let mut replies = Vec::new();
         for i in 0..600 {
-            if w.write_all(format!("RCPT TO:<u{i}@example.com>\r\n").as_bytes())
+            w.write_all(format!("RCPT TO:<u{i}@example.com>\r\n").as_bytes())
                 .await
-                .is_err()
-            {
-                break;
-            }
-            let mut l = String::new();
-            if r.read_line(&mut l).await.unwrap_or(0) == 0 {
-                break;
-            }
-            let closing = l.starts_with("421");
-            replies.push(l);
-            if closing {
-                break;
-            }
+                .unwrap();
+            assert!(line(&mut r).await.starts_with("451"));
         }
         assert!(
-            replies
-                .last()
-                .map(|l| l.starts_with("421"))
-                .unwrap_or(false),
-            "session cut off after repeated greylist deferrals"
-        );
-        assert!(
-            gl.len() <= 25,
-            "one session stored only a few triplets: {}",
+            gl.len() <= 50,
+            "per-IP quota bounds one client: {}",
             gl.len()
         );
-        // A never-seen triplet from another client is still greylisted.
+        // Another client's never-seen triplet is still greylisted.
         assert!(!gl.allow("203.0.113.9", "spam@bad.example", "ceo@example.com"));
+    }
+
+    #[tokio::test]
+    async fn many_recipients_still_deliverable() {
+        let (up, _log) = strict_upstream_accepting().await;
+        let backend = Arc::new(Backend::new(
+            Arc::new(Pass),
+            BackendOptions {
+                recipient_domains: vec!["example.com".into()],
+                upstream: crate::smtpclient::Options {
+                    addr: up,
+                    timeout: Duration::from_secs(5),
+                    ..Default::default()
+                },
+                max_recipients: 100,
+                ..Default::default()
+            },
+        ));
+        let gw = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = gw.local_addr().unwrap();
+        tokio::spawn(backend.serve(gw));
+        let (r, mut w) = tokio::io::split(TcpStream::connect(addr).await.unwrap());
+        let mut r = BufReader::new(r);
+        line(&mut r).await;
+        w.write_all(b"EHLO c\r\nMAIL FROM:<a@x.org>\r\n")
+            .await
+            .unwrap();
+        line(&mut r).await;
+        line(&mut r).await;
+        let mut n452 = 0;
+        for i in 0..150 {
+            w.write_all(format!("RCPT TO:<u{i}@example.com>\r\n").as_bytes())
+                .await
+                .unwrap();
+            if line(&mut r).await.starts_with("452") {
+                n452 += 1;
+            }
+        }
+        assert_eq!(n452, 50);
+        w.write_all(b"DATA\r\n").await.unwrap();
+        assert!(line(&mut r).await.starts_with("354"));
+        w.write_all(b"Subject: x\r\n\r\nhi\r\n.\r\n").await.unwrap();
+        let rep = line(&mut r).await;
+        assert!(
+            rep.starts_with("250"),
+            "accepted recipients delivered: {rep}"
+        );
     }
 }

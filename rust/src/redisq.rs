@@ -61,6 +61,10 @@ pub struct RedisQueue {
     prefix: String,
     /// This process's verdict-consumer id (names its processing list).
     consumer_id: String,
+    /// When the heartbeat last succeeded. Verdicts are only taken while it
+    /// is fresh, so a consumer that cannot prove it is alive never holds
+    /// verdicts other replicas would recover and apply concurrently.
+    last_beat: Mutex<Option<tokio::time::Instant>>,
 }
 
 impl RedisQueue {
@@ -82,6 +86,7 @@ impl RedisQueue {
             conn: Mutex::new(conn),
             prefix: prefix.to_string(),
             consumer_id: uuid::Uuid::new_v4().to_string(),
+            last_beat: Mutex::new(None),
         })
     }
 
@@ -120,11 +125,6 @@ impl RedisQueue {
         format!("{}:results:processing:{id}", self.prefix)
     }
 
-    /// The shared processing list used before per-consumer lists existed.
-    fn legacy_processing_key(&self) -> String {
-        format!("{}:results:processing", self.prefix)
-    }
-
     /// Set of registered verdict-consumer ids.
     pub fn consumers_key(&self) -> String {
         format!("{}:results:consumers", self.prefix)
@@ -134,8 +134,32 @@ impl RedisQueue {
         format!("{}:results:alive:{id}", self.prefix)
     }
 
-    /// Registers this consumer and (re)arms its heartbeat key.
+    /// Registers this consumer and (re)arms its heartbeat key, reconnecting
+    /// the command connection once if it dropped.
     async fn heartbeat(&self) -> redis::RedisResult<()> {
+        let r = match self.heartbeat_once().await {
+            Err(_) => {
+                self.reconnect_cmd().await;
+                self.heartbeat_once().await
+            }
+            ok => ok,
+        };
+        if r.is_ok() {
+            *self.last_beat.lock().unwrap() = Some(tokio::time::Instant::now());
+        }
+        r
+    }
+
+    /// True while the last successful heartbeat is younger than half its TTL.
+    fn beat_fresh(&self) -> bool {
+        self.last_beat
+            .lock()
+            .unwrap()
+            .map(|t| t.elapsed() < Duration::from_secs(HEARTBEAT_TTL_SECS / 2))
+            .unwrap_or(false)
+    }
+
+    async fn heartbeat_once(&self) -> redis::RedisResult<()> {
         let mut conn = self.cmd_conn();
         redis::pipe()
             .atomic()
@@ -224,23 +248,24 @@ impl RedisQueue {
         Ok(n)
     }
 
-    /// Startup recovery: registers this consumer, drains the legacy shared
-    /// processing list and re-queues dead consumers' processing lists.
+    /// Startup recovery: registers this consumer and re-queues dead
+    /// consumers' processing lists.
     pub async fn recover_results(&self) -> redis::RedisResult<usize> {
         self.heartbeat().await?;
-        let mut conn = self.cmd_conn();
-        let legacy = self.legacy_processing_key();
-        let n = self.drain(&mut conn, &legacy).await?;
-        Ok(n + self.recover_dead().await?)
+        self.recover_dead().await
     }
 
     /// Removes a handled verdict from the processing list.
     async fn ack_result(&self, payload: &str) {
+        let key = self.processing_key();
         let mut conn = self.cmd_conn();
-        if let Err(e) = conn
-            .lrem::<_, _, ()>(self.processing_key(), 1, payload)
-            .await
-        {
+        let mut r = conn.lrem::<_, _, ()>(&key, 1, payload).await;
+        if r.is_err() {
+            self.reconnect_cmd().await;
+            let mut conn = self.cmd_conn();
+            r = conn.lrem::<_, _, ()>(&key, 1, payload).await;
+        }
+        if let Err(e) = r {
             eprintln!("redisq: results: ack failed (will be re-applied on restart): {e}");
         }
     }
@@ -346,6 +371,15 @@ impl RedisQueue {
                             eprintln!("redisq: results: recovered {n} verdict(s) of dead consumers")
                         }
                         Err(e) => eprintln!("redisq: results: recovery failed: {e}"),
+                    }
+                }
+                if !self.beat_fresh() {
+                    // Prove liveness before taking work; otherwise another
+                    // replica could recover what we hold and apply it too.
+                    if let Err(e) = self.heartbeat().await {
+                        eprintln!("redisq: results: heartbeat failed, pausing: {e}");
+                        backoff(&mut shutdown).await;
+                        continue;
                     }
                 }
                 let payload = match self.take_result(&mut blocking).await {
@@ -744,7 +778,7 @@ mod tests {
     /// Review round 2: startup recovery used to move every entry of one
     /// shared processing list back, including the in-flight verdicts of live
     /// replicas (applied twice, concurrently). Only consumers whose heartbeat
-    /// expired are recovered now, plus the legacy shared list.
+    /// expired are recovered now.
     #[tokio::test]
     async fn recovery_skips_live_replicas() {
         let Some(q) = setup().await else { return };
@@ -753,26 +787,22 @@ mod tests {
         assert_ne!(live.consumer_id(), q.consumer_id());
         let mut c = q.cmd_conn();
         let inflight = serde_json::to_string(&verdict("live1")).unwrap();
-        let legacy = serde_json::to_string(&verdict("legacy1")).unwrap();
         let dead = serde_json::to_string(&verdict("dead1")).unwrap();
         // A live replica (fresh heartbeat) is handling `inflight`.
         live.heartbeat().await.unwrap();
         let _: () = c.lpush(live.processing_key(), &inflight).await.unwrap();
-        // A dead one left `dead` behind; an old version left `legacy`.
+        // A dead one left `dead` behind.
         let _: () = c.sadd(q.consumers_key(), "gone").await.unwrap();
         let _: () = c.lpush(q.processing_key_for("gone"), &dead).await.unwrap();
-        let _: () = c.lpush(q.legacy_processing_key(), &legacy).await.unwrap();
 
-        assert_eq!(q.recover_results().await.unwrap(), 2);
+        assert_eq!(q.recover_results().await.unwrap(), 1);
         assert_eq!(
             lrange(&q, &live.processing_key()).await,
             vec![inflight.clone()]
         );
         let mut queued = lrange(&q, &q.results_key()).await;
         queued.sort();
-        let mut want = vec![dead, legacy];
-        want.sort();
-        assert_eq!(queued, want);
+        assert_eq!(queued, vec![dead]);
         let mut members: Vec<String> = c.smembers(q.consumers_key()).await.unwrap();
         members.sort();
         let mut want = vec![live.consumer_id().to_string(), q.consumer_id().to_string()];

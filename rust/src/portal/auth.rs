@@ -586,6 +586,11 @@ const MSG_OTP_LOCKED: &str = "인증 시도가 너무 많아 잠시 잠겼습니
 const OTP_GLOBAL_FACTOR: u32 = 5;
 /// Per-generation cap on tracked lockout counters (see `GenMap`).
 const OTP_GUARD_MAX_KEYS: usize = 50_000;
+/// Cap for the per-address ceiling map. Its keys only appear on a wrong guess
+/// against a code that is actually pending, and codes are only issued to
+/// eligible recipients, so forcing a generation rotation (which would flush
+/// lockouts) would need this many recipients holding pending codes.
+const OTP_ADDRESS_MAX_KEYS: usize = 500_000;
 
 /// Counts wrong OTP codes (only guesses against a code that was actually
 /// pending) across code re-sends, keyed on (address, client /64 or IPv4).
@@ -616,7 +621,7 @@ impl OtpGuard {
             window,
             failures: Mutex::new(GuardMaps {
                 per_client: GenMap::new(window, OTP_GUARD_MAX_KEYS),
-                per_address: GenMap::new(window, OTP_GUARD_MAX_KEYS),
+                per_address: GenMap::new(window, OTP_ADDRESS_MAX_KEYS),
             }),
         }
     }

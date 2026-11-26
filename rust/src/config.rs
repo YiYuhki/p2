@@ -133,9 +133,6 @@ pub struct Smtp {
     /// Limit on one DATA upload (0 = 10m).
     #[serde(deserialize_with = "dur::de_opt")]
     pub data_timeout: Duration,
-    /// Limit on processing one message (0 = 5m).
-    #[serde(deserialize_with = "dur::de_opt")]
-    pub process_timeout: Duration,
     /// Concurrent DATA phases, all clients (0 = 32).
     pub max_concurrent_data: i32,
     /// Concurrent DATA phases per client IP / IPv6 /64 (0 = 8; inbound only).
@@ -526,7 +523,6 @@ impl Default for Smtp {
             rate_limit_per_ip_burst: 0,
             session_timeout: Duration::ZERO,
             data_timeout: Duration::ZERO,
-            process_timeout: Duration::ZERO,
             max_concurrent_data: 0,
             max_data_per_ip: 0,
         }
