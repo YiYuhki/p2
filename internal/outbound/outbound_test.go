@@ -255,6 +255,28 @@ func TestReleaseFailureReopensHold(t *testing.T) {
 	}
 }
 
+func TestReleaseAfterExpiryRefused(t *testing.T) {
+	// A review window that is over by the time anyone approves; the janitor
+	// has not run yet.
+	e := setup(t, func(o *Options) { o.HoldTTL = time.Millisecond })
+	ctx := context.Background()
+	e.send("kim@example.com", []string{"partner@ext.org"}, mail("x", "AKIAIOSFODNN7EXAMPLE"))
+	holds, _ := e.store.ListHolds(ctx, model.HoldHeld, 10, store.Page{})
+	if len(holds) != 1 {
+		t.Fatalf("holds %d", len(holds))
+	}
+	time.Sleep(5 * time.Millisecond)
+	if err := e.svc.Release(ctx, holds[0].ID, "sec"); !errors.Is(err, ErrNotHeld) {
+		t.Fatalf("release of an expired hold: %v", err)
+	}
+	if e.next.count() != 0 {
+		t.Fatal("expired hold was sent")
+	}
+	if h, _ := e.store.GetHold(ctx, holds[0].ID); h.Status != model.HoldExpired {
+		t.Fatalf("want EXPIRED, got %s", h.Status)
+	}
+}
+
 func TestRejectAndExpiry(t *testing.T) {
 	e := setup(t, nil)
 	ctx := context.Background()

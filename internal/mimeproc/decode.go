@@ -114,6 +114,11 @@ func (p *Part) Filename() string {
 	if name == "" {
 		return ""
 	}
+	if len(name) > maxRawFilenameBytes {
+		// Keep the head and the tail (extension): truncating an encoded-word
+		// may leave it undecoded, which is harmless (shown raw).
+		name = name[:maxRawFilenameBytes/2] + name[len(name)-maxRawFilenameBytes/2:]
+	}
 	return SanitizeFilename(DecodeHeader(name))
 }
 
@@ -146,13 +151,34 @@ func SanitizeFilename(name string) string {
 	if name == "" || name == "." {
 		return ""
 	}
-	for len(name) > 200 {
+	if len(name) > maxFilenameBytes {
+		// Truncate once (the old rune-at-a-time loop was quadratic), on a
+		// UTF-8 boundary, keeping a short extension.
 		ext := path.Ext(name)
 		if len(ext) > 20 {
 			ext = ""
 		}
-		runes := []rune(strings.TrimSuffix(name, ext))
-		name = string(runes[:len(runes)-1]) + ext
+		name = truncateUTF8(name[:len(name)-len(ext)], maxFilenameBytes-len(ext)) + ext
 	}
 	return name
+}
+
+// maxFilenameBytes is the longest sanitised filename, in bytes.
+const maxFilenameBytes = 200
+
+// maxRawFilenameBytes caps a raw filename parameter before it is decoded:
+// RFC 2231 continuations let a sender build an arbitrarily long value, and
+// nothing much longer than maxFilenameBytes survives sanitising anyway. The
+// tail (with the extension) is kept, since that is what the type checks use.
+const maxRawFilenameBytes = 4096
+
+// truncateUTF8 cuts s to at most n bytes without splitting a rune.
+func truncateUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }

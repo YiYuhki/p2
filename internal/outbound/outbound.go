@@ -269,6 +269,14 @@ func (s *Service) Release(ctx context.Context, id, by string) error {
 	if h.Status != model.HoldHeld {
 		return ErrNotHeld
 	}
+	if !s.now().Before(h.ExpiresAt) {
+		// Past its review deadline: the janitor would expire it (fail closed);
+		// do so now rather than send a message whose approval window closed.
+		if err := s.finish(ctx, id, model.HoldExpired, "system", "검토 기한 만료"); err != nil && !errors.Is(err, ErrNotHeld) {
+			s.log.Error("expire hold", "hold", id, "err", err)
+		}
+		return ErrNotHeld
+	}
 	// Claim first so that concurrent approvals cannot send twice.
 	if err := s.store.DecideHold(ctx, id, model.HoldReleased, by, "", s.now().UTC()); err != nil {
 		if errors.Is(err, store.ErrConflict) {

@@ -3,7 +3,9 @@ package gateway
 import (
 	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
+	"time"
 )
 
 // LimitListener bounds the number of concurrent connections a listener will
@@ -12,6 +14,12 @@ import (
 // floods and slow-loris amplification.
 type LimitListener struct {
 	net.Listener
+	// SessionTimeout, when positive, is the longest a connection may live:
+	// every read/write deadline the server sets is clamped to accept time +
+	// SessionTimeout, so a client trickling bytes (slow-loris) cannot keep a
+	// slot forever even though each command resets the idle timeout.
+	SessionTimeout time.Duration
+
 	max      int
 	perIP    int
 	log      *slog.Logger
@@ -44,7 +52,7 @@ func (l *LimitListener) Accept() (net.Conn, error) {
 				continue
 			}
 		}
-		ip := hostOf(c.RemoteAddr())
+		ip := clientKey(c.RemoteAddr())
 		if !l.reserveIP(ip) {
 			if l.sem != nil {
 				<-l.sem
@@ -52,7 +60,12 @@ func (l *LimitListener) Accept() (net.Conn, error) {
 			l.reject(c, "per-ip")
 			continue
 		}
-		return &limitConn{Conn: c, l: l, ip: ip}, nil
+		lc := &limitConn{Conn: c, l: l, ip: ip}
+		if l.SessionTimeout > 0 {
+			lc.end = time.Now().Add(l.SessionTimeout)
+			_ = c.SetDeadline(lc.end)
+		}
+		return lc, nil
 	}
 }
 
@@ -91,18 +104,47 @@ func (l *LimitListener) reject(c net.Conn, reason string) {
 	_ = c.Close()
 }
 
-func hostOf(a net.Addr) string {
-	if h, _, err := net.SplitHostPort(a.String()); err == nil {
+// clientKey is the per-client bucket: the IPv4 address, or the /64 of an
+// IPv6 address (one subscriber typically owns a whole /64, so per-address
+// keying would let a single host open unlimited connections).
+func clientKey(a net.Addr) string {
+	h := a.String()
+	if host, _, err := net.SplitHostPort(h); err == nil {
+		h = host
+	}
+	ip, err := netip.ParseAddr(h)
+	if err != nil {
 		return h
 	}
-	return a.String()
+	ip = ip.Unmap().WithZone("")
+	if ip.Is6() {
+		p, _ := ip.Prefix(64)
+		return p.String()
+	}
+	return ip.String()
 }
 
 type limitConn struct {
 	net.Conn
 	l    *LimitListener
 	ip   string
+	end  time.Time // zero: no session cap
 	once sync.Once
+}
+
+func (c *limitConn) clamp(t time.Time) time.Time {
+	if !c.end.IsZero() && (t.IsZero() || t.After(c.end)) {
+		return c.end
+	}
+	return t
+}
+
+func (c *limitConn) SetDeadline(t time.Time) error { return c.Conn.SetDeadline(c.clamp(t)) }
+func (c *limitConn) SetReadDeadline(t time.Time) error {
+	return c.Conn.SetReadDeadline(c.clamp(t))
+}
+func (c *limitConn) SetWriteDeadline(t time.Time) error {
+	return c.Conn.SetWriteDeadline(c.clamp(t))
 }
 
 func (c *limitConn) Close() error {

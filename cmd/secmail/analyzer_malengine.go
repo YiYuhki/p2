@@ -8,9 +8,13 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"github.com/yiyuhki/p2/analyzer/scan"
@@ -56,10 +60,17 @@ func runInProcAnalyzer(ctx context.Context, wg *sync.WaitGroup, cfg config.Analy
 
 	handler := func(ctx context.Context, j model.Job) error {
 		var r scan.Result
-		if data, err := readObject(ctx, obj, j.Storage.Key); err != nil {
-			r = scan.ErrorResult("fetch", err)
-		} else {
+		data, err := readObject(ctx, obj, j)
+		switch {
+		case err == nil:
 			r = sc.Scan(ctx, j.Filename, data)
+		case errors.Is(err, storage.ErrNotFound), errors.Is(err, errTooLarge), errors.Is(err, errHashMismatch):
+			r = scan.ErrorResult("fetch", err) // permanent: fail closed
+		default:
+			// Transient (storage outage, timeout, shutdown): record no
+			// verdict; the attachment stays PENDING and the stale-job sweep
+			// re-queues it instead of finalising it as ERROR.
+			return fmt.Errorf("fetch: %w", err)
 		}
 		v := model.Verdict{
 			AttachmentID: j.AttachmentID,
@@ -85,11 +96,32 @@ func runInProcAnalyzer(ctx context.Context, wg *sync.WaitGroup, cfg config.Analy
 	return nil
 }
 
-func readObject(ctx context.Context, obj storage.Storage, key string) ([]byte, error) {
-	rc, err := obj.Get(ctx, key)
+var (
+	errTooLarge     = errors.New("attachment exceeds the analysis size cap")
+	errHashMismatch = errors.New("attachment content does not match the job's sha256")
+)
+
+// readObject loads the attachment. Content over the cap is an error rather
+// than silently truncated (scanning only a prefix could miss the payload),
+// and the bytes are checked against the job's SHA-256 when it has one.
+func readObject(ctx context.Context, obj storage.Storage, j model.Job) ([]byte, error) {
+	rc, err := obj.Get(ctx, j.Storage.Key)
 	if err != nil {
 		return nil, err
 	}
 	defer rc.Close()
-	return io.ReadAll(io.LimitReader(rc, inProcFetchCap))
+	data, err := io.ReadAll(io.LimitReader(rc, inProcFetchCap+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > inProcFetchCap {
+		return nil, errTooLarge
+	}
+	if j.SHA256 != "" {
+		sum := sha256.Sum256(data)
+		if !strings.EqualFold(hex.EncodeToString(sum[:]), j.SHA256) {
+			return nil, errHashMismatch
+		}
+	}
+	return data, nil
 }

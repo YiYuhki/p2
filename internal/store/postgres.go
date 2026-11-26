@@ -292,10 +292,16 @@ func (p *Postgres) FindReusableVerdict(ctx context.Context, sha string, since ti
 		ORDER BY analyzed_at DESC LIMIT 1`, sha, since))
 }
 
-func (p *Postgres) MarkRequeued(ctx context.Context, id string, at time.Time) error {
-	_, err := p.pool.Exec(ctx, `UPDATE attachments SET attempts=attempts+1, queued_at=$2, updated_at=$2
-		WHERE id=$1 AND status='PENDING'`, id, at)
-	return err
+func (p *Postgres) MarkRequeued(ctx context.Context, id string, queuedAt, at time.Time) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE attachments SET attempts=attempts+1, queued_at=$2, updated_at=$2
+		WHERE id=$1 AND status='PENDING' AND queued_at=$3`, id, at, queuedAt)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrConflict
+	}
+	return nil
 }
 
 func (p *Postgres) RecordDownload(ctx context.Context, ev model.DownloadEvent) error {

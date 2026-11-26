@@ -29,8 +29,11 @@ type Store interface {
 	// FindReusableVerdict returns the most recent final verdict for sha256
 	// analyzed after since (CLEAN or MALICIOUS only).
 	FindReusableVerdict(ctx context.Context, sha256 string, since time.Time) (*model.Attachment, error)
-	// MarkRequeued increments Attempts and resets QueuedAt.
-	MarkRequeued(ctx context.Context, id string, at time.Time) error
+	// MarkRequeued increments Attempts and resets QueuedAt to at, provided
+	// the attachment is still PENDING and still has the QueuedAt the caller
+	// listed (queuedAt); otherwise it returns ErrConflict, so that when several
+	// replicas sweep concurrently only one of them re-enqueues the job.
+	MarkRequeued(ctx context.Context, id string, queuedAt, at time.Time) error
 	// RecordDownload increments the counter and appends an audit event.
 	RecordDownload(ctx context.Context, ev model.DownloadEvent) error
 	// ListStalePending returns PENDING attachments queued before olderThan.

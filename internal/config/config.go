@@ -6,6 +6,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"strings"
 	"time"
@@ -176,6 +177,12 @@ type SMTPConfig struct {
 	// apply a per-IP cap because its clients are the allow-listed internal
 	// mail servers.
 	MaxConnectionsPerIP int `yaml:"max_connections_per_ip"`
+	// MaxSessionDuration caps the lifetime of one SMTP connection, however
+	// active it is (slow-loris defence). 0 = unlimited.
+	MaxSessionDuration time.Duration `yaml:"max_session_duration"`
+	// DataTimeout caps the transmission of one message body. 0 = only the
+	// read timeout applies.
+	DataTimeout time.Duration `yaml:"data_timeout"`
 }
 
 type UpstreamConfig struct {
@@ -242,9 +249,14 @@ type PortalConfig struct {
 	// aggregate miss rate across all clients (defends distributed guessing).
 	EnumPerIPBurst int     `yaml:"enum_per_ip_burst"`
 	EnumGlobalRPS  float64 `yaml:"enum_global_rps"`
-	// TrustProxyHeaders makes the rate limiter key on X-Forwarded-For.
-	TrustProxyHeaders bool             `yaml:"trust_proxy_headers"`
-	Auth              PortalAuthConfig `yaml:"auth"`
+	// TrustProxyHeaders makes the rate limiter key on X-Forwarded-For, for
+	// requests arriving from TrustedProxies only.
+	TrustProxyHeaders bool `yaml:"trust_proxy_headers"`
+	// TrustedProxies lists the reverse proxies (CIDRs or IPs) whose
+	// X-Forwarded-For and, in header auth mode, identity header are
+	// believed. Required by trust_proxy_headers and by auth mode "header".
+	TrustedProxies []string         `yaml:"trusted_proxies"`
+	Auth           PortalAuthConfig `yaml:"auth"`
 }
 
 // Recipient authentication modes for the download portal.
@@ -350,6 +362,8 @@ func Default() Config {
 			WriteTimeout:        60 * time.Second,
 			MaxConnections:      1024,
 			MaxConnectionsPerIP: 50,
+			MaxSessionDuration:  30 * time.Minute,
+			DataTimeout:         10 * time.Minute,
 		},
 		Upstream: UpstreamConfig{Timeout: 60 * time.Second},
 		Rewrite: RewriteConfig{
@@ -422,6 +436,29 @@ func Load(path string) (Config, error) {
 	return cfg, cfg.Validate()
 }
 
+// ParsePrefixes accepts CIDRs or single IPs.
+func ParsePrefixes(list []string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for _, v := range list {
+		v = strings.TrimSpace(v)
+		if !strings.Contains(v, "/") {
+			a, err := netip.ParseAddr(v)
+			if err != nil {
+				return nil, err
+			}
+			a = a.Unmap()
+			out = append(out, netip.PrefixFrom(a, a.BitLen()))
+			continue
+		}
+		p, err := netip.ParsePrefix(v)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p.Masked())
+	}
+	return out, nil
+}
+
 func (c *Config) Validate() error {
 	var errs []error
 	if c.Upstream.Addr == "" {
@@ -461,8 +498,20 @@ func (c *Config) Validate() error {
 		if a.TrustedHeader == "" {
 			errs = append(errs, errors.New("portal.auth.trusted_header is required in header mode"))
 		}
+		if len(c.Portal.TrustedProxies) == 0 {
+			errs = append(errs, errors.New("portal.trusted_proxies is required in header mode (only the SSO proxy may assert identities)"))
+		}
 	default:
 		errs = append(errs, fmt.Errorf("portal.auth.mode: unknown value %q", a.Mode))
+	}
+	if c.Portal.TrustProxyHeaders && len(c.Portal.TrustedProxies) == 0 {
+		errs = append(errs, errors.New("portal.trust_proxy_headers requires portal.trusted_proxies"))
+	}
+	if _, err := ParsePrefixes(c.Portal.TrustedProxies); err != nil {
+		errs = append(errs, fmt.Errorf("portal.trusted_proxies: %w", err))
+	}
+	if _, err := ParsePrefixes(c.Outbound.AllowedClients); err != nil {
+		errs = append(errs, fmt.Errorf("outbound.allowed_clients: %w", err))
 	}
 	if c.Outbound.Enabled {
 		if c.Outbound.NextHop.Addr == "" {

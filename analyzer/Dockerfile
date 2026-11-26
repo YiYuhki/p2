@@ -10,7 +10,7 @@
 # Unlike secmail's core image this one links libyara via cgo (CGO_ENABLED=1),
 # which is exactly why the worker is its own module.
 
-FROM golang:1.24-bookworm AS build
+FROM golang:1.26.11-bookworm AS build
 RUN apt-get update \
  && apt-get install -y --no-install-recommends libyara-dev pkg-config \
  && rm -rf /var/lib/apt/lists/*

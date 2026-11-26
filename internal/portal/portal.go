@@ -16,6 +16,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -55,7 +56,10 @@ type Options struct {
 	EnumPerIPBurst    int
 	EnumGlobalRPS     float64
 	TrustProxyHeaders bool
-	Location          *time.Location
+	// TrustedProxies are the reverse proxies allowed to set X-Forwarded-For
+	// (with TrustProxyHeaders) and the auth header in header mode.
+	TrustedProxies []netip.Prefix
+	Location       *time.Location
 	// PublicBaseURL is used to validate the Origin of POST requests.
 	PublicBaseURL string
 	Auth          AuthOptions
@@ -84,11 +88,15 @@ func New(st store.Store, obj storage.Storage, tk Tickets, opts Options, log *slo
 	if opts.Location == nil {
 		opts.Location = time.Local
 	}
+	var xffFrom []netip.Prefix
+	if opts.TrustProxyHeaders {
+		xffFrom = opts.TrustedProxies
+	}
 	return &Server{
 		store: st, storage: obj, tickets: tk, codes: opts.Codes, mailer: opts.Mailer,
 		opts: opts, log: log, now: time.Now,
 		limiter: newIPLimiterFull(opts.RateLimitRPS, opts.RateLimitBurst,
-			opts.EnumPerIPBurst, opts.EnumGlobalRPS, 0, opts.TrustProxyHeaders),
+			opts.EnumPerIPBurst, opts.EnumGlobalRPS, 0, xffFrom),
 	}
 }
 
@@ -320,6 +328,14 @@ func (s *Server) file(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Re-check: the verdict must still be CLEAN at the moment of transfer.
+	// Re-read the row: `a` was loaded before the ticket was redeemed, and a
+	// rescan may have changed the verdict (or the link expired) since.
+	a, err = s.store.GetAttachment(r.Context(), a.ID)
+	if err != nil {
+		s.log.Error("portal: reload attachment", "id", id, "err", err)
+		s.fail(w, r, http.StatusInternalServerError, false, "일시적인 오류가 발생했습니다.")
+		return
+	}
 	if s.effectiveStatus(a) != model.StatusClean {
 		http.Redirect(w, r, "/d/"+r.PathValue("token"), http.StatusSeeOther)
 		return

@@ -97,7 +97,7 @@ func TestPendingThenCleanDownloadFlow(t *testing.T) {
 
 	f.store.SetVerdict(context.Background(), f.id, model.StatusClean, "", nil, time.Now())
 
-	resp, body = get(t, base)
+	_, body = get(t, base)
 	if !strings.Contains(body, "안전한 파일") || strings.Contains(body, `type="submit" disabled`) {
 		t.Fatalf("clean page wrong:\n%s", body)
 	}
@@ -221,8 +221,8 @@ func TestContentDisposition(t *testing.T) {
 		}
 		// The header must never carry a raw quote-break or CR/LF that could
 		// escape the value or inject a header.
-		if v := strings.TrimPrefix(got, `attachment; filename="`); strings.HasPrefix(v, c.wantASCII+`"`) {
-			// ok: the ascii value is properly closed
+		if v := strings.TrimPrefix(got, `attachment; filename="`); !strings.HasPrefix(v, c.wantASCII+`"`) {
+			t.Errorf("%q: ascii value not properly closed: %q", c.name, got)
 		}
 		if strings.ContainsAny(got, "\r\n") {
 			t.Errorf("%q: header contains CR/LF: %q", c.name, got)
@@ -240,7 +240,7 @@ func TestContentDisposition(t *testing.T) {
 
 func TestAllowFailPerIP(t *testing.T) {
 	// failBurst 3, generous global so only the per-IP budget bites.
-	l := newIPLimiterFull(1000, 1000, 3, 1000, 2000, false)
+	l := newIPLimiterFull(1000, 1000, 3, 1000, 2000, nil)
 	ok := 0
 	for i := 0; i < 10; i++ {
 		if l.AllowFail("10.0.0.1") {
@@ -258,7 +258,7 @@ func TestAllowFailPerIP(t *testing.T) {
 
 func TestAllowFailGlobal(t *testing.T) {
 	// Large per-IP burst but a global cap of 5; spread across many IPs.
-	l := newIPLimiterFull(1000, 1000, 1000, 1, 5, false)
+	l := newIPLimiterFull(1000, 1000, 1000, 1, 5, nil)
 	ok := 0
 	for i := 0; i < 50; i++ {
 		if l.AllowFail(fmt.Sprintf("172.16.0.%d", i)) {

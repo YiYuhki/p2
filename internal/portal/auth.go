@@ -8,7 +8,6 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -107,6 +106,11 @@ func (s *Server) clearSession(w http.ResponseWriter) {
 func (s *Server) currentUser(r *http.Request) string {
 	switch s.opts.Auth.Mode {
 	case config.AuthHeader:
+		// The identity header is only meaningful when set by our SSO proxy;
+		// anyone reaching the portal directly could forge it.
+		if !fromTrustedProxy(r, s.opts.TrustedProxies) {
+			return ""
+		}
 		u := NormalizeEmail(r.Header.Get(s.opts.Auth.TrustedHeader))
 		if validEmail(u) {
 			return u
@@ -334,31 +338,59 @@ func (c *RedisCodes) Put(ctx context.Context, email, code string, ttl, resendAft
 	return err == nil, err
 }
 
+// checkCodeScript verifies a code atomically: compare, count the miss, and
+// destroy the code on success or once the attempt budget is spent. Doing it
+// in one script means parallel guesses cannot each read the same attempt
+// count, and a miss can never recreate a deleted key (HINCRBY on an existing
+// key keeps its TTL; the key is not touched when it is gone).
+// The values compared are SHA-256 hashes, so a non-constant-time compare
+// leaks nothing useful.
+var checkCodeScript = redis.NewScript(`
+local stored = redis.call('HGET', KEYS[1], 'code')
+if not stored then return 0 end
+if stored == ARGV[1] then
+  redis.call('DEL', KEYS[1])
+  return 1
+end
+local n = redis.call('HINCRBY', KEYS[1], 'attempts', 1)
+if n >= tonumber(ARGV[2]) then redis.call('DEL', KEYS[1]) end
+return 0
+`)
+
 func (c *RedisCodes) Check(ctx context.Context, email, code string, maxAttempts int) (bool, error) {
 	key := c.prefix + hashKey(email)
-	stored, err := c.rdb.HGet(ctx, key, "code").Result()
-	if errors.Is(err, redis.Nil) {
-		return false, nil
-	}
+	n, err := checkCodeScript.Run(ctx, c.rdb, []string{key}, hashKey(email, code), maxAttempts).Int()
 	if err != nil {
 		return false, err
 	}
-	if subtle.ConstantTimeCompare([]byte(stored), []byte(hashKey(email, code))) == 1 {
-		// GETDEL-like: only the first concurrent verifier wins.
-		n, err := c.rdb.Del(ctx, key).Result()
-		return n == 1, err
-	}
-	n, err := c.rdb.HIncrBy(ctx, key, "attempts", 1).Result()
-	if err == nil && int(n) >= maxAttempts {
-		c.rdb.Del(ctx, key)
-	}
-	return false, err
+	return n == 1, nil
 }
 
+// MemoryCodes is the single-process CodeStore. Expired entries are swept
+// periodically so the maps stay bounded by the live codes.
 type MemoryCodes struct {
-	mu      sync.Mutex
-	pending map[string]*memCode
-	sentAt  map[string]time.Time
+	mu        sync.Mutex
+	pending   map[string]*memCode
+	sentAt    map[string]time.Time // resend throttle: until when no new code is sent
+	lastSweep time.Time
+}
+
+// sweep drops expired codes and throttles. Caller holds c.mu.
+func (c *MemoryCodes) sweep(now time.Time) {
+	if now.Sub(c.lastSweep) < time.Minute {
+		return
+	}
+	c.lastSweep = now
+	for k, p := range c.pending {
+		if now.After(p.exp) {
+			delete(c.pending, k)
+		}
+	}
+	for k, until := range c.sentAt {
+		if !now.Before(until) {
+			delete(c.sentAt, k)
+		}
+	}
 }
 
 type memCode struct {
@@ -375,10 +407,11 @@ func (c *MemoryCodes) Put(_ context.Context, email, code string, ttl, resendAfte
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := time.Now()
-	if t, ok := c.sentAt[email]; ok && now.Sub(t) < resendAfter {
+	c.sweep(now)
+	if until, ok := c.sentAt[email]; ok && now.Before(until) {
 		return false, nil
 	}
-	c.sentAt[email] = now
+	c.sentAt[email] = now.Add(resendAfter)
 	c.pending[email] = &memCode{hash: hashKey(email, code), exp: now.Add(ttl)}
 	return true, nil
 }
