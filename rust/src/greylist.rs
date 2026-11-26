@@ -24,7 +24,14 @@ pub struct Greylist {
     // ordering via a base Instant plus elapsed nanoseconds.
     clock: Box<dyn Fn() -> Instant + Send + Sync>,
     seen: Mutex<HashMap<String, Entry>>,
+    max_entries: usize,
 }
+
+/// Default cap on tracked triplets (bounds memory under a flood of unique
+/// senders/recipients).
+pub const DEFAULT_MAX_ENTRIES: usize = 1_000_000;
+/// Longest sender/recipient stored in a key (RFC 5321 paths are <= 256).
+const MAX_PART_LEN: usize = 320;
 
 impl Greylist {
     /// `delay` is the minimum wait before a retry is accepted (<=0 -> 1m);
@@ -45,7 +52,16 @@ impl Greylist {
             expiry,
             clock: Box::new(Instant::now),
             seen: Mutex::new(HashMap::new()),
+            max_entries: DEFAULT_MAX_ENTRIES,
         }
+    }
+
+    /// Caps the number of tracked triplets (0 -> [`DEFAULT_MAX_ENTRIES`]).
+    /// When full, unseen triplets are allowed through without being stored
+    /// (fail open) until [`Greylist::sweep`] frees space.
+    pub fn with_max_entries(mut self, max: usize) -> Self {
+        self.max_entries = if max == 0 { DEFAULT_MAX_ENTRIES } else { max };
+        self
     }
 
     /// Replace the clock (tests only).
@@ -55,7 +71,7 @@ impl Greylist {
     }
 
     fn key(ip: &str, from: &str, to: &str) -> String {
-        format!("{}\0{}\0{}", ip, from, to).to_lowercase()
+        format!("{}\0{}\0{}", truncate(ip), truncate(from), truncate(to)).to_lowercase()
     }
 
     /// Records a delivery attempt and reports whether it may proceed now. The
@@ -66,7 +82,9 @@ impl Greylist {
         let now = (self.clock)();
         let k = Self::key(ip, from, to);
         let mut seen = self.seen.lock().unwrap();
+        let full = seen.len() >= self.max_entries;
         match seen.get_mut(&k) {
+            None if full => true,
             None => {
                 seen.insert(
                     k,
@@ -109,6 +127,18 @@ impl Greylist {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// Truncates to at most [`MAX_PART_LEN`] bytes on a char boundary.
+fn truncate(s: &str) -> &str {
+    if s.len() <= MAX_PART_LEN {
+        return s;
+    }
+    let mut end = MAX_PART_LEN;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 #[cfg(test)]
@@ -167,5 +197,31 @@ mod tests {
         off.store(2 * 3600 * 1_000_000_000, Ordering::SeqCst); // +2h
         g.sweep();
         assert_eq!(g.len(), 0);
+    }
+
+    #[test]
+    fn bounded_entries_fail_open() {
+        let (_off, f) = clock();
+        let g = Greylist::new(Duration::from_secs(60), Duration::from_secs(3600))
+            .with_clock(f)
+            .with_max_entries(2);
+        assert!(!g.allow("192.0.2.1", "a@ext", "b@us"));
+        assert!(!g.allow("192.0.2.1", "a@ext", "c@us"));
+        assert!(g.allow("192.0.2.1", "a@ext", "d@us"), "full: allowed");
+        assert_eq!(g.len(), 2, "not stored when full");
+        assert!(
+            !g.allow("192.0.2.1", "a@ext", "b@us"),
+            "known still deferred"
+        );
+    }
+
+    #[test]
+    fn long_keys_truncated() {
+        let (_off, f) = clock();
+        let g = Greylist::new(Duration::from_secs(60), Duration::from_secs(3600)).with_clock(f);
+        let long = "é".repeat(10_000);
+        g.allow("192.0.2.1", &long, &long);
+        let seen = g.seen.lock().unwrap();
+        assert!(seen.keys().all(|k| k.len() <= 3 * MAX_PART_LEN + 2));
     }
 }

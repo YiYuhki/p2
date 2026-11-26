@@ -20,7 +20,11 @@ pub struct Limiter {
     burst: f64,
     clock: Box<dyn Fn() -> Instant + Send + Sync>,
     buckets: Mutex<HashMap<String, Bucket>>,
+    max_keys: usize,
 }
+
+/// Default cap on tracked keys (bounds memory under many distinct clients).
+pub const DEFAULT_MAX_KEYS: usize = 100_000;
 
 impl Limiter {
     /// Returns a limiter allowing `rps` tokens/sec with the given `burst`, or
@@ -35,7 +39,14 @@ impl Limiter {
             burst: burst as f64,
             clock: Box::new(Instant::now),
             buckets: Mutex::new(HashMap::new()),
+            max_keys: DEFAULT_MAX_KEYS,
         })
+    }
+
+    /// Caps the number of tracked keys (0 -> [`DEFAULT_MAX_KEYS`]).
+    pub fn with_max_keys(mut self, max: usize) -> Self {
+        self.max_keys = if max == 0 { DEFAULT_MAX_KEYS } else { max };
+        self
     }
 
     pub fn with_clock(mut self, clock: Box<dyn Fn() -> Instant + Send + Sync>) -> Self {
@@ -47,6 +58,19 @@ impl Limiter {
     pub fn allow(&self, key: &str) -> bool {
         let now = (self.clock)();
         let mut buckets = self.buckets.lock().unwrap();
+        if buckets.len() >= self.max_keys && !buckets.contains_key(key) {
+            // A fully refilled bucket is indistinguishable from a fresh one, so
+            // dropping those loses no state.
+            let (rps, burst) = (self.rps, self.burst);
+            buckets.retain(|_, b| {
+                b.tokens + now.duration_since(b.updated).as_secs_f64() * rps < burst
+            });
+            if buckets.len() >= self.max_keys {
+                // Still full of active clients: allow without tracking rather
+                // than growing without bound.
+                return true;
+            }
+        }
         let b = buckets.entry(key.to_string()).or_insert(Bucket {
             tokens: self.burst,
             updated: now,
@@ -133,5 +157,18 @@ mod tests {
         off.store(2 * 3600 * 1_000_000_000, Ordering::SeqCst); // +2h
         l.sweep(Duration::from_secs(3600));
         assert_eq!(l.len(), 0);
+    }
+
+    #[test]
+    fn bounded_keys() {
+        let (off, f) = clock();
+        let l = Limiter::new(1.0, 1).unwrap().with_clock(f).with_max_keys(2);
+        assert!(l.allow("a"));
+        assert!(l.allow("b"));
+        assert!(l.allow("c"), "full: allowed untracked");
+        assert_eq!(l.len(), 2);
+        off.store(5_000_000_000, Ordering::SeqCst); // +5s: a, b refilled
+        assert!(l.allow("c"));
+        assert_eq!(l.len(), 1, "refilled buckets evicted, c tracked");
     }
 }
