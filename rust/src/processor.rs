@@ -90,13 +90,18 @@ impl InboundProcessor {
             spf = Some(r);
         }
         if let Some(res) = &a.dkim {
-            dkim = crate::dkim::verify(raw, res.as_ref()).await;
+            // Canonicalizing and hashing a (up to 50 MB) body is CPU-bound:
+            // keep it off the async workers; only the key lookups are async.
+            let owned = raw.to_vec();
+            let prepared = tokio::task::spawn_blocking(move || crate::dkim::prepare(&owned))
+                .await
+                .unwrap_or_else(|_| crate::dkim::prepare(raw));
+            dkim = crate::dkim::verify_prepared(&prepared, res.as_ref()).await;
             methods.push(crate::dkim::auth_results(&dkim));
         }
         let mut rejects = false;
         if let Some(ev) = &a.dmarc {
             if spf.is_some() || a.dkim.is_some() {
-                let from = from_header_domain(raw);
                 let sigs: Vec<crate::dmarc::Signature> = dkim
                     .iter()
                     .map(|r| crate::dmarc::Signature {
@@ -108,11 +113,29 @@ impl InboundProcessor {
                     .as_ref()
                     .map(|s| (s.value.as_str(), s.domain.as_str()))
                     .unwrap_or(("", ""));
-                let res = ev.evaluate(&from, sv, sd, &sigs).await;
-                methods.push(res.auth_results.clone());
-                // Only an unambiguous fail under p=reject is enforced, so a
-                // temperror or quarantine policy never bounces legitimate mail.
-                rejects = a.enforce_dmarc && res.verdict == "fail" && res.policy == "reject";
+                // Every distinct From domain is evaluated (RFC 7489 §6.6.1): a
+                // From listing several domains must not dodge the policy of
+                // any of them. Absurdly many domains are refused outright.
+                let domains = from_header_domains(raw);
+                if domains.len() > MAX_FROM_DOMAINS {
+                    methods.push("dmarc=permerror (too many From domains)".into());
+                    rejects = a.enforce_dmarc;
+                } else {
+                    let targets = if domains.is_empty() {
+                        vec![String::new()]
+                    } else {
+                        domains
+                    };
+                    for from in targets {
+                        let res = ev.evaluate(&from, sv, sd, &sigs).await;
+                        methods.push(res.auth_results.clone());
+                        // Only an unambiguous fail under p=reject is enforced, so
+                        // a temperror or quarantine policy never bounces
+                        // legitimate mail.
+                        rejects |=
+                            a.enforce_dmarc && res.verdict == "fail" && res.policy == "reject";
+                    }
+                }
             }
         }
         let results = methods.join("; ");
@@ -184,19 +207,29 @@ impl MessageProcessor for InboundProcessor {
         let mut out = root.to_bytes();
 
         // ARC-seal before DKIM signing so the seal covers our results. ARC is
-        // advisory: a sealing error leaves the message unsealed.
+        // advisory: a sealing error leaves the message unsealed. Both hash the
+        // whole message (CPU-bound), so they run on the blocking pool.
         if let Some(sealer) = &self.arc {
             let ar = if auth.results.is_empty() {
-                "none"
+                "none".to_string()
             } else {
-                auth.results.as_str()
+                auth.results.clone()
             };
-            if let Ok(sealed) = sealer.seal(&out, ar) {
-                out = sealed;
-            }
+            let sealer = sealer.clone();
+            let (input, sealed) = tokio::task::spawn_blocking(move || {
+                let r = sealer.seal(&out, &ar);
+                (out, r)
+            })
+            .await
+            .map_err(|_| ProcessError::TempFail)?;
+            out = sealed.unwrap_or(input);
         }
         if let Some(signer) = &self.opts.signer {
-            out = signer.sign(&out).map_err(|_| ProcessError::TempFail)?;
+            let signer = signer.clone();
+            out = tokio::task::spawn_blocking(move || signer.sign(&out))
+                .await
+                .map_err(|_| ProcessError::TempFail)?
+                .map_err(|_| ProcessError::TempFail)?;
         }
         Ok(out)
     }
@@ -235,44 +268,62 @@ fn sanitize_header_value(s: &str) -> String {
     s.chars().filter(|&c| !(c < ' ' || c == '\u{7f}')).collect()
 }
 
-/// Domain of the first From address; "" when the From carries addresses from
-/// several domains (ambiguous — DMARC then reports none).
-fn from_header_domain(raw: &[u8]) -> String {
+/// Most distinct From domains evaluated; more is treated as a DMARC failure.
+const MAX_FROM_DOMAINS: usize = 5;
+
+/// Distinct domains (lowercased, in order) of every address in every From
+/// header. An empty vector when no domain could be found.
+fn from_header_domains(raw: &[u8]) -> Vec<String> {
     let root = crate::mimetree::parse(raw);
-    let from = crate::mimeproc::decode_header(&root.header("from").unwrap_or_default());
     let domain_of = |a: &str| {
         a.rsplit_once('@')
-            .map(|(_, d)| d.trim().trim_end_matches('.').to_ascii_lowercase())
+            .map(|(_, d)| {
+                d.trim()
+                    .trim_end_matches(['>', '.'])
+                    .trim()
+                    .to_ascii_lowercase()
+            })
             .unwrap_or_default()
     };
-    if let Ok(list) = mailparse::addrparse(&from) {
-        let mut addrs: Vec<String> = Vec::new();
-        for a in list.iter() {
-            match a {
-                mailparse::MailAddr::Single(s) => addrs.push(s.addr.clone()),
-                mailparse::MailAddr::Group(g) => {
-                    addrs.extend(g.addrs.iter().map(|s| s.addr.clone()))
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |d: String| {
+        if !d.is_empty() && !out.contains(&d) {
+            out.push(d);
+        }
+    };
+    for value in root.headers("from") {
+        let from = crate::mimeproc::decode_header(&value);
+        let mut found = false;
+        if let Ok(list) = mailparse::addrparse(&from) {
+            for a in list.iter() {
+                match a {
+                    mailparse::MailAddr::Single(s) => {
+                        found = true;
+                        push(domain_of(&s.addr));
+                    }
+                    mailparse::MailAddr::Group(g) => {
+                        for s in &g.addrs {
+                            found = true;
+                            push(domain_of(&s.addr));
+                        }
+                    }
                 }
             }
         }
-        if let Some(first) = addrs.first() {
-            let d = domain_of(first);
-            if addrs.iter().skip(1).any(|a| domain_of(a) != d) {
-                return String::new();
+        if !found {
+            // Fallback for a malformed header: the text after each '@'.
+            for (i, _) in from.match_indices('@') {
+                let d = from[i + 1..]
+                    .split(['>', ' ', '\t', ')', ',', ';'])
+                    .next()
+                    .unwrap_or("")
+                    .trim_matches(|c| c == '.' || c == '<' || c == '>')
+                    .to_ascii_lowercase();
+                push(d);
             }
-            return d;
         }
     }
-    // Fallback for a malformed header: the text after the first '@'.
-    match from.split_once('@') {
-        Some((_, rest)) => rest
-            .split(['>', ' ', '\t', ')', ',', ';'])
-            .next()
-            .unwrap_or("")
-            .trim_matches(|c| c == '.' || c == '<' || c == '>')
-            .to_ascii_lowercase(),
-        None => String::new(),
-    }
+    out
 }
 
 #[cfg(test)]
@@ -405,14 +456,79 @@ mod tests {
     #[test]
     fn from_domains() {
         assert_eq!(
-            from_header_domain(b"From: A <a@Example.COM>\r\n\r\n"),
-            "example.com"
+            from_header_domains(b"From: A <a@Example.COM>\r\n\r\n"),
+            vec!["example.com"]
         );
-        assert_eq!(from_header_domain(b"From: a@x.com, b@y.com\r\n\r\n"), "");
         assert_eq!(
-            from_header_domain(b"From: a@x.com, b@x.com\r\n\r\n"),
-            "x.com"
+            from_header_domains(b"From: a@x.com, b@y.com\r\n\r\n"),
+            vec!["x.com", "y.com"]
         );
+        assert_eq!(
+            from_header_domains(b"From: a@x.com, b@x.com\r\n\r\n"),
+            vec!["x.com"]
+        );
+        assert_eq!(
+            from_header_domains(b"From: a@x.com\r\nFrom: b@victim.com\r\n\r\n"),
+            vec!["x.com", "victim.com"]
+        );
+        assert!(from_header_domains(b"Subject: none\r\n\r\n").is_empty());
         assert_eq!(auth_results_id("GW.corp.test 1; spf=pass"), "gw.corp.test");
+    }
+
+    #[tokio::test]
+    async fn multi_domain_from_cannot_dodge_dmarc_reject() {
+        let r = Static::default()
+            .with_txt("attacker.net", &["v=spf1 ip4:192.0.2.0/24 -all"])
+            .with_txt("_dmarc.attacker.net", &["v=DMARC1; p=none"])
+            .with_txt("_dmarc.victim.com", &["v=DMARC1; p=reject"]);
+        let p = InboundProcessor::with_options(
+            None,
+            None,
+            Options {
+                hostname: "gw.corp.test".into(),
+                auth: auth(r, true),
+                ..Default::default()
+            },
+        );
+        let mut e = env();
+        e.mail_from = "x@attacker.net".into();
+        let msg = b"From: x@attacker.net, ceo@victim.com\r\nSubject: pay\r\n\r\nhi\r\n";
+        match p.process(&e, msg).await {
+            Err(ProcessError::Reject(e)) => assert_eq!(e.code, 550),
+            other => panic!("expected reject, got {:?}", other.map(|_| ())),
+        }
+        // Too many From domains is refused under enforcement.
+        let many = b"From: a@a.com, b@b.com, c@c.com, d@d.com, e@e.com, f@f.com\r\n\r\nhi\r\n";
+        assert!(matches!(
+            p.process(&e, many).await,
+            Err(ProcessError::Reject(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn arc_sealed_and_signed_output_verifies() {
+        use base64::Engine;
+        use rsa::pkcs8::EncodePublicKey;
+        let key = rsa::PrivateKey::new(&mut getrandom::SysRng, 1024).unwrap();
+        let txt = format!(
+            "v=DKIM1; k=rsa; p={}",
+            base64::engine::general_purpose::STANDARD
+                .encode(key.to_public_key().to_public_key_der().unwrap().as_bytes())
+        );
+        let arc_key = rsa::PrivateKey::new(&mut getrandom::SysRng, 1024).unwrap();
+        let sealer = Sealer::new("corp.test", "arc", "gw.corp.test", arc_key).unwrap();
+        let p = InboundProcessor::with_options(
+            None,
+            Some(Arc::new(sealer)),
+            Options {
+                hostname: "gw.corp.test".into(),
+                signer: Some(Arc::new(crate::dkim::Signer::new("corp.test", "gw", key))),
+                ..Default::default()
+            },
+        );
+        let out = p.process(&env(), MSG).await.unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("ARC-Seal: i=1;"));
+        let r = Static::default().with_txt("gw._domainkey.corp.test", &[&txt]);
+        assert_eq!(crate::dkim::verify(&out, &r).await[0].value, "pass");
     }
 }

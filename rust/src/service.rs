@@ -84,7 +84,14 @@ impl Service {
     /// message has no attachments it is relayed unchanged.
     pub async fn quarantine(&self, env: &Envelope, raw: &[u8]) -> Result<Vec<u8>, ProcessError> {
         let mut root = crate::mimetree::parse(raw);
-        let res = match crate::mimetree::extract(&mut root, &self.rewrite) {
+        // The blocked-extension gate also applies to parts the rewrite policy
+        // would keep inline (e.g. an inline image named "x.exe" is extracted).
+        let blocked = |name: &str| {
+            file_ext(name)
+                .map(|e| self.blocked_extensions.contains(&e))
+                .unwrap_or(false)
+        };
+        let res = match crate::mimetree::extract_with(&mut root, &self.rewrite, &blocked) {
             Ok(r) => r,
             Err(crate::mimetree::ExtractError::Encrypted) => {
                 return Err(ProcessError::Reject(crate::gateway::SmtpError::new(
@@ -353,7 +360,13 @@ mod tests {
     use crate::store::{Memory, Page};
 
     fn bodies(out: &[u8]) -> String {
-        crate::mimeproc::parse(out).unwrap().text_parts.join("\n")
+        crate::mimeproc::parse(out)
+            .unwrap()
+            .text_parts
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[tokio::test]
@@ -363,7 +376,7 @@ mod tests {
             encrypted_reject: true,
             ..Default::default()
         });
-        let raw = b"From: a@x.org\r\nContent-Type: multipart/encrypted; boundary=E\r\n\r\n--E\r\n\r\nx\r\n--E--\r\n";
+        let raw = b"From: a@x.org\r\nContent-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=E\r\n\r\n--E\r\nContent-Type: application/pgp-encrypted\r\n\r\nVersion: 1\r\n--E\r\nContent-Type: application/octet-stream\r\n\r\nx\r\n--E--\r\n";
         match s.quarantine(&Envelope::default(), raw).await {
             Err(ProcessError::Reject(e)) => assert_eq!(e.code, 554),
             other => panic!("unexpected {other:?}"),
@@ -463,6 +476,26 @@ Content-Disposition: attachment; filename=\"evil.exe.\"\r\n\r\nMZ\r\n--B--\r\n";
             queue.snapshot().is_empty(),
             "blocked attachment must not be enqueued"
         );
+    }
+
+    #[tokio::test]
+    async fn kept_inline_part_with_blocked_name_is_extracted() {
+        let (s, _store, queue) = svc(&["gif".into()]).await;
+        let s = s.with_rewrite(crate::mimetree::Options {
+            keep_inline_images: true,
+            ..Default::default()
+        });
+        let raw = b"From: a@ext.org\r\nSubject: x\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/related; boundary=\"B\"\r\n\r\n\
+--B\r\nContent-Type: text/html\r\n\r\n<img src=cid:a>\r\n\
+--B\r\nContent-Type: image/png\r\nContent-ID: <a>\r\n\r\nPNG\r\n\
+--B\r\nContent-Type: image/gif; name=\"x.gif\"\r\nContent-ID: <b>\r\n\r\nGIF\r\n--B--\r\n";
+        let out = s.quarantine(&Envelope::default(), raw).await.unwrap();
+        let o = String::from_utf8_lossy(&out);
+        assert!(o.contains("Content-ID: <a>"), "nameless raster image kept");
+        assert!(!o.contains("Content-ID: <b>"), "blocked name extracted");
+        assert!(bodies(&out).contains("[차단됨]"));
+        assert!(queue.snapshot().is_empty());
     }
 
     #[tokio::test]

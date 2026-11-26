@@ -311,10 +311,14 @@ impl Scanner {
         rep
     }
 
-    /// Parses a raw message and scans its subject, text bodies and text
-    /// attachments. Port of the Go ScanMessage text path (OCR/archive extraction
-    /// is the analysis project's territory). Non-text attachments are noted as
-    /// uninspectable.
+    /// Parses a raw message and scans its subject, every text-like leaf (incl.
+    /// embedded messages) and text attachments. Port of the Go ScanMessage text
+    /// path (OCR/archive extraction is the analysis project's territory).
+    /// Structure comes from [`crate::mimetree`], the parser the gateway relays
+    /// with, so DLP sees exactly the parts recipients see. HTML is reduced to
+    /// its text (tags stripped, entities decoded) and invisible format
+    /// characters are removed before matching. Non-text attachments are noted
+    /// as uninspectable, opaque encrypted parts as encrypted.
     pub fn scan_message(&self, raw: &[u8]) -> Report {
         let mut rep = Report::default();
         let parsed = match crate::mimeproc::parse(raw) {
@@ -322,31 +326,245 @@ impl Scanner {
             Err(_) => {
                 rep.uninspectable
                     .push("메일 구조 해석 실패: 원문 전체를 텍스트로 검사".into());
-                rep.findings = self.scan_text("메일 원문", &String::from_utf8_lossy(raw));
+                let text = normalize_text(&String::from_utf8_lossy(raw), false);
+                rep.findings = self.scan_text("메일 원문", &text);
                 self.escalate(&mut rep);
                 rep.findings.sort_by_key(|f| std::cmp::Reverse(f.sev()));
                 return rep;
             }
         };
         if !parsed.subject.is_empty() {
-            rep.findings.extend(self.scan_text("제목", &parsed.subject));
+            rep.findings
+                .extend(self.scan_text("제목", &normalize_text(&parsed.subject, false)));
         }
-        for body in &parsed.text_parts {
-            rep.findings.extend(self.scan_text("본문", body));
+        for tp in &parsed.text_parts {
+            rep.findings
+                .extend(self.scan_text(&tp.location, &normalize_text(&tp.text, tp.html)));
         }
         for att in &parsed.attachments {
             let loc = format!("첨부 {}", att.filename);
             match std::str::from_utf8(&att.data) {
-                Ok(text) => rep.findings.extend(self.scan_text(&loc, text)),
+                Ok(text) => {
+                    let lname = att.filename.to_ascii_lowercase();
+                    let html = att.content_type == "text/html"
+                        || lname.ends_with(".html")
+                        || lname.ends_with(".htm");
+                    rep.findings
+                        .extend(self.scan_text(&loc, &normalize_text(text, html)))
+                }
                 Err(_) => rep
                     .uninspectable
                     .push(format!("{loc}: 텍스트로 해석할 수 없는 첨부")),
             }
         }
+        rep.uninspectable.extend(parsed.uninspectable);
+        rep.encrypted.extend(parsed.encrypted);
         self.escalate(&mut rep);
         rep.findings.sort_by_key(|f| std::cmp::Reverse(f.sev()));
         rep
     }
+}
+
+/// Prepares text for matching: HTML is reduced to its rendered text (plus its
+/// attribute values, which can be displayed too), then Unicode format
+/// characters (zero-width spaces/joiners, soft hyphens, bidi controls, BOM)
+/// that split a number invisibly are removed.
+pub fn normalize_text(text: &str, html: bool) -> String {
+    let s = if html {
+        html_to_text(text)
+    } else {
+        text.to_string()
+    };
+    s.chars()
+        .filter(|&c| !crate::mimeproc::is_format_char(c))
+        .collect()
+}
+
+/// Block-level elements whose boundaries separate words.
+fn is_block_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "br" | "p"
+            | "div"
+            | "td"
+            | "th"
+            | "tr"
+            | "li"
+            | "ul"
+            | "ol"
+            | "table"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "hr"
+            | "blockquote"
+            | "pre"
+            | "section"
+            | "article"
+            | "header"
+            | "footer"
+            | "title"
+            | "body"
+            | "html"
+            | "head"
+            | "option"
+            | "dt"
+            | "dd"
+    )
+}
+
+/// Strips tags and comments (inline tags vanish so "1234<b></b>567" joins;
+/// block tags become line breaks), appends quoted attribute values on their own
+/// lines, and decodes character references.
+fn html_to_text(html: &str) -> String {
+    let b = html.as_bytes();
+    let mut text = String::with_capacity(html.len());
+    let mut attrs = String::new();
+    let mut i = 0;
+    let mut lit = 0; // start of the pending literal run
+    while i < b.len() {
+        if b[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        if html[i..].starts_with("<!--") {
+            text.push_str(&html[lit..i]);
+            i = match html[i + 4..].find("-->") {
+                Some(j) => i + 4 + j + 3,
+                None => b.len(),
+            };
+            lit = i;
+            continue;
+        }
+        let next = b.get(i + 1).copied().unwrap_or(b' ');
+        if !(next.is_ascii_alphabetic() || next == b'/' || next == b'!' || next == b'?') {
+            i += 1;
+            continue;
+        }
+        // Find the closing '>' outside quotes.
+        let mut j = i + 1;
+        let mut quote: Option<u8> = None;
+        let mut val_start = 0;
+        let mut vals: Vec<(usize, usize)> = Vec::new();
+        while j < b.len() {
+            let c = b[j];
+            match quote {
+                Some(q) if c == q => {
+                    vals.push((val_start, j));
+                    quote = None;
+                }
+                Some(_) => {}
+                None if c == b'"' || c == b'\'' => {
+                    quote = Some(c);
+                    val_start = j + 1;
+                }
+                None if c == b'>' => break,
+                None => {}
+            }
+            j += 1;
+        }
+        if j >= b.len() {
+            break; // unterminated tag: keep the rest as literal text
+        }
+        text.push_str(&html[lit..i]);
+        let inner = html[i + 1..j].trim_start_matches('/');
+        let name: String = inner
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if is_block_tag(&name) {
+            text.push('\n');
+        }
+        for (s, e) in vals {
+            attrs.push_str(&html[s..e]);
+            attrs.push('\n');
+        }
+        i = j + 1;
+        lit = i;
+    }
+    text.push_str(&html[lit..]);
+    if !attrs.is_empty() {
+        text.push('\n');
+        text.push_str(&attrs);
+    }
+    decode_entities(&text)
+}
+
+/// Decodes numeric character references (with or without the final ';') and
+/// the common named ones.
+fn decode_entities(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + 1..];
+        if let Some(num) = tail.strip_prefix('#') {
+            let (hex, digits) = match num.strip_prefix(['x', 'X']) {
+                Some(h) => (true, h),
+                None => (false, num),
+            };
+            let n = digits
+                .bytes()
+                .take_while(|c| {
+                    if hex {
+                        c.is_ascii_hexdigit()
+                    } else {
+                        c.is_ascii_digit()
+                    }
+                })
+                .count();
+            if n > 0 {
+                let d = digits[..n].trim_start_matches('0');
+                let v = if d.is_empty() {
+                    Some(0xFFFD)
+                } else if d.len() > 8 {
+                    None
+                } else {
+                    u32::from_str_radix(d, if hex { 16 } else { 10 }).ok()
+                };
+                out.push(v.and_then(char::from_u32).unwrap_or('\u{FFFD}'));
+                let used = (num.len() - digits.len()) + n;
+                let mut after = &num[used..];
+                if let Some(a) = after.strip_prefix(';') {
+                    after = a;
+                }
+                rest = after;
+                continue;
+            }
+        } else if let Some(semi) = tail.find(';').filter(|&k| k > 0 && k <= 32) {
+            let rep = match &tail[..semi] {
+                "amp" => Some("&"),
+                "lt" => Some("<"),
+                "gt" => Some(">"),
+                "quot" => Some("\""),
+                "apos" => Some("'"),
+                "nbsp" | "ensp" | "emsp" | "thinsp" => Some(" "),
+                "shy" | "ZeroWidthSpace" | "zwnj" | "zwj" | "lrm" | "rlm" | "NoBreak"
+                | "InvisibleTimes" | "InvisibleComma" => Some(""),
+                "hyphen" | "dash" | "ndash" | "mdash" | "minus" => Some("-"),
+                "period" => Some("."),
+                "colon" => Some(":"),
+                "commat" => Some("@"),
+                _ => None,
+            };
+            if let Some(r) = rep {
+                out.push_str(r);
+                rest = &tail[semi + 1..];
+                continue;
+            }
+        }
+        out.push('&');
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
 }
 
 fn is_identity_detector(id: &str) -> bool {
@@ -630,5 +848,74 @@ name,ssn\r\nkim,900101-1234567\r\n--B--\r\n";
             .scan_text("x", "010-1234-5678")
             .iter()
             .any(|f| f.detector == "kr_mobile"));
+    }
+
+    fn has_rrn(rep: &Report) -> bool {
+        rep.findings.iter().any(|f| f.detector == "kr_rrn")
+    }
+
+    #[test]
+    fn nameless_non_text_leaves_are_scanned_or_reported() {
+        let s = scanner();
+        for ct in [
+            "application/octet-stream",
+            "message/rfc822",
+            "application/json",
+            "application/xml",
+        ] {
+            let raw = format!("From: a@x\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nhi\r\n--B\r\nContent-Type: {ct}\r\n\r\nSubject: x\r\n\r\nRRN 900101-1234567\r\n--B--\r\n");
+            assert!(has_rrn(&s.scan_message(raw.as_bytes())), "{ct}");
+        }
+        // Binary nameless leaves are reported, never silently skipped.
+        let raw = b"From: a@x\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nhi\r\n--B\r\nContent-Type: application/octet-stream\r\n\r\n\xff\xfe\x00\x01\r\n--B--\r\n";
+        assert_eq!(s.scan_message(raw).uninspectable.len(), 1);
+        // Opaque ciphertext is reported as encrypted.
+        let raw = b"From: a@x\r\nContent-Type: application/pkcs7-mime; smime-type=enveloped-data\r\n\r\nMIAG\r\n";
+        assert!(s.scan_message(raw).has_encrypted());
+    }
+
+    #[test]
+    fn dlp_uses_the_relay_parser() {
+        // mailparse would split at "--Bx" and hide the PII in a "png"; the
+        // gateway relays it as text, so DLP must scan it as text.
+        let s = scanner();
+        let raw = b"From: a@x\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nhello\r\n--Bx\r\nContent-Type: image/png; name=a.png\r\nContent-Transfer-Encoding: base64\r\n\r\n\xEC\xA3\xBC\xEB\xAF\xBC\xEB\xB2\x88\xED\x98\xB8 900101-1234567\r\n--B--\r\n";
+        let rep = s.scan_message(raw);
+        assert!(has_rrn(&rep));
+        assert!(rep.uninspectable.is_empty());
+    }
+
+    #[test]
+    fn html_and_invisible_characters_are_normalized() {
+        let s = scanner();
+        for body in [
+            "<p>rrn 900101-<i></i>1234567</p>",
+            "<p>rrn &#57;00101-1234567</p>",
+            "<p>rrn &#x39;00101&#45;1234567</p>",
+            "<p>rrn 900101&shy;-1234567<!-- x --></p>",
+            "<p title=\"900101-1234567\">hover</p>",
+        ] {
+            let raw = format!("Content-Type: text/html\r\n\r\n{body}\r\n");
+            assert!(has_rrn(&s.scan_message(raw.as_bytes())), "{body}");
+        }
+        let raw = "Content-Type: text/plain; charset=utf-8\r\n\r\nrrn 900101-\u{200B}1234567\r\n";
+        assert!(has_rrn(&s.scan_message(raw.as_bytes())));
+        let raw =
+            "Content-Type: text/plain; charset=utf-8\r\n\r\nrrn 9001\u{2060}01-12345\u{FEFF}67\r\n";
+        assert!(has_rrn(&s.scan_message(raw.as_bytes())));
+        assert_eq!(html_to_text("a<br>b"), "a\nb");
+        assert_eq!(html_to_text("1 < 2 & 3"), "1 < 2 & 3");
+        assert_eq!(decode_entities("&lt;&amp;&#65;&#x42&zz;"), "<&AB&zz;");
+    }
+
+    #[test]
+    fn deep_nesting_does_not_crash_the_scanner() {
+        let raw = crate::mimetree::tests::deep_message(50_000);
+        let h = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || scanner().scan_message(&raw))
+            .unwrap();
+        let rep = h.join().expect("no stack overflow");
+        assert!(!rep.uninspectable.is_empty());
     }
 }

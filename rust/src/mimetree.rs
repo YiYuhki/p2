@@ -5,18 +5,34 @@
 //! are unwrapped when their content changes), and the download banner is
 //! appended to the first text/plain and text/html bodies (quoted-printable,
 //! UTF-8), or added as a new multipart/alternative part when neither exists.
+//!
+//! This is the gateway's single MIME parser: quarantine *and* the DLP scanner
+//! ([`crate::mimeproc::parse`]) both walk this tree, so what is inspected is
+//! exactly the structure recipients are given. `mailparse` is only ever run on
+//! single, non-multipart leaves (with a synthesized Content-Type), so its
+//! unbounded multipart recursion can never be reached with attacker input.
+//!
+//! Round-trip guarantee: for CRLF input, `parse(x).to_bytes() == x` — header
+//! lines without a colon, delimiter transport padding, the preamble's line
+//! break, a missing close delimiter and a missing header/body separator are all
+//! preserved.
 
 use std::collections::BTreeMap;
 
 use mailparse::{parse_content_disposition, parse_content_type, DispositionType};
 
-const MAX_DEPTH: usize = 32;
+/// Maximum multipart nesting the tree descends into. A multipart nested deeper
+/// stays an opaque leaf ([`Part::is_truncated`]) and is treated as an
+/// uninspectable attachment.
+pub const MAX_DEPTH: usize = 32;
 
 #[derive(Clone, Debug)]
 struct Field {
-    /// Lowercase field name.
+    /// Lowercase field name ("" for a header line without a colon, which is
+    /// kept verbatim but never matches a lookup).
     name: String,
-    /// Full raw field bytes including folding and the trailing CRLF.
+    /// Full raw field bytes including folding and the trailing CRLF (the last
+    /// field of a header block without a separator may lack the CRLF).
     raw: Vec<u8>,
 }
 
@@ -38,15 +54,47 @@ impl Field {
 }
 
 /// One MIME entity.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Part {
     fields: Vec<Field>,
+    /// The header block was terminated by an empty line.
+    has_sep: bool,
     body: Vec<u8>,
-    preamble: Vec<u8>,
+    /// Bytes before the first delimiter; `Some(p)` means `p` + CRLF precede it,
+    /// `None` that the delimiter starts the body.
+    preamble: Option<Vec<u8>>,
     children: Vec<Part>,
     /// Bytes after the closing delimiter line's "--" (starts with its CRLF).
     epilogue: Vec<u8>,
     boundary: Option<String>,
+    /// The multipart had no close delimiter (the last child runs to the end).
+    open_ended: bool,
+    /// Bytes after "--boundary" on the delimiter line that opened this part,
+    /// through its line break (`None` for parts the gateway created: CRLF).
+    delim_tail: Option<Vec<u8>>,
+    /// This (empty) child was followed directly by the next delimiter line,
+    /// with no CRLF of its own.
+    no_tail_crlf: bool,
+    /// A multipart left unsplit because the nesting limit was reached.
+    truncated: bool,
+}
+
+impl Default for Part {
+    fn default() -> Self {
+        Part {
+            fields: Vec::new(),
+            has_sep: true,
+            body: Vec::new(),
+            preamble: None,
+            children: Vec::new(),
+            epilogue: Vec::new(),
+            boundary: None,
+            open_ended: false,
+            delim_tail: None,
+            no_tail_crlf: false,
+            truncated: false,
+        }
+    }
 }
 
 fn crlf(msg: &[u8]) -> Vec<u8> {
@@ -75,12 +123,12 @@ pub fn parse(raw: &[u8]) -> Part {
 }
 
 fn parse_part(raw: &[u8], depth: usize) -> Part {
-    let (head, body): (&[u8], &[u8]) = if raw.starts_with(b"\r\n") {
-        (&[], &raw[2..])
+    let (head, body, has_sep): (&[u8], &[u8], bool) = if raw.starts_with(b"\r\n") {
+        (&[], &raw[2..], true)
     } else {
         match find(raw, b"\r\n\r\n") {
-            Some(i) => (&raw[..i + 2], &raw[i + 4..]),
-            None => (raw, &[]),
+            Some(i) => (&raw[..i + 2], &raw[i + 4..], true),
+            None => (raw, &[], false),
         }
     };
     let mut fields: Vec<Field> = Vec::new();
@@ -92,90 +140,143 @@ fn parse_part(raw: &[u8], depth: usize) -> Part {
         let line = &head[start..end];
         if (line[0] == b' ' || line[0] == b'\t') && !fields.is_empty() {
             fields.last_mut().unwrap().raw.extend_from_slice(line);
-        } else if let Some(c) = line.iter().position(|&b| b == b':') {
-            let mut raw = line.to_vec();
-            if !raw.ends_with(b"\r\n") {
-                raw.extend_from_slice(b"\r\n");
-            }
-            fields.push(Field {
-                name: String::from_utf8_lossy(&line[..c])
+        } else {
+            let name = match line.iter().position(|&b| b == b':') {
+                Some(c) => String::from_utf8_lossy(&line[..c])
                     .trim()
                     .to_ascii_lowercase(),
-                raw,
+                None => String::new(),
+            };
+            fields.push(Field {
+                name,
+                raw: line.to_vec(),
             });
         }
         start = end;
     }
     let mut p = Part {
         fields,
-        body: body.to_vec(),
+        has_sep,
         ..Default::default()
     };
     let (mt, params) = p.media_type();
-    if mt.starts_with("multipart/") && depth < MAX_DEPTH {
+    if mt.starts_with("multipart/") {
         if let Some(b) = params.get("boundary").filter(|b| !b.is_empty()) {
-            if let Some((pre, kids, epi)) = split_multipart(body, b) {
-                p.preamble = pre;
-                p.epilogue = epi;
-                p.children = kids.iter().map(|k| parse_part(k, depth + 1)).collect();
+            if depth >= MAX_DEPTH {
+                p.truncated = true;
+            } else if let Some(sp) = split_multipart(body, b) {
+                p.preamble = sp.preamble.map(|(s, e)| body[s..e].to_vec());
+                match sp.epilogue {
+                    Some(s) => p.epilogue = body[s..].to_vec(),
+                    None => p.open_ended = true,
+                }
+                p.children = sp
+                    .kids
+                    .iter()
+                    .map(|k| {
+                        let mut c = parse_part(&body[k.start..k.end], depth + 1);
+                        c.delim_tail = Some(body[k.tail.0..k.tail.1].to_vec());
+                        c.no_tail_crlf = k.no_crlf;
+                        c
+                    })
+                    .collect();
                 p.boundary = Some(b.clone());
-                p.body.clear();
+                return p;
             }
         }
     }
+    p.body = body.to_vec();
     p
 }
 
-/// Splits a multipart body into (preamble, child entities, epilogue). None
-/// when the opening delimiter is missing.
-type Split = (Vec<u8>, Vec<Vec<u8>>, Vec<u8>);
+/// One child entity of a multipart body, as byte ranges into that body.
+struct Kid {
+    start: usize,
+    end: usize,
+    /// Range of the opening delimiter line after "--boundary" (padding + CRLF).
+    tail: (usize, usize),
+    no_crlf: bool,
+}
+
+struct Split {
+    preamble: Option<(usize, usize)>,
+    kids: Vec<Kid>,
+    /// Start of the bytes after the close delimiter's "--"; None when missing.
+    epilogue: Option<usize>,
+}
+
+/// Splits a multipart body into preamble, children and epilogue (as ranges, so
+/// nested bodies are not copied at every level). None when the opening
+/// delimiter is missing. Delimiters must match exactly (RFC 2046 §5.1.1):
+/// "--boundary", optionally "--", then only transport padding.
 fn split_multipart(body: &[u8], boundary: &str) -> Option<Split> {
     let delim = format!("--{boundary}");
     let d = delim.as_bytes();
-    // Collect line starts.
-    let mut kids = Vec::new();
-    let mut preamble: Option<Vec<u8>> = None;
-    let mut cur_start: Option<usize> = None;
+    let mut kids: Vec<Kid> = Vec::new();
+    let mut preamble: Option<(usize, usize)> = None;
+    let mut cur: Option<(usize, (usize, usize))> = None;
+    let mut seen_first = false;
     let mut pos = 0;
     while pos <= body.len() {
         let end = find(&body[pos..], b"\r\n")
             .map(|i| pos + i)
             .unwrap_or(body.len());
+        let line_end = if end < body.len() { end + 2 } else { end };
         let line = &body[pos..end];
         let is_delim = line.starts_with(d) && {
             let rest = &line[d.len()..];
-            let rest = if rest.starts_with(b"--") {
-                &rest[2..]
-            } else {
-                rest
-            };
+            let rest = rest.strip_prefix(b"--").unwrap_or(rest);
             rest.iter().all(|&b| b == b' ' || b == b'\t')
         };
         if is_delim {
-            // Content ends before the CRLF that precedes this delimiter.
-            let content_end = pos.saturating_sub(2);
-            match cur_start {
-                None => preamble = Some(body[..content_end.min(body.len())].to_vec()),
-                Some(s) => kids.push(body[s..content_end.max(s)].to_vec()),
+            match cur.take() {
+                Some((s, tail)) => {
+                    // Content ends before the CRLF that precedes this delimiter.
+                    let (e, no_crlf) = if pos >= s + 2 {
+                        (pos - 2, false)
+                    } else {
+                        (s, true)
+                    };
+                    kids.push(Kid {
+                        start: s,
+                        end: e,
+                        tail,
+                        no_crlf,
+                    });
+                }
+                None if !seen_first => {
+                    preamble = if pos == 0 { None } else { Some((0, pos - 2)) };
+                }
+                None => {}
             }
-            if pos == 0 {
-                preamble = Some(Vec::new());
-            }
+            seen_first = true;
             if line[d.len()..].starts_with(b"--") {
-                let epi = body[pos + d.len() + 2..].to_vec();
-                return Some((preamble.unwrap_or_default(), kids, epi));
+                return Some(Split {
+                    preamble,
+                    kids,
+                    epilogue: Some(pos + d.len() + 2),
+                });
             }
-            cur_start = Some((end + 2).min(body.len()));
+            cur = Some((line_end, (pos + d.len(), line_end)));
         }
         if end >= body.len() {
             break;
         }
         pos = end + 2;
     }
-    // Missing close delimiter: keep what we have.
-    let s = cur_start?;
-    kids.push(body[s..].to_vec());
-    Some((preamble.unwrap_or_default(), kids, b"\r\n".to_vec()))
+    // Missing close delimiter: the last child runs to the end of the body.
+    let (s, tail) = cur?;
+    kids.push(Kid {
+        start: s,
+        end: body.len(),
+        tail,
+        no_crlf: false,
+    });
+    Some(Split {
+        preamble,
+        kids,
+        epilogue: None,
+    })
 }
 
 impl Part {
@@ -187,23 +288,45 @@ impl Part {
     }
 
     fn write(&self, out: &mut Vec<u8>) {
-        for f in &self.fields {
+        let sep = self.has_sep || !self.body.is_empty() || self.boundary.is_some();
+        let n = self.fields.len();
+        for (i, f) in self.fields.iter().enumerate() {
             out.extend_from_slice(&f.raw);
+            if !f.raw.ends_with(b"\r\n") && (i + 1 < n || sep) {
+                out.extend_from_slice(b"\r\n");
+            }
         }
-        out.extend_from_slice(b"\r\n");
+        if sep {
+            out.extend_from_slice(b"\r\n");
+        }
         match &self.boundary {
             Some(b) => {
-                if !self.preamble.is_empty() {
-                    out.extend_from_slice(&self.preamble);
+                if let Some(p) = &self.preamble {
+                    out.extend_from_slice(p);
                     out.extend_from_slice(b"\r\n");
                 }
-                for c in &self.children {
-                    out.extend_from_slice(format!("--{b}\r\n").as_bytes());
+                let n = self.children.len();
+                for (i, c) in self.children.iter().enumerate() {
+                    out.extend_from_slice(b"--");
+                    out.extend_from_slice(b.as_bytes());
+                    match &c.delim_tail {
+                        Some(t) => out.extend_from_slice(t),
+                        None => out.extend_from_slice(b"\r\n"),
+                    }
+                    let before = out.len();
                     c.write(out);
-                    out.extend_from_slice(b"\r\n");
+                    let last = i + 1 == n;
+                    let empty_tight = c.no_tail_crlf && out.len() == before;
+                    if !(last && self.open_ended) && !empty_tight {
+                        out.extend_from_slice(b"\r\n");
+                    }
                 }
-                out.extend_from_slice(format!("--{b}--").as_bytes());
-                out.extend_from_slice(&self.epilogue);
+                if !self.open_ended {
+                    out.extend_from_slice(b"--");
+                    out.extend_from_slice(b.as_bytes());
+                    out.extend_from_slice(b"--");
+                    out.extend_from_slice(&self.epilogue);
+                }
             }
             None => out.extend_from_slice(&self.body),
         }
@@ -213,10 +336,30 @@ impl Part {
         self.boundary.is_some()
     }
 
+    /// A multipart nested deeper than [`MAX_DEPTH`], left unparsed.
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Child entities of a multipart (empty for leaves).
+    pub fn children(&self) -> &[Part] {
+        &self.children
+    }
+
     /// First value of a header (unfolded), if present.
     pub fn header(&self, name: &str) -> Option<String> {
         let n = name.to_ascii_lowercase();
         self.fields.iter().find(|f| f.name == n).map(Field::value)
+    }
+
+    /// Every value of a header (unfolded), in order.
+    pub fn headers(&self, name: &str) -> Vec<String> {
+        let n = name.to_ascii_lowercase();
+        self.fields
+            .iter()
+            .filter(|f| f.name == n)
+            .map(Field::value)
+            .collect()
     }
 
     /// Replaces every instance of `name` with a single field appended last.
@@ -246,7 +389,8 @@ impl Part {
 
     /// Removes every header field for which `f(lowercase_name, value)` is true.
     pub fn remove_headers(&mut self, f: impl Fn(&str, &str) -> bool) {
-        self.fields.retain(|fl| !f(&fl.name, &fl.value()));
+        self.fields
+            .retain(|fl| fl.name.is_empty() || !f(&fl.name, &fl.value()));
     }
 
     /// Renames every instance of header `from` to `to`, keeping values and
@@ -276,7 +420,8 @@ impl Part {
         (ct.mimetype.to_ascii_lowercase(), params)
     }
 
-    fn disposition(&self) -> (String, BTreeMap<String, String>) {
+    /// Lowercase disposition type ("" when absent) and its parameters.
+    pub fn disposition(&self) -> (String, BTreeMap<String, String>) {
         match self.header("content-disposition") {
             None => (String::new(), BTreeMap::new()),
             Some(v) => {
@@ -304,34 +449,47 @@ impl Part {
         crate::mimeproc::decode_header(&raw)
     }
 
-    /// Body with the transfer encoding removed.
+    /// Body with the transfer encoding removed. Multipart (and truncated)
+    /// entities are returned raw: `mailparse` is never run on them.
     pub fn decode_body(&self) -> Vec<u8> {
-        match mailparse::parse_mail(&self.leaf_bytes()) {
+        let Some(lb) = self.leaf_bytes() else {
+            return self.body.clone();
+        };
+        match mailparse::parse_mail(&lb) {
             Ok(m) => m.get_body_raw().unwrap_or_else(|_| self.body.clone()),
             Err(_) => self.body.clone(),
         }
     }
 
-    /// Body decoded to UTF-8 text using the declared charset.
-    fn text(&self) -> Option<String> {
-        mailparse::parse_mail(&self.leaf_bytes())
+    /// Body decoded to UTF-8 text using the declared charset (None for
+    /// multiparts or an undecodable body).
+    pub fn text(&self) -> Option<String> {
+        mailparse::parse_mail(&self.leaf_bytes()?)
             .ok()?
             .get_body()
             .ok()
     }
 
-    fn leaf_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        for f in self
-            .fields
-            .iter()
-            .filter(|f| f.name.starts_with("content-"))
-        {
-            out.extend_from_slice(&f.raw);
+    /// A self-contained single-part entity for `mailparse`: a synthesized,
+    /// non-multipart Content-Type plus the first Content-Transfer-Encoding.
+    /// None for multiparts, so `mailparse`'s multipart recursion is unreachable.
+    fn leaf_bytes(&self) -> Option<Vec<u8>> {
+        let (mt, params) = self.media_type();
+        if self.truncated || self.is_multipart() || mt.starts_with("multipart/") {
+            return None;
+        }
+        let mut out = Vec::with_capacity(self.body.len() + 128);
+        if self.header("content-type").is_some() {
+            out.extend_from_slice(
+                format!("Content-Type: {}\r\n", format_media_type(&mt, &params)).as_bytes(),
+            );
+        }
+        if let Some(cte) = self.header("content-transfer-encoding") {
+            out.extend_from_slice(format!("Content-Transfer-Encoding: {cte}\r\n").as_bytes());
         }
         out.extend_from_slice(b"\r\n");
         out.extend_from_slice(&self.body);
-        out
+        Some(out)
     }
 
     fn make_multipart_mixed(&mut self) {
@@ -342,12 +500,17 @@ impl Part {
             &format!("multipart/mixed; boundary=\"{b}\""),
         );
         self.boundary = Some(b);
+        self.has_sep = true;
+        self.truncated = false;
+        self.open_ended = false;
         self.body.clear();
-        self.preamble.clear();
+        self.children.clear();
+        self.preamble = None;
         self.epilogue = b"\r\n".to_vec();
     }
 
-    /// Makes self carry src's content while keeping self's non-content headers.
+    /// Makes self carry src's content while keeping self's non-content headers
+    /// (and its own position in the parent).
     fn replace_content(&mut self, src: Part) {
         self.clear_content_headers();
         for f in src
@@ -357,11 +520,14 @@ impl Part {
         {
             self.fields.push(f);
         }
+        self.has_sep = true;
         self.body = src.body;
         self.children = src.children;
         self.preamble = src.preamble;
         self.epilogue = src.epilogue;
         self.boundary = src.boundary;
+        self.open_ended = src.open_ended;
+        self.truncated = src.truncated;
     }
 }
 
@@ -381,7 +547,7 @@ pub fn new_boundary() -> String {
 #[derive(Clone, Debug, Default)]
 pub struct Options {
     pub keep_inline_images: bool,
-    /// Leave multipart/signed messages untouched.
+    /// Leave (well-formed) multipart/signed messages untouched.
     pub signed_passthrough: bool,
     /// Reject encrypted messages instead of passing them through.
     pub encrypted_reject: bool,
@@ -410,146 +576,257 @@ pub enum ExtractError {
     Encrypted,
 }
 
-fn is_encrypted(mt: &str) -> bool {
+fn is_signature_type(mt: &str) -> bool {
     matches!(
         mt,
-        "multipart/encrypted" | "application/pkcs7-mime" | "application/x-pkcs7-mime"
+        "application/pgp-signature"
+            | "application/pkcs7-signature"
+            | "application/x-pkcs7-signature"
     )
+}
+
+/// True only for content that is genuinely opaque ciphertext: S/MIME
+/// enveloped-data / authEnveloped-data, or a well-formed PGP/MIME
+/// multipart/encrypted (exactly a control part and an application/octet-stream
+/// part). Anything else claiming to be "encrypted" (e.g. pkcs7 signed-data,
+/// which carries readable content) is inspected / extracted normally.
+pub fn is_opaque_encrypted(p: &Part) -> bool {
+    let (mt, params) = p.media_type();
+    match mt.as_str() {
+        "multipart/encrypted" => {
+            p.children.len() == 2
+                && p.children.iter().all(|c| !c.is_multipart() && !c.truncated)
+                && p.children[1].media_type().0 == "application/octet-stream"
+        }
+        "application/pkcs7-mime" | "application/x-pkcs7-mime" => {
+            !p.is_multipart()
+                && params
+                    .get("smime-type")
+                    .map(|s| {
+                        let s = s.to_ascii_lowercase();
+                        s == "enveloped-data" || s == "authenveloped-data"
+                    })
+                    .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+/// A multipart/signed with exactly the content part and one signature part.
+fn is_well_formed_signed(p: &Part) -> bool {
+    p.children.len() == 2 && is_signature_type(&p.children[1].media_type().0)
+}
+
+struct Ctx<'a> {
+    opts: &'a Options,
+    blocked: &'a dyn Fn(&str) -> bool,
+    res: ExtractResult,
 }
 
 /// Removes attachment parts from `root` in place.
 pub fn extract(root: &mut Part, opts: &Options) -> Result<ExtractResult, ExtractError> {
-    let mut res = ExtractResult::default();
-    let (mt, _) = root.media_type();
-    if is_encrypted(&mt) {
+    extract_with(root, opts, &|_| false)
+}
+
+/// Like [`extract`]; `blocked(sanitized_name)` reports a blocked file
+/// extension, and a part the policy would otherwise keep inline (an inline
+/// image) is extracted when its name is blocked.
+pub fn extract_with(
+    root: &mut Part,
+    opts: &Options,
+    blocked: &dyn Fn(&str) -> bool,
+) -> Result<ExtractResult, ExtractError> {
+    let mut ctx = Ctx {
+        opts,
+        blocked,
+        res: ExtractResult::default(),
+    };
+    if is_opaque_encrypted(root) {
         if opts.encrypted_reject {
             return Err(ExtractError::Encrypted);
         }
-        res.skipped = "encrypted".into();
-        return Ok(res);
+        ctx.res.skipped = "encrypted".into();
+        return Ok(ctx.res);
     }
-    if mt == "multipart/signed" && opts.signed_passthrough {
-        res.skipped = "signed".into();
-        return Ok(res);
+    let (mt, _) = root.media_type();
+    if mt == "multipart/signed" && opts.signed_passthrough && is_well_formed_signed(root) {
+        ctx.res.skipped = "signed".into();
+        return Ok(ctx.res);
     }
     if !root.is_multipart() {
-        if is_attachment(root, opts) {
-            res.attachments.push(extract_leaf(root));
+        if is_attachment(root, &ctx) {
+            ctx.res.attachments.push(extract_leaf(root));
             root.make_multipart_mixed();
         }
-        return Ok(res);
+        return Ok(ctx.res);
     }
-    walk(root, opts, &mut res);
+    walk(root, &mut ctx)?;
     if root.is_multipart() && root.children.is_empty() {
         root.make_multipart_mixed();
     }
-    Ok(res)
+    Ok(ctx.res)
 }
 
-fn walk(p: &mut Part, opts: &Options, res: &mut ExtractResult) -> bool {
+fn walk(p: &mut Part, ctx: &mut Ctx) -> Result<bool, ExtractError> {
     let (mt, _) = p.media_type();
     if mt == "multipart/signed" {
         if p.children.is_empty() {
-            return false;
+            return Ok(false);
         }
-        let mut content = Some(p.children[0].clone());
-        let mut sub = false;
-        if let Some(c) = content.as_mut() {
-            if c.is_multipart() {
-                sub = walk(c, opts, res);
-            } else if is_attachment(c, opts) {
-                res.attachments.push(extract_leaf(c));
-                content = None;
-                sub = true;
-            }
+        let mut kids = std::mem::take(&mut p.children);
+        // Keep only the content part and one signature part; every other child
+        // (a smuggled third part, or a non-signature second part) is removed.
+        let keep_n = if kids.len() >= 2 && is_signature_type(&kids[1].media_type().0) {
+            2
+        } else {
+            1
+        };
+        let mut changed = false;
+        for extra in kids.drain(keep_n..) {
+            ctx.res.attachments.push(extract_whole(&extra));
+            changed = true;
         }
-        if !sub {
-            return false;
+        let content = kids.remove(0);
+        let (kept, sub) = process_child(content, ctx)?;
+        if !sub && !changed {
+            p.children = kept.into_iter().chain(kids).collect();
+            return Ok(false);
         }
-        res.signature_removed = true;
-        match content {
+        ctx.res.signature_removed = true;
+        match kept {
             Some(c) if !(c.is_multipart() && c.children.is_empty()) => p.replace_content(c),
             _ => p.children.clear(),
         }
-        return true;
+        p.open_ended = false;
+        return Ok(true);
     }
 
     let mut changed = false;
     let kids = std::mem::take(&mut p.children);
-    for mut c in kids {
-        if c.is_multipart() {
-            let (cmt, _) = c.media_type();
-            if is_encrypted(&cmt) {
-                p.children.push(c);
-                continue;
-            }
-            if walk(&mut c, opts, res) {
-                changed = true;
-            }
-            if c.is_multipart() && c.children.is_empty() {
-                continue; // drop now-empty container
-            }
-            p.children.push(c);
-            continue;
+    for c in kids {
+        let (kept, ch) = process_child(c, ctx)?;
+        changed |= ch;
+        if let Some(k) = kept {
+            p.children.push(k);
         }
-        if is_attachment(&c, opts) {
-            res.attachments.push(extract_leaf(&c));
-            changed = true;
-            continue;
-        }
-        p.children.push(c);
     }
-    changed
+    if changed {
+        p.open_ended = false;
+    }
+    Ok(changed)
 }
 
-fn is_attachment(p: &Part, opts: &Options) -> bool {
+/// Processes one child: returns the part to keep (if any) and whether anything
+/// was removed.
+fn process_child(c: Part, ctx: &mut Ctx) -> Result<(Option<Part>, bool), ExtractError> {
+    if is_opaque_encrypted(&c) {
+        // A nested encrypted container cannot be inspected: extract it whole.
+        if ctx.opts.encrypted_reject {
+            return Err(ExtractError::Encrypted);
+        }
+        ctx.res.attachments.push(extract_whole(&c));
+        return Ok((None, true));
+    }
+    if c.is_multipart() {
+        let mut c = c;
+        let ch = walk(&mut c, ctx)?;
+        if ch && c.is_multipart() && c.children.is_empty() {
+            return Ok((None, true)); // drop now-empty container
+        }
+        return Ok((Some(c), ch));
+    }
+    if is_attachment(&c, ctx) {
+        ctx.res.attachments.push(extract_leaf(&c));
+        return Ok((None, true));
+    }
+    Ok((Some(c), false))
+}
+
+fn is_raster_image(mt: &str) -> bool {
+    matches!(
+        mt,
+        "image/png"
+            | "image/jpeg"
+            | "image/jpg"
+            | "image/pjpeg"
+            | "image/gif"
+            | "image/webp"
+            | "image/bmp"
+            | "image/x-ms-bmp"
+    )
+}
+
+fn has_raster_ext(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]
+        .iter()
+        .any(|e| n.ends_with(e))
+}
+
+fn is_attachment(p: &Part, ctx: &Ctx) -> bool {
     let (mt, _) = p.media_type();
+    if p.truncated || mt.starts_with("multipart/") {
+        return true; // an unsplit multipart (too deep / no boundary)
+    }
     let (disp, _) = p.disposition();
     if disp == "attachment" {
         return true;
     }
-    if mt == "message/rfc822" || mt == "message/global" {
-        return true; // forwarded mails may carry their own attachments
-    }
     if matches!(
         mt.as_str(),
-        "application/pgp-signature"
-            | "application/pkcs7-signature"
-            | "application/x-pkcs7-signature"
+        "message/rfc822" | "message/global" | "message/partial" | "message/external-body"
     ) {
-        return false;
+        return true; // forwarded mails may carry their own attachments
     }
-    if opts.keep_inline_images && mt.starts_with("image/") && p.header("content-id").is_some() {
-        return false;
+    let name = p.filename();
+    if ctx.opts.keep_inline_images && is_raster_image(&mt) && p.header("content-id").is_some() {
+        let safe = crate::mimeproc::sanitize_filename(&name);
+        if (safe.is_empty() || has_raster_ext(&safe)) && !(ctx.blocked)(&safe) {
+            return false;
+        }
     }
-    if !p.filename().is_empty() {
+    if !name.is_empty() {
         return true;
     }
     if mt.starts_with("text/") || mt.starts_with("message/") {
         return false;
     }
-    true // nameless non-text leaves
+    true // nameless non-text leaves (signature parts outside multipart/signed too)
 }
 
 fn extract_leaf(p: &Part) -> Extracted {
     let (mt, _) = p.media_type();
+    let whole = p.truncated || p.is_multipart() || mt.starts_with("multipart/");
     let mut name = p.filename();
     if name.is_empty() {
-        name = if mt.starts_with("message/") {
+        name = if mt.starts_with("message/") || whole {
             "forwarded-message.eml".into()
         } else {
             format!("attachment{}", ext_for(&mt))
         };
     }
-    let data = if mt.starts_with("message/") && p.is_multipart() {
-        p.to_bytes()
-    } else {
-        p.decode_body()
-    };
+    let data = if whole { p.to_bytes() } else { p.decode_body() };
     Extracted {
         filename: crate::mimeproc::sanitize_filename(&name),
         content_type: mt,
         data,
+    }
+}
+
+/// Extracts a whole entity (leaf or container) as one attachment.
+fn extract_whole(p: &Part) -> Extracted {
+    if !p.is_multipart() {
+        return extract_leaf(p);
+    }
+    let (mt, _) = p.media_type();
+    let mut name = p.filename();
+    if name.is_empty() {
+        name = "attachment.eml".into();
+    }
+    Extracted {
+        filename: crate::mimeproc::sanitize_filename(&name),
+        content_type: mt,
+        data: p.to_bytes(),
     }
 }
 
@@ -562,6 +839,7 @@ fn ext_for(mt: &str) -> &'static str {
         "image/gif" => ".gif",
         "text/calendar" => ".ics",
         "application/msword" => ".doc",
+        "application/pkcs7-mime" | "application/x-pkcs7-mime" => ".p7m",
         _ => ".bin",
     }
 }
@@ -609,7 +887,7 @@ fn find_bodies(
 ) {
     let (mt, _) = p.media_type();
     if p.is_multipart() {
-        if mt == "multipart/signed" || is_encrypted(&mt) {
+        if mt == "multipart/signed" || mt == "multipart/encrypted" {
             return;
         }
         for (i, c) in p.children.iter().enumerate() {
@@ -649,6 +927,7 @@ fn append_to_text(p: &mut Part, banner: &str, is_html: bool) -> bool {
     p.set_header("Content-Type", &format_media_type(&mt, &params));
     p.set_header("Content-Transfer-Encoding", "quoted-printable");
     p.body = encode_qp(text.as_bytes());
+    p.has_sep = true;
     true
 }
 
@@ -735,15 +1014,18 @@ fn add_banner_part(root: &mut Part, b: &Banner) {
     let mut inner = Part {
         body: std::mem::take(&mut root.body),
         children: std::mem::take(&mut root.children),
-        preamble: std::mem::take(&mut root.preamble),
+        preamble: root.preamble.take(),
         epilogue: std::mem::take(&mut root.epilogue),
         boundary: root.boundary.take(),
+        open_ended: root.open_ended,
+        truncated: root.truncated,
         fields: root
             .fields
             .iter()
             .filter(|f| f.name.starts_with("content-"))
             .cloned()
             .collect(),
+        ..Default::default()
     };
     if inner.fields.is_empty() {
         inner.add_header("Content-Type", "text/plain; charset=us-ascii");
@@ -753,7 +1035,7 @@ fn add_banner_part(root: &mut Part, b: &Banner) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const MIXED: &str = "From: a@example.com\r\nTo: b@example.com\r\nSubject: hi\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"XX\"\r\n\r\npreamble\r\n--XX\r\nContent-Type: multipart/alternative; boundary=\"YY\"\r\n\r\n--YY\r\nContent-Type: text/plain; charset=iso-8859-1\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nCaf=E9 menu\r\n--YY\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><p>Hello</p></body></html>\r\n--YY--\r\n--XX\r\nContent-Type: application/pdf; name=\"report.pdf\"\r\nContent-Disposition: attachment; filename=\"report.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQK\r\n--XX\r\nContent-Type: image/png\r\nContent-ID: <logo>\r\nContent-Disposition: inline\r\nContent-Transfer-Encoding: base64\r\n\r\niVBORw0K\r\n--XX--\r\n";
@@ -910,5 +1192,178 @@ mod tests {
                 .unwrap(),
             "한글 é".as_bytes()
         );
+    }
+
+    fn names(raw: &[u8], o: &Options) -> (Vec<String>, String) {
+        let mut p = parse(raw);
+        let r = extract(&mut p, o).unwrap();
+        (
+            r.attachments.iter().map(|a| a.filename.clone()).collect(),
+            String::from_utf8_lossy(&p.to_bytes()).into_owned(),
+        )
+    }
+
+    #[test]
+    fn signed_extra_child_is_extracted() {
+        let raw = b"From: a@x\r\nContent-Type: multipart/signed; protocol=\"application/pgp-signature\"; boundary=S\r\n\r\n--S\r\nContent-Type: text/plain\r\n\r\nhi\r\n--S\r\nContent-Type: application/pgp-signature\r\n\r\nSIG\r\n--S\r\nContent-Type: application/x-msdownload; name=\"evil.exe\"\r\nContent-Disposition: attachment; filename=\"evil.exe\"\r\n\r\nMZ\r\n--S--\r\n";
+        let (n, out) = names(raw, &Options::default());
+        assert_eq!(n, vec!["evil.exe".to_string()]);
+        assert!(!out.contains("evil.exe") && !out.contains("MZ"));
+        assert!(out.contains("hi"));
+        // Even under signed passthrough a malformed signed message is processed.
+        let (n, out) = names(
+            raw,
+            &Options {
+                signed_passthrough: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(n, vec!["evil.exe".to_string()]);
+        assert!(!out.contains("evil.exe"));
+        // A non-signature second child is not trusted as "the signature".
+        let raw2 = b"From: a@x\r\nContent-Type: multipart/signed; boundary=S\r\n\r\n--S\r\nContent-Type: text/plain\r\n\r\nhi\r\n--S\r\nContent-Type: application/octet-stream\r\n\r\nMZ\r\n--S--\r\n";
+        let (n, out) = names(raw2, &Options::default());
+        assert_eq!(n.len(), 1);
+        assert!(!out.contains("MZ"));
+    }
+
+    #[test]
+    fn inline_image_with_bad_name_is_extracted() {
+        let keep = Options {
+            keep_inline_images: true,
+            ..Default::default()
+        };
+        let mk = |ct: &str, cd: &str| {
+            format!("From: a@x\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nhi\r\n--B\r\nContent-Type: {ct}\r\nContent-ID: <x>\r\nContent-Disposition: {cd}\r\n\r\nMZ\r\n--B--\r\n")
+        };
+        let raw = mk(
+            "image/png; name=\"evil.exe\"",
+            "inline; filename=\"evil.exe\"",
+        );
+        let (n, out) = names(raw.as_bytes(), &keep);
+        assert_eq!(n, vec!["evil.exe".to_string()]);
+        assert!(!out.contains("evil.exe"));
+        // SVG (scriptable) is never kept inline.
+        let raw = mk("image/svg+xml", "inline");
+        assert_eq!(names(raw.as_bytes(), &keep).0.len(), 1);
+        // A raster image with a raster name (or none) is kept.
+        let raw = mk("image/png; name=\"logo.png\"", "inline");
+        assert!(names(raw.as_bytes(), &keep).0.is_empty());
+        let raw = mk("image/gif", "inline");
+        assert!(names(raw.as_bytes(), &keep).0.is_empty());
+        // ...unless the blocked-extension gate says otherwise.
+        let mut p = parse(mk("image/png; name=\"logo.png\"", "inline").as_bytes());
+        let r = extract_with(&mut p, &keep, &|n: &str| n.ends_with(".png")).unwrap();
+        assert_eq!(r.attachments.len(), 1);
+    }
+
+    #[test]
+    fn only_enveloped_pkcs7_is_opaque() {
+        let raw = b"From: a@x\r\nContent-Type: application/pkcs7-mime; smime-type=signed-data; name=smime.p7m\r\nContent-Transfer-Encoding: base64\r\n\r\nMIAG\r\n";
+        let mut p = parse(raw);
+        let r = extract(
+            &mut p,
+            &Options {
+                encrypted_reject: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(r.skipped, "");
+        assert_eq!(r.attachments.len(), 1);
+        assert_eq!(r.attachments[0].filename, "smime.p7m");
+
+        // A one-part "multipart/encrypted" is walked, not trusted.
+        let raw2 = b"From: a@x\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nhi\r\n--B\r\nContent-Type: multipart/encrypted; boundary=E\r\n\r\n--E\r\nContent-Type: application/x-msdownload; name=\"evil.exe\"\r\nContent-Disposition: attachment; filename=\"evil.exe\"\r\n\r\nMZ\r\n--E--\r\n--B--\r\n";
+        let (n, out) = names(raw2, &Options::default());
+        assert_eq!(n, vec!["evil.exe".to_string()]);
+        assert!(!out.contains("evil.exe"));
+    }
+
+    const PGP_ENC: &str = "Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=E\r\n\r\n--E\r\nContent-Type: application/pgp-encrypted\r\n\r\nVersion: 1\r\n--E\r\nContent-Type: application/octet-stream\r\n\r\n-----BEGIN PGP MESSAGE-----\r\n--E--\r\n";
+
+    #[test]
+    fn nested_encrypted_container_is_extracted_or_rejected() {
+        let raw = format!("From: a@x\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nhi\r\n--B\r\n{PGP_ENC}--B--\r\n");
+        let (n, out) = names(raw.as_bytes(), &Options::default());
+        assert_eq!(n, vec!["attachment.eml".to_string()]);
+        assert!(!out.contains("PGP MESSAGE"));
+        let mut p = parse(raw.as_bytes());
+        let reject = Options {
+            encrypted_reject: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            extract(&mut p, &reject).unwrap_err(),
+            ExtractError::Encrypted
+        );
+        // A well-formed top-level PGP/MIME message is opaque: policy applies.
+        let top = format!("From: a@x\r\n{PGP_ENC}");
+        let mut p = parse(top.as_bytes());
+        assert_eq!(
+            extract(&mut p, &Options::default()).unwrap().skipped,
+            "encrypted"
+        );
+        assert_eq!(p.to_bytes(), top.as_bytes());
+    }
+
+    /// Builds a message nested `n` multiparts deep.
+    pub(crate) fn deep_message(n: usize) -> Vec<u8> {
+        let mut raw = String::from("From: a@x\r\n");
+        for i in 0..n {
+            raw.push_str(&format!(
+                "Content-Type: multipart/mixed; boundary=b{i}\r\n\r\n--b{i}\r\n"
+            ));
+        }
+        raw.push_str("Content-Type: text/plain\r\n\r\nx\r\n");
+        raw.into_bytes()
+    }
+
+    #[test]
+    fn deep_nesting_does_not_overflow_the_stack() {
+        let raw = deep_message(50_000);
+        let h = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || {
+                let mut p = parse(&raw);
+                let r = extract(&mut p, &Options::default()).unwrap();
+                insert_banner(&mut p, &banner());
+                let _ = p.to_bytes();
+                r.attachments.len()
+            })
+            .unwrap();
+        // The over-deep remainder is quarantined as one opaque attachment.
+        assert_eq!(h.join().expect("no stack overflow"), 1);
+    }
+
+    #[test]
+    fn untouched_messages_round_trip_byte_exact() {
+        let cases: &[&[u8]] = &[
+            MIXED.as_bytes(),
+            b"Subject: a\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nx\r\n--B--\r\n",
+            b"Subject: a\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B  \r\nContent-Type: text/plain\r\n\r\nx\r\n--B--\t\r\nepilogue\r\n",
+            b"Subject: a\r\nbogus line\r\nX: y\r\n\r\nbody\r\n",
+            b"Subject: a\r\nX: y\r\n",
+            b"Subject: a\r\nX: y",
+            b"\r\nbody only\r\n",
+            b"",
+            b" leading continuation\r\nSubject: a\r\n\r\nb",
+            b"Subject: a\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\n--B\r\nContent-Type: text/plain\r\n\r\nx\r\n--B--",
+            b"Subject: a\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\npre\r\n--B\r\n\r\nno headers\r\n--B\r\nContent-Type: text/plain\r\n\r\nunterminated",
+            b"Subject: a\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\nContent-Type: multipart/alternative; boundary=C\r\n\r\n--C\r\n\r\nx\r\n--C--\r\n--B",
+            b"Subject: a\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B--\r\n",
+            b"Subject: a\r\nContent-Type: text/plain\r\n\r\n\xc7\xd1\xb1\xdb 8-bit\r\n\r\n",
+        ];
+        for (i, c) in cases.iter().enumerate() {
+            let out = parse(c).to_bytes();
+            assert_eq!(
+                String::from_utf8_lossy(&out),
+                String::from_utf8_lossy(c),
+                "case {i}"
+            );
+            assert_eq!(out, *c, "case {i}");
+        }
+        let deep = deep_message(40);
+        assert_eq!(parse(&deep).to_bytes(), deep);
     }
 }
