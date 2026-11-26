@@ -55,7 +55,16 @@ pub struct Detector {
     pub hints_fold: Vec<String>,
     pub back: usize,
     pub ahead: usize,
+    /// Keywords (lower-case) a match must have within [`SEP_CONTEXT_CHARS`]
+    /// characters when it is not in its canonical dashed form: written with a
+    /// non-dash separator (space, NBSP, tab, newline, '/', '.') or only found
+    /// in a separator-normalized view. Such detectors are matched against
+    /// views in which only a literal dash becomes '-'. Empty: no such rule.
+    pub sep_context: Vec<String>,
 }
+
+/// Window (in characters, each side) for [`Detector::sep_context`].
+pub const SEP_CONTEXT_CHARS: usize = 50;
 
 // ---- helpers ----
 
@@ -91,10 +100,12 @@ pub fn valid_rrn(v: &str) -> bool {
     if date.month() != mm || date.day() != dd || date > Utc::now().date_naive() {
         return false;
     }
-    // Written in its 6-7 form ("-" or a space between the groups): the
-    // shape plus a valid date is the signal (RRNs issued since 2020 carry no
-    // checksum). A bare 13-digit run must pass the checksum.
-    if v.contains('-') || v.contains(' ') {
+    // Written in its dashed 6-7 form ('-', or a dash variant normalized to
+    // it): the shape plus a valid date is the signal (RRNs issued since 2020
+    // carry no checksum). Any other separator, or none, must pass the
+    // checksum (the scanner additionally requires an RRN keyword nearby for
+    // non-dash separators; see `Detector::sep_context`).
+    if v.contains('-') {
         return true;
     }
     rrn_checksum(&d)
@@ -354,6 +365,7 @@ pub fn builtin() -> Vec<Detector> {
             hints_fold: vec![],
             back: 0,
             ahead: 0,
+            sep_context: sv(&["주민", "생년월일", "rrn", "resident registration", "jumin"]),
         },
         Detector {
             id: "credit_card".into(),
@@ -385,6 +397,7 @@ pub fn builtin() -> Vec<Detector> {
             hints_fold: vec![],
             back: 0,
             ahead: 0,
+            sep_context: vec![],
         },
         Detector {
             id: "kr_passport".into(),
@@ -394,6 +407,7 @@ pub fn builtin() -> Vec<Detector> {
             hints_fold: sv(&["여권", "passport"]),
             back: 200,
             ahead: 200,
+            sep_context: vec![],
             re: re(&format!(
                 r"{NA}([MSRGDmsrgd]\d{{8}}|[MSRGD]\d{{3}}[A-Z]\d{{4}}){NAE}"
             )),
@@ -423,6 +437,7 @@ pub fn builtin() -> Vec<Detector> {
             hints_fold: vec![],
             back: 0,
             ahead: 0,
+            sep_context: vec![],
         },
         Detector {
             id: "kr_biz_reg".into(),
@@ -440,6 +455,7 @@ pub fn builtin() -> Vec<Detector> {
             hints_fold: vec![],
             back: 0,
             ahead: 0,
+            sep_context: vec![],
         },
         Detector {
             id: "kr_corp_reg".into(),
@@ -457,6 +473,7 @@ pub fn builtin() -> Vec<Detector> {
             hints_fold: vec![],
             back: 0,
             ahead: 0,
+            sep_context: vec![],
         },
         Detector {
             id: "bank_account".into(),
@@ -499,6 +516,7 @@ pub fn builtin() -> Vec<Detector> {
             hints_fold: vec![],
             back: 0,
             ahead: 0,
+            sep_context: vec![],
         },
         Detector {
             id: "iban".into(),
@@ -516,6 +534,7 @@ pub fn builtin() -> Vec<Detector> {
             hints_fold: vec![],
             back: 0,
             ahead: 0,
+            sep_context: vec![],
         },
         Detector {
             id: "kr_mobile".into(),
@@ -535,6 +554,7 @@ pub fn builtin() -> Vec<Detector> {
             hints_fold: vec![],
             back: 0,
             ahead: 0,
+            sep_context: vec![],
         },
         Detector {
             id: "email_address".into(),
@@ -545,6 +565,7 @@ pub fn builtin() -> Vec<Detector> {
             hints: sv(&["@"]),
             back: 64,
             ahead: 256,
+            sep_context: vec![],
             re: re(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
             mask: Box::new(mask_email),
             validate: None,
@@ -572,6 +593,7 @@ pub fn builtin() -> Vec<Detector> {
             hints_fold: vec![],
             back: 0,
             ahead: 0,
+            sep_context: vec![],
         },
         Detector {
             id: "aws_access_key".into(),
@@ -589,6 +611,7 @@ pub fn builtin() -> Vec<Detector> {
             hints_fold: vec![],
             back: 0,
             ahead: 0,
+            sep_context: vec![],
         },
         Detector {
             id: "aws_secret_key".into(),
@@ -598,6 +621,7 @@ pub fn builtin() -> Vec<Detector> {
             hints_fold: sv(&["aws"]),
             back: 0,
             ahead: 160,
+            sep_context: vec![],
             re: re(
                 r#"(?i)aws.{0,20}(?:secret|private).{0,20}?[=:"'\s]\s*["']?([A-Za-z0-9/+]{40})(?:[^A-Za-z0-9/+=]|$)"#,
             ),
@@ -627,6 +651,7 @@ pub fn builtin() -> Vec<Detector> {
             hints_fold: vec![],
             back: 0,
             ahead: 0,
+            sep_context: vec![],
         },
         Detector {
             id: "gitlab_token".into(),
@@ -644,6 +669,7 @@ pub fn builtin() -> Vec<Detector> {
             hints_fold: vec![],
             back: 0,
             ahead: 0,
+            sep_context: vec![],
         },
         Detector {
             id: "slack_token".into(),
@@ -661,6 +687,7 @@ pub fn builtin() -> Vec<Detector> {
             hints_fold: vec![],
             back: 0,
             ahead: 0,
+            sep_context: vec![],
         },
         Detector {
             id: "slack_webhook".into(),
@@ -678,6 +705,7 @@ pub fn builtin() -> Vec<Detector> {
             digits: false,
             hints_fold: vec![],
             ahead: 0,
+            sep_context: vec![],
         },
         Detector {
             id: "google_api_key".into(),
@@ -695,6 +723,7 @@ pub fn builtin() -> Vec<Detector> {
             hints_fold: vec![],
             back: 0,
             ahead: 0,
+            sep_context: vec![],
         },
         Detector {
             id: "stripe_key".into(),
@@ -712,6 +741,7 @@ pub fn builtin() -> Vec<Detector> {
             hints_fold: vec![],
             back: 0,
             ahead: 0,
+            sep_context: vec![],
         },
         Detector {
             id: "anthropic_key".into(),
@@ -729,6 +759,7 @@ pub fn builtin() -> Vec<Detector> {
             hints_fold: vec![],
             back: 0,
             ahead: 0,
+            sep_context: vec![],
         },
         Detector {
             id: "openai_key".into(),
@@ -748,6 +779,7 @@ pub fn builtin() -> Vec<Detector> {
             hints_fold: vec![],
             back: 0,
             ahead: 0,
+            sep_context: vec![],
         },
         Detector {
             id: "db_connection".into(),
@@ -770,6 +802,7 @@ pub fn builtin() -> Vec<Detector> {
             ]),
             back: 1,
             ahead: 256,
+            sep_context: vec![],
             validate: Some(valid_db_url),
             re: re(
                 r#"((?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqps?|mssql|sqlserver)://[^\s:/@"'<>]+:[^\s@/"'<>]+@[^\s/"'<>]+)"#,
@@ -797,6 +830,7 @@ pub fn builtin() -> Vec<Detector> {
             digits: false,
             hints_fold: vec![],
             ahead: 0,
+            sep_context: vec![],
         },
         Detector {
             id: "jwt".into(),
@@ -805,6 +839,7 @@ pub fn builtin() -> Vec<Detector> {
             severity: Severity::Medium,
             hints: sv(&["eyJ"]),
             ahead: 8192,
+            sep_context: vec![],
             re: re(&format!(
                 r"{NA}(eyJ[A-Za-z0-9_-]{{10,}}\.eyJ[A-Za-z0-9_-]{{10,}}\.[A-Za-z0-9_-]{{10,}})"
             )),
@@ -842,6 +877,7 @@ pub fn builtin() -> Vec<Detector> {
             ]),
             back: 1,
             ahead: 128,
+            sep_context: vec![],
             re: re(
                 r#"(?i)(?:\b(?:password|passwd|pwd|secret|api[_-]?key|apikey|access[_-]?token|auth[_-]?token|client[_-]?secret)\b|비밀번호|패스워드|암호)["']?\s*[:=：]\s*["']?([^\s"'<>,;]{8,64})"#,
             ),

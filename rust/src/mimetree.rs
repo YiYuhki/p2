@@ -570,22 +570,27 @@ impl Part {
             "content-disposition",
             "content-transfer-encoding",
         ] {
+            // Any difference at all between instances (beyond surrounding
+            // whitespace / line folding) is a conflict: parameter values such
+            // as boundary, name and filename are case- and quote-sensitive,
+            // so no normalization is safe.
             let vals: Vec<String> = self
                 .fields
                 .iter()
                 .filter(|f| f.name == name)
-                .map(|f| {
-                    f.value()
-                        .chars()
-                        .filter(|c| !c.is_whitespace() && *c != '"')
-                        .collect::<String>()
-                        .to_ascii_lowercase()
-                })
+                .map(Field::value)
                 .collect();
             if vals.windows(2).any(|w| w[0] != w[1]) {
                 return true;
             }
             if let Some(v) = vals.first() {
+                // Parameter names are case-insensitive (and may be quoted
+                // or padded): compare them normalized.
+                let v: String = v
+                    .chars()
+                    .filter(|c| !c.is_whitespace() && *c != '"')
+                    .collect::<String>()
+                    .to_ascii_lowercase();
                 // Parameters are split exactly as mailparse splits them.
                 // Absurdly many parameters: refuse rather than parse them.
                 if v.matches(';').count() > MAX_PARAMS {
@@ -663,6 +668,32 @@ impl Part {
             .clone()
     }
 
+    /// Every decoded name the entity carries: the Content-Disposition
+    /// filename and the Content-Type name (clients differ in which one they
+    /// show and save under), without empty or repeated ones.
+    pub fn names(&self) -> Vec<String> {
+        let mut out = vec![self.filename()];
+        if self.disposition().1.contains_key("filename") {
+            if let Some(n) = self.media_type().1.remove("name") {
+                let n = crate::mimeproc::decode_header(tail_str(&n, MAX_RAW_NAME));
+                if !out.contains(&n) {
+                    out.push(n);
+                }
+            }
+        }
+        out.retain(|n| !n.is_empty());
+        out
+    }
+
+    /// Sanitized [`Part::names`] (non-empty only).
+    fn safe_names(&self) -> Vec<String> {
+        self.names()
+            .iter()
+            .map(|n| crate::mimeproc::sanitize_filename(n))
+            .filter(|n| !n.is_empty())
+            .collect()
+    }
+
     /// The lowercase Content-Transfer-Encoding ("" when absent).
     fn cte(&self) -> String {
         self.header("content-transfer-encoding")
@@ -684,7 +715,8 @@ impl Part {
     /// entities are returned raw: `mailparse` is never run on them.
     pub fn decode_body(&self) -> Vec<u8> {
         if self.is_uuencoded_cte() && self.opaque.is_none() && !self.is_multipart() {
-            let (_, blocks) = split_uuencode(&self.body);
+            // One entity, one attachment: no block limit needed here.
+            let (_, blocks, _) = split_uuencode(&self.body, usize::MAX);
             if !blocks.is_empty() {
                 return blocks.into_iter().flat_map(|b| b.data).collect();
             }
@@ -802,21 +834,29 @@ pub(crate) struct UuBlock {
 }
 
 /// Finds uuencoded blocks ("begin <mode> <name>" … "end") in `data`; returns
-/// the text with the blocks removed and the decoded files. A block without
-/// its "end" line runs to the end of the text.
-pub(crate) fn split_uuencode(data: &[u8]) -> (Vec<u8>, Vec<UuBlock>) {
+/// the text with the blocks removed, the decoded files (at most `max`) and,
+/// when there are more, the raw remainder of `data` from the first block
+/// beyond `max` onwards (undecoded). A block without its "end" line runs to
+/// the end of the text.
+pub(crate) fn split_uuencode(data: &[u8], max: usize) -> (Vec<u8>, Vec<UuBlock>, Option<Vec<u8>>) {
     let mut rest: Vec<u8> = Vec::new();
     let mut blocks: Vec<UuBlock> = Vec::new();
     if !data.windows(6).any(|w| w == b"begin ") {
-        return (data.to_vec(), blocks);
+        return (data.to_vec(), blocks, None);
     }
     let mut cur: Option<UuBlock> = None;
     let mut done = false; // data lines ended (zero-length line seen)
+    let mut off = 0;
     for line in data.split_inclusive(|&b| b == b'\n') {
+        let start = off;
+        off += line.len();
         let t = trim_eol(line);
         match cur.as_mut() {
             None => {
                 if let Some(name) = uu_begin(t) {
+                    if blocks.len() >= max {
+                        return (rest, blocks, Some(data[start..].to_vec()));
+                    }
                     cur = Some(UuBlock {
                         name,
                         data: Vec::new(),
@@ -838,7 +878,7 @@ pub(crate) fn split_uuencode(data: &[u8]) -> (Vec<u8>, Vec<UuBlock>) {
     if let Some(b) = cur {
         blocks.push(b);
     }
-    (rest, blocks)
+    (rest, blocks, None)
 }
 
 fn trim_eol(l: &[u8]) -> &[u8] {
@@ -846,12 +886,14 @@ fn trim_eol(l: &[u8]) -> &[u8] {
     l.strip_suffix(b"\r").unwrap_or(l)
 }
 
-/// "begin 644 name" → name.
+/// "begin 644 name" → name. Lenient like the decoders clients use: leading
+/// whitespace and an octal mode of three to six digits are accepted.
 fn uu_begin(t: &[u8]) -> Option<String> {
-    let r = t.strip_prefix(b"begin ")?;
-    let sp = r.iter().position(|&b| b == b' ')?;
+    let r = t.trim_ascii_start().strip_prefix(b"begin ")?;
+    let r = r.trim_ascii_start();
+    let sp = r.iter().position(|&b| b == b' ' || b == b'\t')?;
     let (mode, name) = (&r[..sp], &r[sp + 1..]);
-    if !(3..=4).contains(&mode.len()) || !mode.iter().all(|b| (b'0'..=b'7').contains(b)) {
+    if !(3..=6).contains(&mode.len()) || !mode.iter().all(|b| (b'0'..=b'7').contains(b)) {
         return None;
     }
     let name = String::from_utf8_lossy(name).trim().to_string();
@@ -946,18 +988,38 @@ fn is_signature_type(mt: &str) -> bool {
 const MAX_SIGNATURE: usize = 64 * 1024;
 
 /// A detached signature part that may stay in place: a signature media type,
-/// nameless or conventionally named (smime.p7s, signature.asc, *.sig), not
-/// blocked, and small. Anything else in the signature slot is extracted.
+/// nameless or conventionally named (smime.p7s, signature.asc, *.sig — both
+/// the Content-Type name and the Content-Disposition filename), not blocked,
+/// small, and actually shaped like a signature (an ASCII-armored PGP
+/// signature, or a DER SEQUENCE for S/MIME). Anything else in the signature
+/// slot is extracted.
 fn signature_ok(p: &Part, blocked: &dyn Fn(&str) -> bool) -> bool {
-    if p.is_multipart() || p.opaque.is_some() || !is_signature_type(&p.media_type().0) {
+    let mt = p.media_type().0;
+    if p.is_multipart() || p.opaque.is_some() || !is_signature_type(&mt) {
         return false;
     }
-    let name = crate::mimeproc::sanitize_filename(&p.filename()).to_ascii_lowercase();
-    let name_ok = name.is_empty()
-        || name == "smime.p7s"
-        || name == "signature.asc"
-        || (name.ends_with(".sig") && name.len() > 4);
-    name_ok && !(!name.is_empty() && blocked(&name)) && p.decode_body().len() < MAX_SIGNATURE
+    let names_ok = p.safe_names().iter().all(|n| {
+        let name = n.to_ascii_lowercase();
+        (name == "smime.p7s"
+            || name == "signature.asc"
+            || (name.ends_with(".sig") && name.len() > 4))
+            && !blocked(n)
+            && !blocked(&name)
+    });
+    if !names_ok {
+        return false;
+    }
+    let body = p.decode_body();
+    if body.len() >= MAX_SIGNATURE {
+        return false;
+    }
+    if mt == "application/pgp-signature" {
+        body.trim_ascii_start()
+            .starts_with(b"-----BEGIN PGP SIGNATURE-----")
+            && body.is_ascii()
+    } else {
+        body.first() == Some(&0x30)
+    }
 }
 
 /// True only for content that is genuinely opaque ciphertext:
@@ -1009,20 +1071,35 @@ pub fn is_opaque_encrypted(p: &Part) -> bool {
                     s == "enveloped-data" || s == "authenveloped-data"
                 })
                 .unwrap_or(false);
-            let name = crate::mimeproc::sanitize_filename(&p.filename()).to_ascii_lowercase();
-            !p.is_multipart()
-                && enveloped
-                && (name.is_empty() || name == "smime.p7m")
-                && p.decode_body().first() == Some(&0x30)
+            let names_ok = p
+                .safe_names()
+                .iter()
+                .all(|n| n.eq_ignore_ascii_case("smime.p7m"));
+            !p.is_multipart() && enveloped && names_ok && p.decode_body().first() == Some(&0x30)
         }
         _ => false,
     }
 }
 
-/// Any entity in the tree carries a blocked filename.
+/// Any entity in the tree carries a blocked name (Content-Disposition
+/// filename or Content-Type name), or a text leaf embeds a uuencoded file
+/// with a blocked name.
 fn any_blocked_name(p: &Part, blocked: &dyn Fn(&str) -> bool) -> bool {
-    let n = crate::mimeproc::sanitize_filename(&p.filename());
-    (!n.is_empty() && blocked(&n)) || p.children.iter().any(|c| any_blocked_name(c, blocked))
+    if p.safe_names().iter().any(|n| blocked(n)) {
+        return true;
+    }
+    if !p.is_multipart() && p.opaque.is_none() && p.media_type().0 == "text/plain" {
+        let (_, blocks, rest) = split_uuencode(&p.decode_body(), MAX_PARTS);
+        if rest.is_some()
+            || blocks.iter().any(|b| {
+                let n = crate::mimeproc::sanitize_filename(&b.name);
+                n.is_empty() || blocked(&n)
+            })
+        {
+            return true;
+        }
+    }
+    p.children.iter().any(|c| any_blocked_name(c, blocked))
 }
 
 /// A multipart/signed with exactly the content part and one acceptable
@@ -1031,10 +1108,75 @@ fn is_well_formed_signed(p: &Part, blocked: &dyn Fn(&str) -> bool) -> bool {
     p.children.len() == 2 && signature_ok(&p.children[1], blocked)
 }
 
+/// Most attachments extracted from one message. Once reached, everything
+/// further is gathered into one last, uninspectable blob
+/// ([`OVERFLOW_NAME`]), so a hostile message can never turn into an
+/// unbounded number of stored objects, rows and jobs.
+pub const MAX_ATTACHMENTS: usize = 500;
+
+/// Name of the blob holding everything beyond [`MAX_ATTACHMENTS`] (and
+/// uuencoded files beyond the entity budget).
+pub const OVERFLOW_NAME: &str = "remaining-attachments.bin";
+
 struct Ctx<'a> {
     opts: &'a Options,
     blocked: &'a dyn Fn(&str) -> bool,
     res: ExtractResult,
+    /// Entities left in the per-message budget ([`MAX_PARTS`], shared by MIME
+    /// entities and uuencoded files).
+    budget: usize,
+    /// Content beyond [`MAX_ATTACHMENTS`] (one uninspectable blob).
+    overflow: Option<Vec<u8>>,
+}
+
+impl Ctx<'_> {
+    /// Records an extracted attachment, or appends it to the overflow blob
+    /// once [`MAX_ATTACHMENTS`] - 1 are recorded.
+    fn push(&mut self, e: Extracted) {
+        if self.overflow.is_none() && self.res.attachments.len() + 1 < MAX_ATTACHMENTS {
+            self.res.attachments.push(e);
+            return;
+        }
+        let o = self.overflow.get_or_insert_with(Vec::new);
+        o.extend_from_slice(
+            format!(
+                "\r\n----- {} ({}, {} bytes) -----\r\n",
+                e.filename,
+                e.content_type,
+                e.data.len()
+            )
+            .as_bytes(),
+        );
+        o.extend_from_slice(&e.data);
+    }
+
+    /// Appends raw, undecoded content (uuencoded text beyond the budget) to
+    /// the overflow blob.
+    fn push_raw(&mut self, data: Vec<u8>) {
+        match self.overflow.as_mut() {
+            None => self.overflow = Some(data),
+            Some(o) => {
+                o.extend_from_slice(b"\r\n----- uuencoded remainder -----\r\n");
+                o.extend_from_slice(&data);
+            }
+        }
+    }
+
+    fn finish(mut self) -> ExtractResult {
+        if let Some(data) = self.overflow.take() {
+            self.res.attachments.push(Extracted {
+                filename: OVERFLOW_NAME.into(),
+                content_type: "application/octet-stream".into(),
+                data,
+            });
+        }
+        self.res
+    }
+}
+
+/// Number of entities in a tree.
+fn count_parts(p: &Part) -> usize {
+    1 + p.children.iter().map(count_parts).sum::<usize>()
 }
 
 /// Removes attachment parts from `root` in place.
@@ -1055,13 +1197,15 @@ pub fn extract_with(
         opts,
         blocked,
         res: ExtractResult::default(),
+        budget: MAX_PARTS.saturating_sub(count_parts(root)),
+        overflow: None,
     };
     if is_opaque_encrypted(root) && !any_blocked_name(root, blocked) {
         if opts.encrypted_reject {
             return Err(ExtractError::Encrypted);
         }
         ctx.res.skipped = "encrypted".into();
-        return Ok(ctx.res);
+        return Ok(ctx.finish());
     }
     let (mt, _) = root.media_type();
     if mt == "multipart/signed"
@@ -1071,22 +1215,22 @@ pub fn extract_with(
         && !any_blocked_name(root, blocked)
     {
         ctx.res.skipped = "signed".into();
-        return Ok(ctx.res);
+        return Ok(ctx.finish());
     }
     if !root.is_multipart() {
         if is_attachment(root, &ctx) {
-            ctx.res.attachments.push(extract_leaf(root));
+            ctx.push(extract_leaf(root));
             root.make_multipart_mixed();
         } else {
             extract_uuencoded(root, &mut ctx);
         }
-        return Ok(ctx.res);
+        return Ok(ctx.finish());
     }
     walk(root, &mut ctx)?;
     if root.is_multipart() && root.children.is_empty() {
         root.make_multipart_mixed();
     }
-    Ok(ctx.res)
+    Ok(ctx.finish())
 }
 
 fn walk(p: &mut Part, ctx: &mut Ctx) -> Result<bool, ExtractError> {
@@ -1106,7 +1250,7 @@ fn walk(p: &mut Part, ctx: &mut Ctx) -> Result<bool, ExtractError> {
         };
         let mut changed = false;
         for extra in kids.drain(keep_n..) {
-            ctx.res.attachments.push(extract_whole(&extra));
+            ctx.push(extract_whole(&extra));
             changed = true;
         }
         let content = kids.remove(0);
@@ -1147,7 +1291,7 @@ fn process_child(c: Part, ctx: &mut Ctx) -> Result<(Option<Part>, bool), Extract
         if ctx.opts.encrypted_reject {
             return Err(ExtractError::Encrypted);
         }
-        ctx.res.attachments.push(extract_whole(&c));
+        ctx.push(extract_whole(&c));
         return Ok((None, true));
     }
     if c.is_multipart() {
@@ -1159,7 +1303,7 @@ fn process_child(c: Part, ctx: &mut Ctx) -> Result<(Option<Part>, bool), Extract
         return Ok((Some(c), ch));
     }
     if is_attachment(&c, ctx) {
-        ctx.res.attachments.push(extract_leaf(&c));
+        ctx.push(extract_leaf(&c));
         return Ok((None, true));
     }
     let mut c = c;
@@ -1175,20 +1319,26 @@ fn extract_uuencoded(p: &mut Part, ctx: &mut Ctx) -> bool {
         return false;
     }
     let data = p.decode_body();
-    let (rest, blocks) = split_uuencode(&data);
-    if blocks.is_empty() {
+    let max = ctx.budget.min(MAX_ATTACHMENTS);
+    let (rest, blocks, remainder) = split_uuencode(&data, max);
+    if blocks.is_empty() && remainder.is_none() {
         return false;
     }
+    ctx.budget = ctx.budget.saturating_sub(blocks.len());
     for b in blocks {
         let mut name = crate::mimeproc::sanitize_filename(&b.name);
         if name.is_empty() {
             name = "attachment.bin".into();
         }
-        ctx.res.attachments.push(Extracted {
+        ctx.push(Extracted {
             filename: name,
             content_type: "application/octet-stream".into(),
             data: b.data,
         });
+    }
+    if let Some(r) = remainder {
+        // Beyond the budget: the rest of the text, undecoded, as one blob.
+        ctx.push_raw(r);
     }
     if matches!(p.cte().as_str(), "" | "7bit" | "8bit" | "binary") {
         p.body = rest;
@@ -1259,14 +1409,28 @@ fn is_attachment(p: &Part, ctx: &Ctx) -> bool {
     if disp == "attachment" {
         return true;
     }
-    if mt.starts_with("message/") && !is_report_message(&mt) {
+    // A headers-only report type that carries a body after its header block
+    // (an embedded message in disguise) is extracted like a message.
+    let headers_with_body = || {
+        if !mt.ends_with("-headers") {
+            return false;
+        }
+        let b = crlf(&p.decode_body());
+        let b = b.trim_ascii_start();
+        match b.windows(4).position(|w| w == b"\r\n\r\n") {
+            Some(i) => !b[i + 4..].trim_ascii().is_empty(),
+            None => false,
+        }
+    };
+    if mt.starts_with("message/") && (!is_report_message(&mt) || headers_with_body()) {
         return true; // forwarded mails / news may carry their own attachments
     }
     let name = p.filename();
     if ctx.opts.keep_inline_images && is_raster_image(&mt) && p.header("content-id").is_some() {
-        let safe = crate::mimeproc::sanitize_filename(&name);
-        if (safe.is_empty() || has_raster_ext(&safe))
-            && !(ctx.blocked)(&safe)
+        // Every name (CD filename and CT name) must be a raster name.
+        if p.safe_names()
+            .iter()
+            .all(|n| has_raster_ext(n) && !(ctx.blocked)(n))
             && raster_magic_ok(&mt, &p.decode_body())
         {
             return false;
@@ -1626,7 +1790,7 @@ pub(crate) mod tests {
 
     #[test]
     fn signed_wrapper_unwrapped_when_modified() {
-        let raw = "From: a@x.com\r\nContent-Type: multipart/signed; protocol=\"application/pgp-signature\"; boundary=\"S\"\r\n\r\n--S\r\nContent-Type: multipart/mixed; boundary=\"M\"\r\n\r\n--M\r\nContent-Type: text/plain\r\n\r\nbody\r\n--M\r\nContent-Type: application/zip; name=\"z.zip\"\r\nContent-Transfer-Encoding: base64\r\n\r\nUEsDBA==\r\n--M--\r\n--S\r\nContent-Type: application/pgp-signature\r\n\r\nSIG\r\n--S--\r\n";
+        let raw = "From: a@x.com\r\nContent-Type: multipart/signed; protocol=\"application/pgp-signature\"; boundary=\"S\"\r\n\r\n--S\r\nContent-Type: multipart/mixed; boundary=\"M\"\r\n\r\n--M\r\nContent-Type: text/plain\r\n\r\nbody\r\n--M\r\nContent-Type: application/zip; name=\"z.zip\"\r\nContent-Transfer-Encoding: base64\r\n\r\nUEsDBA==\r\n--M--\r\n--S\r\nContent-Type: application/pgp-signature\r\n\r\n-----BEGIN PGP SIGNATURE-----\r\nSIG\r\n--S--\r\n";
         let mut p = parse(raw.as_bytes());
         let r = extract(&mut p, &Options::default()).unwrap();
         assert!(r.signature_removed);
@@ -1700,7 +1864,7 @@ pub(crate) mod tests {
 
     #[test]
     fn signed_extra_child_is_extracted() {
-        let raw = b"From: a@x\r\nContent-Type: multipart/signed; protocol=\"application/pgp-signature\"; boundary=S\r\n\r\n--S\r\nContent-Type: text/plain\r\n\r\nhi\r\n--S\r\nContent-Type: application/pgp-signature\r\n\r\nSIG\r\n--S\r\nContent-Type: application/x-msdownload; name=\"evil.exe\"\r\nContent-Disposition: attachment; filename=\"evil.exe\"\r\n\r\nMZ\r\n--S--\r\n";
+        let raw = b"From: a@x\r\nContent-Type: multipart/signed; protocol=\"application/pgp-signature\"; boundary=S\r\n\r\n--S\r\nContent-Type: text/plain\r\n\r\nhi\r\n--S\r\nContent-Type: application/pgp-signature\r\n\r\n-----BEGIN PGP SIGNATURE-----\r\nSIG\r\n--S\r\nContent-Type: application/x-msdownload; name=\"evil.exe\"\r\nContent-Disposition: attachment; filename=\"evil.exe\"\r\n\r\nMZ\r\n--S--\r\n";
         let (n, out) = names(raw, &Options::default());
         assert_eq!(n, vec!["evil.exe".to_string()]);
         assert!(!out.contains("evil.exe") && !out.contains("MZ"));
@@ -1973,13 +2137,21 @@ mod r2_tests {
             format!("From: a@x\r\nContent-Type: multipart/signed; protocol=\"application/pgp-signature\"; boundary=S\r\n\r\n--S\r\nContent-Type: text/plain\r\n\r\nhi\r\n--S\r\nContent-Type: {sig_ct}\r\n\r\n{body}\r\n--S--\r\n")
         };
         let d = Options::default();
-        for ok in [
-            "application/pgp-signature",
-            "application/pgp-signature; name=signature.asc",
-            "application/pkcs7-signature; name=smime.p7s",
-            "application/pkcs7-signature; name=\"mail.sig\"",
+        let pgp_sig = "-----BEGIN PGP SIGNATURE-----\r\nSIG\r\n-----END PGP SIGNATURE-----";
+        let der_sig = "MIAGCSqGSIb3DQEHAqCAMIACAQEx";
+        for (ok, body) in [
+            ("application/pgp-signature", pgp_sig),
+            ("application/pgp-signature; name=signature.asc", pgp_sig),
+            (
+                "application/pkcs7-signature; name=smime.p7s\r\nContent-Transfer-Encoding: base64",
+                der_sig,
+            ),
+            (
+                "application/pkcs7-signature; name=\"mail.sig\"\r\nContent-Transfer-Encoding: base64",
+                der_sig,
+            ),
         ] {
-            let raw = mk(ok, "SIG");
+            let raw = mk(ok, body);
             let (n, _, out) = run(raw.as_bytes(), &d);
             assert!(n.is_empty(), "{ok}");
             assert_eq!(out, raw, "{ok}: untouched");
@@ -2386,5 +2558,169 @@ mod r2_tests {
             h.extend_from_slice(b"<span hidden><a href=\"x\">1234567890-</a>&#49;");
         }
         timed("10MB nested hidden html", &h);
+    }
+}
+
+/// Round-3 review regressions.
+#[cfg(test)]
+mod r3_tests {
+    use super::*;
+
+    fn exe(n: &str) -> bool {
+        let n = n.to_ascii_lowercase();
+        n.ends_with(".exe") || n.ends_with(".bat")
+    }
+
+    fn run(raw: &[u8], o: &Options) -> (Vec<String>, String, String) {
+        let mut root = parse(raw);
+        let r = extract_with(&mut root, o, &exe).unwrap();
+        (
+            r.attachments.iter().map(|a| a.filename.clone()).collect(),
+            r.skipped,
+            String::from_utf8_lossy(&root.to_bytes()).into_owned(),
+        )
+    }
+
+    #[test]
+    fn escapes_are_extracted() {
+        let o = Options {
+            keep_inline_images: true,
+            ..Default::default()
+        };
+        let sp = Options {
+            keep_inline_images: true,
+            signed_passthrough: true,
+            ..Default::default()
+        };
+        let cases: &[(&str, &[u8], &Options)] = &[
+            ("boundary-case", b"From: a@x\r\nContent-Type: multipart/mixed; boundary=ab\r\nContent-Type: multipart/mixed; boundary=AB\r\n\r\n--ab\r\nContent-Type: text/plain\r\n\r\nhi\r\n--AB\r\nContent-Type: application/octet-stream; name=evil.exe\r\n\r\nMZ\r\n--AB--\r\n--ab--\r\n", &o),
+            ("boundary-ws", b"From: a@x\r\nContent-Type: multipart/mixed; boundary=\"a b\"\r\nContent-Type: multipart/mixed; boundary=ab\r\n\r\n--a b\r\nContent-Type: text/plain\r\n\r\nhi\r\n--ab\r\nContent-Type: application/octet-stream; name=evil.exe\r\n\r\nMZ\r\n--ab--\r\n--a b--\r\n", &o),
+            ("sig-ct-name-mismatch", b"From: a@x\r\nContent-Type: multipart/mixed; boundary=A\r\n\r\n--A\r\nContent-Type: multipart/signed; boundary=B\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nhello\r\n--B\r\nContent-Type: application/pgp-signature; name=evil.exe\r\nContent-Disposition: attachment; filename=signature.asc\r\n\r\nMZ\r\n--B--\r\n--A--\r\n", &o),
+            ("sig-ct-name-mismatch-armored", b"From: a@x\r\nContent-Type: multipart/signed; boundary=B; protocol=\"application/pgp-signature\"\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nhello\r\n--B\r\nContent-Type: application/pgp-signature; name=evil.exe\r\nContent-Disposition: attachment; filename=signature.asc\r\n\r\n-----BEGIN PGP SIGNATURE-----\r\nMZ\r\n--B--\r\n", &sp),
+            ("pgp-ct-name-mismatch", b"From: a@x\r\nContent-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=B\r\n\r\n--B\r\nContent-Type: application/pgp-encrypted\r\n\r\nVersion: 1\r\n--B\r\nContent-Type: application/octet-stream; name=evil.bat\r\nContent-Disposition: attachment; filename=msg.asc\r\n\r\n-----BEGIN PGP MESSAGE-----\r\ncalc.exe\r\n--B--\r\n", &o),
+            ("smime-ct-name-mismatch", b"From: a@x\r\nContent-Type: application/pkcs7-mime; smime-type=enveloped-data; name=evil.exe\r\nContent-Disposition: attachment; filename=smime.p7m\r\nContent-Transfer-Encoding: base64\r\n\r\nME1a\r\n", &o),
+            ("inline-image-ct-name", b"From: a@x\r\nContent-Type: multipart/related; boundary=B\r\n\r\n--B\r\nContent-Type: text/html\r\n\r\n<img src=cid:x>\r\n--B\r\nContent-Type: image/png; name=evil.exe\r\nContent-ID: <x>\r\nContent-Disposition: inline; filename=logo.png\r\n\r\n\x89PNG MZ\r\n--B--\r\n", &o),
+            ("uu-5digit-mode", b"From: a@x\r\nSubject: s\r\n\r\nsee\r\nbegin 100644 evil.exe\r\n#35H*\r\n`\r\nend\r\n", &o),
+            ("uu-in-qp", b"From: a@x\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nsee\r\nbegin=20644 evil.exe\r\n#35H*\r\n`\r\nend\r\n", &o),
+            ("uu-leading-space", b"From: a@x\r\nSubject: s\r\n\r\nsee\r\n begin 644 evil.exe\r\n#35H*\r\n`\r\nend\r\n", &o),
+            ("utf7-name", b"From: a@x\r\nContent-Type: multipart/related; boundary=B\r\n\r\n--B\r\nContent-Type: text/html\r\n\r\n<img src=cid:x>\r\n--B\r\nContent-Type: image/png; name=\"=?utf-7?Q?a+AC4-exe?=\"\r\nContent-ID: <x>\r\n\r\n\x89PNG MZ\r\n--B--\r\n", &o),
+            ("signed-uuencode", b"From: a@x\r\nContent-Type: multipart/signed; boundary=B; protocol=\"application/pgp-signature\"\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nsee\r\nbegin 644 evil.exe\r\n#35H*\r\n`\r\nend\r\n--B\r\nContent-Type: application/pgp-signature\r\n\r\n-----BEGIN PGP SIGNATURE-----\r\n--B--\r\n", &sp),
+            ("report-headers-with-body", b"From: a@x\r\nContent-Type: multipart/report; boundary=B\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nbounce\r\n--B\r\nContent-Type: message/rfc822-headers\r\n\r\nContent-Type: multipart/mixed; boundary=C\r\n\r\n--C\r\nContent-Type: application/octet-stream; name=evil.exe\r\nContent-Transfer-Encoding: base64\r\n\r\nTVo=\r\n--C--\r\n--B--\r\n", &o),
+        ];
+        for (label, raw, o) in cases {
+            let (names, skipped, out) = run(raw, o);
+            assert!(!names.is_empty(), "{label}: nothing extracted");
+            assert_eq!(skipped, "", "{label}: passed through");
+            for leak in ["evil", "MZ", "TVo=", "#35H*"] {
+                assert!(!out.contains(leak), "{label}: {leak} left in:\n{out}");
+            }
+        }
+    }
+
+    #[test]
+    fn utf7_encoded_words_decode() {
+        assert_eq!(
+            crate::mimeproc::decode_header("=?utf-7?Q?a+AC4-exe?="),
+            "a.exe"
+        );
+        assert_eq!(
+            crate::mimeproc::decode_utf7(b"Hi Mom -+Jjo--!"),
+            "Hi Mom -\u{263A}-!"
+        );
+        assert_eq!(crate::mimeproc::decode_utf7(b"1 +- 1"), "1 + 1");
+        assert_eq!(
+            crate::mimeproc::decode_utf7(b"+1VyuAA-"),
+            "\u{D55C}\u{AE00}"
+        );
+        // Malformed runs never panic.
+        let _ = crate::mimeproc::decode_utf7(b"+////////+\xff+2D3cAA");
+    }
+
+    #[test]
+    fn duplicate_content_headers_compare_raw_values() {
+        // Identical duplicates (modulo surrounding whitespace) stay parsed.
+        let same = b"From: a@x\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Type:  text/plain; charset=utf-8 \r\n\r\nhi\r\n";
+        assert!(parse(same).opaque().is_none());
+        for v in [
+            "text/plain; charset=UTF-8",
+            "text/plain; charset=\"utf-8\"",
+            "text/plain;charset=utf-8",
+            "TEXT/plain; charset=utf-8",
+        ] {
+            let raw = format!("From: a@x\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Type: {v}\r\n\r\nhi\r\n");
+            assert_eq!(
+                parse(raw.as_bytes()).opaque(),
+                Some(Opaque::Ambiguous),
+                "{v}"
+            );
+        }
+        let cd = b"From: a@x\r\nContent-Disposition: attachment; filename=a.txt\r\nContent-Disposition: attachment; filename=A.txt\r\n\r\nhi\r\n";
+        assert_eq!(parse(cd).opaque(), Some(Opaque::Ambiguous));
+        // Duplicate parameter names are still caught case-insensitively.
+        let dp =
+            b"From: a@x\r\nContent-Type: multipart/mixed; boundary=A; BOUNDARY=B\r\n\r\n--A--\r\n";
+        assert_eq!(parse(dp).opaque(), Some(Opaque::Ambiguous));
+    }
+
+    #[test]
+    fn plausible_signed_and_encrypted_still_pass() {
+        let sp = Options {
+            signed_passthrough: true,
+            ..Default::default()
+        };
+        let pgp = b"From: a@x\r\nContent-Type: multipart/signed; boundary=B; protocol=\"application/pgp-signature\"\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nhello\r\n--B\r\nContent-Type: application/pgp-signature; name=signature.asc\r\nContent-Disposition: attachment; filename=signature.asc\r\n\r\n-----BEGIN PGP SIGNATURE-----\r\niQEz\r\n-----END PGP SIGNATURE-----\r\n--B--\r\n";
+        let (n, s, out) = run(pgp, &sp);
+        assert!(n.is_empty() && s == "signed");
+        assert_eq!(out.as_bytes(), pgp);
+        let smime = b"From: a@x\r\nContent-Type: multipart/signed; boundary=B; protocol=\"application/pkcs7-signature\"\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nhello\r\n--B\r\nContent-Type: application/pkcs7-signature; name=smime.p7s\r\nContent-Disposition: attachment; filename=smime.p7s\r\nContent-Transfer-Encoding: base64\r\n\r\nMIAGCSqGSIb3DQEHAqCAMIACAQEx\r\n--B--\r\n";
+        assert_eq!(run(smime, &sp).1, "signed");
+        // A text body with a harmless uuencoded file still passes.
+        let ok_uu = String::from_utf8_lossy(pgp).replace(
+            "hello\r\n",
+            "see\r\nbegin 644 notes.txt\r\n#35H*\r\n`\r\nend\r\n",
+        );
+        assert_eq!(run(ok_uu.as_bytes(), &sp).1, "signed");
+        // A non-armored signature body is not kept.
+        let fake = String::from_utf8_lossy(pgp).replace("-----BEGIN PGP SIGNATURE-----", "MZ");
+        let (n, s, _) = run(fake.as_bytes(), &sp);
+        assert_eq!((n.len(), s.as_str()), (1, ""));
+        // S/MIME enveloped-data with both names smime.p7m stays encrypted.
+        let env = b"From: a@x\r\nContent-Type: application/pkcs7-mime; smime-type=enveloped-data; name=smime.p7m\r\nContent-Disposition: attachment; filename=smime.p7m\r\nContent-Transfer-Encoding: base64\r\n\r\nMIAGCSqGSIb3DQEHA6CAMIACAQAx\r\n";
+        assert_eq!(run(env, &Options::default()).1, "encrypted");
+    }
+
+    #[test]
+    fn uuencode_extraction_is_bounded() {
+        let raw = format!(
+            "From: a@x\r\nSubject: s\r\n\r\n{}",
+            "begin 644 a\r\n#35H*\r\nend\r\n".repeat(400_000)
+        );
+        let mut root = parse(raw.as_bytes());
+        let r = extract_with(&mut root, &Options::default(), &|_: &str| false).unwrap();
+        assert!(
+            r.attachments.len() <= MAX_ATTACHMENTS,
+            "{}",
+            r.attachments.len()
+        );
+        let last = r.attachments.last().unwrap();
+        assert_eq!(last.filename, OVERFLOW_NAME);
+        assert!(last.data.len() > 1_000_000);
+        assert!(!String::from_utf8_lossy(&root.to_bytes()).contains("begin 644"));
+        // Shared with MIME entities: many parts plus many uuencoded blocks.
+        let mut m = String::from("From: a@x\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n");
+        for _ in 0..1500 {
+            m.push_str("--B\r\nContent-Type: application/octet-stream; name=a.bin\r\n\r\nx\r\n");
+        }
+        m.push_str("--B\r\nContent-Type: text/plain\r\n\r\n");
+        m.push_str(&"begin 644 b\r\n#35H*\r\nend\r\n".repeat(5000));
+        m.push_str("--B--\r\n");
+        let mut root = parse(m.as_bytes());
+        let r = extract_with(&mut root, &Options::default(), &|_: &str| false).unwrap();
+        assert_eq!(r.attachments.len(), MAX_ATTACHMENTS);
+        assert_eq!(r.attachments.last().unwrap().filename, OVERFLOW_NAME);
+        // The DLP view is bounded too.
+        let p = crate::mimeproc::parse(raw.as_bytes()).unwrap();
+        assert!(p.attachments.len() <= MAX_ATTACHMENTS + 1);
+        assert!(!p.uninspectable.is_empty());
     }
 }

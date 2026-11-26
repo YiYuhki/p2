@@ -344,52 +344,77 @@ fn sanitize_header_value(s: &str) -> String {
 }
 
 /// Removes the header fields for which `drop(lowercase_name, unfolded_value)`
-/// is true, keeping every other byte (line breaks normalized to CRLF, as the
-/// MIME parser does). Unlike the MIME tree this has no field limit, so a
-/// forged field cannot hide behind thousands of others.
+/// is true. Only the header block is touched and every kept byte is the
+/// input's own (no line-break normalization: downstream DKIM/ARC verifiers
+/// see the message as sent); when nothing is dropped the input is returned
+/// unchanged. Lines are split the way the MIME parser splits them (CRLF, bare
+/// LF or bare CR), so a forged field cannot hide behind a bare CR. Unlike the
+/// MIME tree this has no field limit, so a forged field cannot hide behind
+/// thousands of others either.
 fn strip_header_fields(raw: &[u8], drop: impl Fn(&str, &str) -> bool) -> Vec<u8> {
-    let msg = crate::mimetree::crlf(raw);
-    let head_end = if msg.starts_with(b"\r\n") {
-        0
-    } else {
-        msg.windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .map(|i| i + 2)
-            .unwrap_or(msg.len())
-    };
-    let mut out = Vec::with_capacity(msg.len());
-    let mut field: Vec<u8> = Vec::new();
-    let flush = |field: &mut Vec<u8>, out: &mut Vec<u8>| {
-        if field.is_empty() {
-            return;
+    // (start, content end, line end) of each header line, through the first
+    // empty line (exclusive).
+    let n = raw.len();
+    let mut lines: Vec<(usize, usize, usize)> = Vec::new();
+    let mut i = 0;
+    let mut head_end = n;
+    while i < n {
+        let mut j = i;
+        while j < n && raw[j] != b'\n' && raw[j] != b'\r' {
+            j += 1;
         }
-        let keep = match field.iter().position(|&b| b == b':') {
-            Some(c) => {
-                let name = String::from_utf8_lossy(&field[..c])
-                    .trim()
-                    .to_ascii_lowercase();
-                let value: Vec<u8> = field[c + 1..]
-                    .iter()
-                    .copied()
-                    .filter(|&b| b != b'\r' && b != b'\n')
-                    .collect();
-                !drop(&name, String::from_utf8_lossy(&value).trim())
-            }
-            None => true,
+        let end = if j >= n {
+            n
+        } else if raw[j] == b'\r' && raw.get(j + 1) == Some(&b'\n') {
+            j + 2
+        } else {
+            j + 1
         };
-        if keep {
-            out.extend_from_slice(field);
+        if j == i && j < n {
+            head_end = i; // the empty separator line
+            break;
         }
-        field.clear();
-    };
-    for line in msg[..head_end].split_inclusive(|&b| b == b'\n') {
-        if !(line[0] == b' ' || line[0] == b'\t') || field.is_empty() {
-            flush(&mut field, &mut out);
-        }
-        field.extend_from_slice(line);
+        lines.push((i, j, end));
+        i = end;
     }
-    flush(&mut field, &mut out);
-    out.extend_from_slice(&msg[head_end..]);
+    // Group lines into fields (continuations start with SP/HT).
+    let mut fields: Vec<(usize, usize)> = Vec::new(); // (first line, last line)
+    for (k, &(s, _, _)) in lines.iter().enumerate() {
+        let cont = matches!(raw[s], b' ' | b'\t');
+        match fields.last_mut() {
+            Some(f) if cont => f.1 = k,
+            _ => fields.push((k, k)),
+        }
+    }
+    let mut dropped: Vec<(usize, usize)> = Vec::new(); // byte ranges
+    for &(a, b) in &fields {
+        let (fs, fe) = (lines[a].0, lines[b].2);
+        let first = &raw[lines[a].0..lines[a].1];
+        let Some(c) = first.iter().position(|&x| x == b':') else {
+            continue;
+        };
+        let name = String::from_utf8_lossy(&first[..c])
+            .trim()
+            .to_ascii_lowercase();
+        let mut value: Vec<u8> = first[c + 1..].to_vec();
+        for &(ls, le, _) in &lines[a + 1..=b] {
+            value.extend_from_slice(&raw[ls..le]);
+        }
+        if drop(&name, String::from_utf8_lossy(&value).trim()) {
+            dropped.push((fs, fe));
+        }
+    }
+    if dropped.is_empty() {
+        return raw.to_vec();
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut at = 0;
+    for (fs, fe) in dropped {
+        out.extend_from_slice(&raw[at..fs]);
+        at = fe;
+    }
+    out.extend_from_slice(&raw[at..]);
+    debug_assert!(at <= head_end);
     out
 }
 
@@ -397,24 +422,18 @@ fn strip_header_fields(raw: &[u8], drop: impl Fn(&str, &str) -> bool) -> Vec<u8>
 const MAX_FROM_DOMAINS: usize = 5;
 
 /// Distinct domains (lowercased, in order) of every address in every From
-/// header, plus every domain that follows an '@' anywhere in the raw header
-/// text (DMARC then evaluates all of them; the worst verdict wins). The raw
-/// value is parsed *before* any RFC 2047 decoding, so encoded words cannot
-/// inject quotes or brackets that hide an address. Only the header block is
-/// parsed. An empty vector when no domain could be found.
+/// header (DMARC then evaluates all of them; the worst verdict wins). Each
+/// raw value is parsed structurally *before* any RFC 2047 decoding, so
+/// encoded words cannot inject quotes or brackets that hide an address, and
+/// only real addr-spec domains count: an address-like string inside a
+/// display name ("bob@yahoo.com via Contact Form" <noreply@site.net>) is
+/// not the author. Only when a value does not parse into clean addr-specs
+/// is every "@domain" in its raw (and decoded) text taken instead, so
+/// malformed headers fail closed. Only the header block is parsed. An empty
+/// vector when no domain could be found.
 fn from_header_domains(raw: &[u8]) -> Vec<String> {
     let head = header_block(raw);
     let root = crate::mimetree::parse(head);
-    let domain_of = |a: &str| {
-        a.rsplit_once('@')
-            .map(|(_, d)| {
-                d.trim()
-                    .trim_end_matches(['>', '.'])
-                    .trim()
-                    .to_ascii_lowercase()
-            })
-            .unwrap_or_default()
-    };
     let mut out: Vec<String> = Vec::new();
     let mut push = |d: String| {
         if !d.is_empty() && !out.contains(&d) {
@@ -422,28 +441,57 @@ fn from_header_domains(raw: &[u8]) -> Vec<String> {
         }
     };
     for value in root.headers("from") {
-        if let Ok(list) = mailparse::addrparse(&value) {
-            for a in list.iter() {
-                match a {
-                    mailparse::MailAddr::Single(s) => push(domain_of(&s.addr)),
-                    mailparse::MailAddr::Group(g) => {
-                        for s in &g.addrs {
-                            push(domain_of(&s.addr));
-                        }
+        match structured_from_domains(&value) {
+            Some(ds) => ds.into_iter().for_each(&mut push),
+            None => {
+                let decoded = crate::mimeproc::decode_header(&value);
+                for text in [value.as_str(), decoded.as_str()] {
+                    for (i, _) in text.match_indices('@') {
+                        let d: String = text[i + 1..]
+                            .trim_start()
+                            .chars()
+                            .take_while(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_'))
+                            .collect();
+                        push(d.trim_matches('.').to_ascii_lowercase());
                     }
                 }
             }
         }
-        // Every "@domain" in the raw text, whatever the structure says.
-        for (i, _) in value.match_indices('@') {
-            let d: String = value[i + 1..]
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_'))
-                .collect();
-            push(d.trim_matches('.').to_ascii_lowercase());
-        }
     }
     out
+}
+
+/// The domains of a raw From value that parses into one or more clean
+/// addr-specs (exactly one '@', no whitespace or control characters, a
+/// plausible domain); None when it does not.
+fn structured_from_domains(value: &str) -> Option<Vec<String>> {
+    let list = mailparse::addrparse(value).ok()?;
+    let mut addrs: Vec<&str> = Vec::new();
+    for a in list.iter() {
+        match a {
+            mailparse::MailAddr::Single(s) => addrs.push(&s.addr),
+            mailparse::MailAddr::Group(g) => addrs.extend(g.addrs.iter().map(|s| s.addr.as_str())),
+        }
+    }
+    let mut out = Vec::new();
+    for a in addrs {
+        let (local, domain) = a.rsplit_once('@')?;
+        if local.is_empty() || (local.contains('@') && !local.starts_with('"')) {
+            return None;
+        }
+        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+        let literal = domain.starts_with('[') && domain.ends_with(']');
+        let clean = !domain.is_empty()
+            && (literal
+                || domain
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_')));
+        if !clean || a.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return None;
+        }
+        out.push(domain);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// The header block of a message (through the first empty line).
@@ -682,7 +730,7 @@ mod r2_tests {
             (b"From: ceo@victim.com (\r\n\r\n", &["victim.com"]),
             (b"From: a@attacker.net\r\nFrom : ceo@victim.com\r\n\r\n", &["attacker.net", "victim.com"]),
             (b"from:a@attacker.net\r\nFrom\t: ceo@victim.com\r\n\r\n", &["attacker.net", "victim.com"]),
-            (b"From: \"x@victim.com\" <a@attacker.net>\r\n\r\nbody From: z@other.org\r\n", &["attacker.net", "victim.com"]),
+            (b"From: \"x@victim.com\" <a@attacker.net>\r\n\r\nbody From: z@other.org\r\n", &["attacker.net"]),
         ] {
             let got = from_header_domains(m);
             for w in want {
@@ -821,5 +869,141 @@ mod r2_tests {
         .unwrap();
         assert!(out.starts_with("ARC-Seal: i=1; a=rsa-sha256; cv=none;"));
         assert!(!out.contains("arc="));
+    }
+}
+
+/// Round-3 review regressions: display-name addresses, byte exactness.
+#[cfg(test)]
+mod r3_tests {
+    use super::*;
+    use crate::dns::Static;
+    use std::time::Duration;
+
+    #[test]
+    fn only_addr_spec_domains_count() {
+        for (m, want) in [
+            // Address-like text in a display name is not the author.
+            (&b"From: \"bob@yahoo.com via Contact Form\" <noreply@site.net>\r\n\r\n"[..], &["site.net"][..]),
+            (b"From: \"Bob (bob@yahoo.com) via Form\" <noreply@site.net>\r\n\r\n", &["site.net"]),
+            (b"From: \"x@victim.com\" <a@attacker.net>\r\n\r\n", &["attacker.net"]),
+            (b"From: a@(c)victim.com\r\n\r\n", &["victim.com"]),
+            (b"From: a@VICTIM.com.\r\n\r\n", &["victim.com"]),
+            // Round 2: encoded words cannot inject quotes hiding an address.
+            (b"From: =?utf-8?q?=22x?= <ceo@victim.com>, =?utf-8?q?y=22?= <a@attacker.net>\r\n\r\n", &["victim.com", "attacker.net"]),
+            // Unparseable or unclean values fall back to every raw "@domain".
+            (b"From: =?utf-8?q?=28?= <ceo@victim.com> =?utf-8?q?=29?= <a@attacker.net>\r\n\r\n", &["victim.com", "attacker.net"]),
+            (b"From: a@attacker.net ceo@victim.com\r\n\r\n", &["attacker.net", "victim.com"]),
+            (b"From: a@victim .com\r\n\r\n", &["victim"]),
+            (b"From: a@ victim.com\r\n\r\n", &["victim.com"]),
+            (b"From: =?utf-8?q?a=40victim.com?=\r\n\r\n", &["victim.com"]),
+        ] {
+            let got = from_header_domains(m);
+            assert_eq!(got, want, "{:?}", String::from_utf8_lossy(m));
+        }
+    }
+
+    fn auth(resolver: Static) -> AuthOptions {
+        let r: Arc<dyn Resolver> = Arc::new(resolver);
+        AuthOptions {
+            spf: Some(Arc::new(crate::spf::Checker::new(
+                r.clone(),
+                Duration::from_secs(2),
+            ))),
+            dkim: Some(r.clone()),
+            arc: None,
+            dmarc: Some(Arc::new(crate::dmarc::Evaluator::new(
+                r,
+                Duration::from_secs(2),
+            ))),
+            enforce_dmarc: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn display_name_address_is_not_rejected() {
+        let r = Static::default()
+            .with_txt("site.net", &["v=spf1 ip4:192.0.2.0/24 -all"])
+            .with_txt("_dmarc.site.net", &["v=DMARC1; p=none"])
+            .with_txt("_dmarc.yahoo.com", &["v=DMARC1; p=reject"])
+            .with_txt("_dmarc.victim.com", &["v=DMARC1; p=reject"]);
+        let p = InboundProcessor::with_options(
+            None,
+            None,
+            Options {
+                hostname: "gw.corp.test".into(),
+                auth: auth(r),
+                ..Default::default()
+            },
+        );
+        let env = Envelope {
+            mail_from: "bounce@site.net".into(),
+            rcpt_to: vec!["bob@corp.test".into()],
+            remote_addr: "192.0.2.10:5".into(),
+            helo: "mx.site.net".into(),
+            tls: true,
+        };
+        let msg = b"From: \"bob@yahoo.com via Contact Form\" <noreply@site.net>\r\nSubject: inquiry\r\n\r\nhi\r\n";
+        let out = p.process(&env, msg).await.expect("delivered");
+        assert!(out.ends_with(msg));
+        // The encoded-word quote injection (round 2) is still rejected.
+        let msg = b"From: =?utf-8?q?=22x?= <ceo@victim.com>, =?utf-8?q?y=22?= <a@site.net>\r\nSubject: pay\r\n\r\nhi\r\n";
+        assert!(matches!(
+            p.process(&env, msg).await,
+            Err(ProcessError::Reject(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn untouched_messages_are_relayed_byte_exact() {
+        let key = rsa::PrivateKey::new(&mut getrandom::SysRng, 1024).unwrap();
+        let sealer = Arc::new(Sealer::new("corp.test", "arc", "gw.corp.test", key).unwrap());
+        let env = Envelope {
+            mail_from: "a@x".into(),
+            rcpt_to: vec!["b@corp.test".into()],
+            remote_addr: "192.0.2.1:1".into(),
+            helo: "h".into(),
+            tls: true,
+        };
+        for sealer in [None, Some(sealer)] {
+            let p = InboundProcessor::with_options(
+                None,
+                sealer,
+                Options {
+                    hostname: "gw.corp.test".into(),
+                    ..Default::default()
+                },
+            );
+            for raw in [
+                &b"From: a@x\r\nSubject: hi\r\n\r\nhello\r\n"[..],
+                b"DKIM-Signature: v=1; a=rsa-sha256; d=x; s=s;\r\n h=from:subject; bh=AAAA; b=AAAA\r\nFrom: a@x\r\nSubject: hi\r\n\r\nhello\r\n",
+                b"From: a@x\r\nSubject: hi\r\n\r\nline one\rcontinued\r\nbinary \r\x00\r\n",
+                b"From: a@x\r\nSubject: hi\r\n\r\nno final crlf",
+                b"From: a@x\r\nSubject: hi\r\n",
+            ] {
+                let out = p.process(&env, raw).await.unwrap();
+                assert!(out.ends_with(raw), "{:?}", String::from_utf8_lossy(&out));
+            }
+        }
+    }
+
+    #[test]
+    fn strip_keeps_bytes_and_catches_bare_cr() {
+        let drop = |n: &str, _: &str| n.starts_with("x-secmail-");
+        let raw = b"From: a@x\r\nSubject: hi\r\n\r\nline\rX-SecMail-Processed: body\r\n";
+        assert_eq!(strip_header_fields(raw, drop), raw);
+        // A forged field after a bare CR (a line break to the MIME parser).
+        let raw = b"From: a@x\rX-SecMail-Processed: forged\r\nSubject: s\r\n\r\nb\rc\r\n";
+        assert_eq!(
+            strip_header_fields(raw, drop),
+            b"From: a@x\rSubject: s\r\n\r\nb\rc\r\n"
+        );
+        // Bare LF lines and folded values are dropped whole, rest untouched.
+        let raw = b"From: a@x\nX-SecMail-A: 1\n 2\nSubject: s\n\nbody\n";
+        assert_eq!(
+            strip_header_fields(raw, drop),
+            b"From: a@x\nSubject: s\n\nbody\n"
+        );
+        let raw = b"X-SecMail-A: 1";
+        assert_eq!(strip_header_fields(raw, drop), b"");
     }
 }

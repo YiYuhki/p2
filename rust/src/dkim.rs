@@ -216,16 +216,33 @@ pub(crate) fn canon_body(body: &[u8], c: Canon) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 // Tag lists
 
+/// Most tags accepted in one tag list (DKIM-Signature, ARC-*, key record);
+/// real ones carry about a dozen. More is a permanent error.
+pub(crate) const MAX_TAGS: usize = 64;
+
+/// Longest tag list parsed, in bytes; longer is a permanent error.
+pub(crate) const MAX_TAG_LIST: usize = 16 * 1024;
+
+/// Parses a tag=value list. None (a permanent error) for a malformed list,
+/// a duplicate tag (RFC 6376 §3.2), more than [`MAX_TAGS`] tags or more
+/// than [`MAX_TAG_LIST`] bytes. Linear in the input.
 pub(crate) fn parse_tags(value: &str) -> Option<Vec<(String, String)>> {
+    if value.len() > MAX_TAG_LIST {
+        return None;
+    }
     let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for part in value.split(';') {
         let p = part.trim_matches(|c: char| c.is_ascii_whitespace());
         if p.is_empty() {
             continue;
         }
+        if out.len() >= MAX_TAGS {
+            return None;
+        }
         let (k, v) = p.split_once('=')?;
         let k = k.trim().to_string();
-        if k.is_empty() || out.iter().any(|(e, _): &(String, String)| *e == k) {
+        if k.is_empty() || !seen.insert(k.clone()) {
             return None; // duplicate tags are invalid (RFC 6376 §3.2)
         }
         out.push((k, v.trim().to_string()));
@@ -1010,5 +1027,43 @@ mod r2_tests {
             assert_eq!(canon_body(body, Canon::Simple), s);
             assert_eq!(canon_body(body, Canon::Relaxed), rl);
         }
+    }
+}
+
+/// Round-3 review regressions: bounded tag-list parsing.
+#[cfg(test)]
+mod r3_tests {
+    use super::*;
+
+    #[test]
+    fn tag_lists_are_bounded() {
+        let ok = (0..MAX_TAGS)
+            .map(|k| format!("t{k}=x"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert_eq!(parse_tags(&ok).unwrap().len(), MAX_TAGS);
+        assert!(parse_tags(&format!("{ok}; extra=1")).is_none());
+        assert!(parse_tags("a=1; b=2; a=3").is_none());
+        assert!(parse_tags(&format!("a={}", "x".repeat(MAX_TAG_LIST))).is_none());
+    }
+
+    #[tokio::test]
+    async fn huge_signature_is_a_quick_permerror() {
+        let mut v =
+            String::from("DKIM-Signature: v=1; a=rsa-sha256; d=x; s=y; h=from; bh=AAAA; b=AAAA");
+        for k in 0..60_000 {
+            v.push_str(&format!("; t{k}=x"));
+        }
+        let msg = format!("{v}\r\nFrom: a@x\r\n\r\nb\r\n");
+        let t = std::time::Instant::now();
+        let p = prepare(msg.as_bytes());
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
+        );
+        let r = verify_prepared(&p, &crate::dns::Static::default()).await;
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].value, "permerror");
     }
 }

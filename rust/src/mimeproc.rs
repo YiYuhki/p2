@@ -81,7 +81,10 @@ pub fn parse(raw: &[u8]) -> Result<Parsed, String> {
         subject: subject_of(&root),
         ..Default::default()
     };
-    walk(&root, 0, "", &mut out);
+    // uuencoded files share the per-message entity budget (and the
+    // attachment cap) with MIME entities, as in quarantine extraction.
+    let mut uu_budget = mimetree::MAX_ATTACHMENTS;
+    walk(&root, 0, "", &mut out, &mut uu_budget);
     Ok(out)
 }
 
@@ -103,7 +106,7 @@ fn opaque_reason(o: Opaque) -> String {
     }
 }
 
-fn walk(part: &Part, msg_depth: usize, prefix: &str, out: &mut Parsed) {
+fn walk(part: &Part, msg_depth: usize, prefix: &str, out: &mut Parsed, uu_budget: &mut usize) {
     let (mt, params) = part.media_type();
     if let Some(o) = part.opaque() {
         out.uninspectable
@@ -116,7 +119,7 @@ fn walk(part: &Part, msg_depth: usize, prefix: &str, out: &mut Parsed) {
     }
     if part.is_multipart() {
         for sub in part.children() {
-            walk(sub, msg_depth, prefix, out);
+            walk(sub, msg_depth, prefix, out, uu_budget);
         }
         return;
     }
@@ -136,7 +139,7 @@ fn walk(part: &Part, msg_depth: usize, prefix: &str, out: &mut Parsed) {
                 html: false,
             });
         }
-        walk(&inner, msg_depth + 1, &p, out);
+        walk(&inner, msg_depth + 1, &p, out, uu_budget);
         return;
     }
     let charset = params
@@ -164,7 +167,20 @@ fn walk(part: &Part, msg_depth: usize, prefix: &str, out: &mut Parsed) {
         let mut stripped = false;
         if mt == "text/plain" {
             // uuencoded files inside the text are attachments to recipients.
-            let (rest, blocks) = mimetree::split_uuencode(&body);
+            let (rest, blocks, remainder) = mimetree::split_uuencode(&body, *uu_budget);
+            *uu_budget = uu_budget.saturating_sub(blocks.len());
+            if let Some(r) = remainder {
+                out.uninspectable.push(format!(
+                    "{prefix}uuencode 파일이 {}개를 초과하여 나머지를 검사할 수 없음",
+                    mimetree::MAX_ATTACHMENTS
+                ));
+                out.attachments.push(Attachment {
+                    filename: format!("{prefix}{}", mimetree::OVERFLOW_NAME),
+                    content_type: "application/octet-stream".into(),
+                    charset: None,
+                    data: r,
+                });
+            }
             for b in blocks {
                 let mut name = sanitize_filename(&b.name);
                 if name.is_empty() {
@@ -467,13 +483,79 @@ fn hex(c: u8) -> Option<u8> {
     (c as char).to_digit(16).map(|d| d as u8)
 }
 
-/// Decodes bytes in a named charset (lossy UTF-8 when unknown).
+/// Decodes bytes in a named charset (UTF-7 included; lossy UTF-8 when
+/// unknown).
 pub fn decode_charset(cs: &str, bytes: &[u8]) -> String {
+    if is_utf7_label(cs) {
+        return decode_utf7(bytes);
+    }
     match encoding_rs::Encoding::for_label(cs.trim().as_bytes()) {
         Some(enc) => enc.decode_without_bom_handling(bytes).0.into_owned(),
         None => String::from_utf8_lossy(bytes).into_owned(),
     }
 }
+fn is_utf7_label(cs: &str) -> bool {
+    matches!(
+        cs.trim().to_ascii_lowercase().as_str(),
+        "utf-7" | "utf7" | "unicode-1-1-utf-7" | "csunicode11utf7" | "x-unicode-1-1-utf-7"
+    )
+}
+
+/// Decodes UTF-7 (RFC 2152): "+" opens a modified-base64 run of UTF-16BE
+/// code units, ended by any non-base64 character ("-" is absorbed); "+-" is
+/// a literal "+". Malformed input decodes leniently (U+FFFD), never fails.
+pub fn decode_utf7(b: &[u8]) -> String {
+    fn b64(c: u8) -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => (c - b'a') as u32 + 26,
+            b'0'..=b'9' => (c - b'0') as u32 + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    }
+    let mut out = String::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c != b'+' {
+            // Direct characters; any non-ASCII byte is taken leniently.
+            let j = b[i..]
+                .iter()
+                .position(|&x| x == b'+')
+                .map_or(b.len(), |k| i + k);
+            out.push_str(&String::from_utf8_lossy(&b[i..j]));
+            i = j;
+            continue;
+        }
+        i += 1;
+        if b.get(i) == Some(&b'-') {
+            out.push('+');
+            i += 1;
+            continue;
+        }
+        let (mut acc, mut bits) = (0u32, 0u32);
+        let mut units: Vec<u16> = Vec::new();
+        while i < b.len() {
+            let Some(v) = b64(b[i]) else { break };
+            acc = (acc << 6) | v;
+            bits += 6;
+            if bits >= 16 {
+                bits -= 16;
+                units.push((acc >> bits) as u16);
+                acc &= (1 << bits) - 1;
+            }
+            i += 1;
+        }
+        if b.get(i) == Some(&b'-') {
+            i += 1;
+        }
+        out.extend(char::decode_utf16(units).map(|r| r.unwrap_or('\u{FFFD}')));
+    }
+    out
+}
+
 /// Unicode format characters (general category Cf): invisible characters
 /// such as zero-width spaces/joiners, the soft hyphen, BOM, bidi embeddings,
 /// overrides and isolates, and tag characters.

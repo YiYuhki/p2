@@ -20,6 +20,10 @@ pub const MAX_INSTANCES: usize = 50;
 /// Most distinct signing keys fetched per chain (bounds DNS work).
 const MAX_KEYS: usize = 16;
 
+/// Overall deadline for a chain's key lookups (they run concurrently); a
+/// chain whose keys are not all known by then fails.
+pub const KEY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Chain validation status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cv {
@@ -273,32 +277,54 @@ fn canon_last(raw: &[u8], c: Canon) -> Vec<u8> {
     v
 }
 
-/// Fetches the keys and verifies the prepared signatures.
+/// Fetches the keys and verifies the prepared signatures. The distinct
+/// (selector, domain) keys — at most [`MAX_KEYS`], more fails the chain —
+/// are looked up concurrently under one [`KEY_DEADLINE`].
 pub async fn verify<R: Resolver + ?Sized>(p: &Prepared, resolver: &R) -> ChainStatus {
+    verify_within(p, resolver, KEY_DEADLINE).await
+}
+
+async fn verify_within<R: Resolver + ?Sized>(
+    p: &Prepared,
+    resolver: &R,
+    deadline: std::time::Duration,
+) -> ChainStatus {
     let instances = p.instances;
     if let Some(cv) = p.decided {
         return ChainStatus { cv, instances };
     }
-    let mut keys: Vec<((String, String), Option<rsa::PublicKey>)> = Vec::new();
+    let fail = ChainStatus {
+        cv: Cv::Fail,
+        instances,
+    };
+    let mut ids: Vec<(&str, &str)> = Vec::new();
     for c in &p.checks {
-        let id = (c.selector.clone(), c.domain.clone());
-        let key = match keys.iter().find(|(k, _)| *k == id) {
-            Some((_, k)) => k.clone(),
-            None if keys.len() >= MAX_KEYS => None,
-            None => {
-                let k = lookup_key(resolver, &c.selector, &c.domain).await.ok();
-                keys.push((id, k.clone()));
-                k
+        let id = (c.selector.as_str(), c.domain.as_str());
+        if !ids.contains(&id) {
+            if ids.len() >= MAX_KEYS {
+                return fail;
             }
-        };
+            ids.push(id);
+        }
+    }
+    let lookups = futures_util::future::join_all(
+        ids.iter()
+            .map(|(sel, dom)| async move { lookup_key(resolver, sel, dom).await.ok() }),
+    );
+    let Ok(keys) = tokio::time::timeout(deadline, lookups).await else {
+        return fail;
+    };
+    for c in &p.checks {
+        let id = (c.selector.as_str(), c.domain.as_str());
+        let key = ids
+            .iter()
+            .position(|k| *k == id)
+            .and_then(|i| keys[i].as_ref());
         let ok = key
-            .map(|k| verify_digest(&k, &c.digest, &c.b).is_ok())
+            .map(|k| verify_digest(k, &c.digest, &c.b).is_ok())
             .unwrap_or(false);
         if !ok {
-            return ChainStatus {
-                cv: Cv::Fail,
-                instances,
-            };
+            return fail;
         }
     }
     ChainStatus {
@@ -310,4 +336,101 @@ pub async fn verify<R: Resolver + ?Sized>(p: &Prepared, resolver: &R) -> ChainSt
 /// Validates the message's ARC chain ([`prepare`] + [`verify`]).
 pub async fn validate<R: Resolver + ?Sized>(raw: &[u8], resolver: &R) -> ChainStatus {
     verify(&prepare(raw), resolver).await
+}
+
+/// Round-3 review regressions: bounded tag parsing, concurrent key lookups.
+#[cfg(test)]
+mod r3_tests {
+    use super::*;
+    use crate::arc::seal::Sealer;
+    use crate::dns::{Result as DnsResult, Static};
+    use std::net::IpAddr;
+    use std::time::{Duration, Instant};
+
+    /// A resolver that answers from `Static` after a delay.
+    struct Slow(Static, Duration);
+
+    #[async_trait::async_trait]
+    impl Resolver for Slow {
+        async fn txt(&self, name: &str) -> DnsResult<Vec<String>> {
+            tokio::time::sleep(self.1).await;
+            self.0.txt(name).await
+        }
+        async fn ip(&self, name: &str) -> DnsResult<Vec<IpAddr>> {
+            self.0.ip(name).await
+        }
+        async fn mx(&self, name: &str) -> DnsResult<Vec<String>> {
+            self.0.mx(name).await
+        }
+    }
+
+    /// A message carrying a valid 4-set chain, each set under its own key.
+    async fn chain() -> (Vec<u8>, Static) {
+        use base64::Engine;
+        use rsa::pkcs8::EncodePublicKey;
+        let mut r = Static::default();
+        let mut msg = b"From: a@x\r\nSubject: s\r\n\r\nbody\r\n".to_vec();
+        for i in 1..=4 {
+            let key = rsa::PrivateKey::new(&mut getrandom::SysRng, 1024).unwrap();
+            let txt = format!(
+                "v=DKIM1; k=rsa; p={}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(key.to_public_key().to_public_key_der().unwrap().as_bytes())
+            );
+            let sel = format!("s{i}");
+            r = r.with_txt(&format!("{sel}._domainkey.hop{i}.test"), &[&txt]);
+            let sealer = Sealer::new(&format!("hop{i}.test"), &sel, "gw", key).unwrap();
+            let status = prepare(&msg);
+            let status = verify(&status, &r).await;
+            assert_eq!(status.instances, i - 1);
+            msg = sealer.seal_with(&msg, "spf=pass", &status).unwrap();
+        }
+        (msg, r)
+    }
+
+    #[tokio::test]
+    async fn key_lookups_run_concurrently_under_one_deadline() {
+        let (msg, r) = chain().await;
+        let p = prepare(&msg);
+        assert_eq!(
+            verify(&p, &r).await,
+            ChainStatus {
+                cv: Cv::Pass,
+                instances: 4
+            }
+        );
+        let slow = Slow(r, Duration::from_millis(400));
+        let t = Instant::now();
+        assert_eq!(verify(&p, &slow).await.cv, Cv::Pass);
+        // Four distinct keys at 400 ms each: sequential would take 1.6 s.
+        assert!(
+            t.elapsed() < Duration::from_millis(1200),
+            "{:?}",
+            t.elapsed()
+        );
+        // Past the deadline the chain fails.
+        let t = Instant::now();
+        let st = verify_within(&p, &slow, Duration::from_millis(50)).await;
+        assert_eq!(st.cv, Cv::Fail);
+        assert!(t.elapsed() < Duration::from_millis(300));
+    }
+
+    #[test]
+    fn huge_tag_lists_are_rejected_quickly() {
+        for n in [100usize, 60_000] {
+            let mut v = String::from("ARC-Seal: i=1; cv=none");
+            for k in 0..n {
+                v.push_str(&format!("; t{k}=x"));
+            }
+            let msg = format!("{v}\r\nFrom: a@x\r\n\r\nb\r\n");
+            let t = Instant::now();
+            let st = prepare(msg.as_bytes()).unverified();
+            assert_eq!(st.cv, Cv::Fail);
+            assert!(
+                t.elapsed() < Duration::from_millis(500),
+                "{n}: {:?}",
+                t.elapsed()
+            );
+        }
+    }
 }

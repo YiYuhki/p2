@@ -8,7 +8,9 @@ use std::collections::{HashMap, HashSet};
 use regex::Regex;
 use serde::Serialize;
 
-use super::detectors::{builtin, mask_middle, Detector, Severity, CATEGORY_PII, CONTEXT_WINDOW};
+use super::detectors::{
+    builtin, mask_middle, Detector, Severity, CATEGORY_PII, CONTEXT_WINDOW, SEP_CONTEXT_CHARS,
+};
 
 /// Byte ranges of a text.
 type Ranges = Vec<(usize, usize)>;
@@ -158,6 +160,7 @@ impl Scanner {
                 hints_fold: vec![],
                 back: 0,
                 ahead: 0,
+                sep_context: vec![],
             });
         }
         Ok(Scanner {
@@ -178,8 +181,11 @@ impl Scanner {
         let mut out = Vec::new();
         let lower = ascii_lower(text);
         let mut num_tokens: Option<Vec<(usize, usize)>> = None;
-        // (view, lowercased view, number tokens) for tolerant detectors.
+        // (view, lowercased view, number tokens) for tolerant detectors;
+        // `strict_views` only turn a literal dash into '-' (for detectors
+        // with `sep_context`).
         let mut views: Option<Vec<View>> = None;
+        let mut strict_views: Option<Vec<View>> = None;
 
         for d in &self.detectors {
             let tolerant = d.digits && is_separator_tolerant(&d.id);
@@ -199,12 +205,18 @@ impl Scanner {
             } else {
                 vec![(0, text.len())]
             };
+            let strict = !d.sep_context.is_empty();
             let mut sources: Vec<(&str, &str, Ranges)> = vec![(text, &lower, windows)];
             if tolerant {
-                let vs = views.get_or_insert_with(|| {
+                let slot = if strict {
+                    &mut strict_views
+                } else {
+                    &mut views
+                };
+                let vs = slot.get_or_insert_with(|| {
                     [false, true]
                         .iter()
-                        .map(|&drop_ws| collapse_numbers(text, drop_ws))
+                        .map(|&drop_ws| collapse_numbers(text, drop_ws, strict))
                         .filter(|v| v != text)
                         .map(|v| {
                             let l = ascii_lower(&v);
@@ -219,7 +231,7 @@ impl Scanner {
             }
             let mut seen: HashSet<String> = HashSet::new();
             let mut samples: Vec<String> = Vec::new();
-            for (src, src_lower, windows) in sources {
+            for (si, (src, src_lower, windows)) in sources.into_iter().enumerate() {
                 for (ws, we) in windows {
                     let seg = &src[ws..we];
                     for caps in d.re.captures_iter(seg) {
@@ -242,6 +254,22 @@ impl Scanner {
                             if !validate(v) {
                                 continue;
                             }
+                        }
+                        // Not in its canonical dashed form: a non-dash
+                        // separator, or only seen once separators were
+                        // collapsed — require a keyword close by.
+                        if strict
+                            && !v.contains('-')
+                            && (si > 0 || v.bytes().any(|c| !c.is_ascii_digit()))
+                            && !has_context_chars(
+                                src_lower,
+                                abs_start,
+                                abs_end,
+                                &d.sep_context,
+                                SEP_CONTEXT_CHARS,
+                            )
+                        {
+                            continue;
                         }
                         if !d.context.is_empty()
                             && d.needs_context.map(|f| f(v)).unwrap_or(true)
@@ -904,8 +932,10 @@ const MAX_SEP: usize = 6;
 /// A copy of `text` where, between two digit groups, a separator made of at
 /// most one of [-./] plus whitespace (at most one line break, at most
 /// [`MAX_SEP`] bytes) becomes '-' — or, when whitespace only, ' ' (dropped
-/// entirely when `drop_ws` and at most 3 bytes long).
-fn collapse_numbers(text: &str, drop_ws: bool) -> String {
+/// entirely when `drop_ws` and at most 3 bytes long). With `dash_only`, only
+/// a literal '-' becomes '-' ('.' and '/' become ' ', never dropped), so a
+/// dash in the view always stands for a dash in the text.
+fn collapse_numbers(text: &str, drop_ws: bool, dash_only: bool) -> String {
     let b = text.as_bytes();
     let n = b.len();
     let mut out = String::with_capacity(n);
@@ -925,10 +955,14 @@ fn collapse_numbers(text: &str, drop_ws: bool) -> String {
             }
             out.push_str(&text[ds..j]);
             let (ss, mut k) = (j, j);
-            let (mut punct, mut nl) = (0, 0);
+            let (mut punct, mut nl, mut dash) = (0, 0, false);
             while k < n && k - ss <= MAX_SEP {
                 match b[k] {
-                    b'-' | b'.' | b'/' => punct += 1,
+                    b'-' => {
+                        punct += 1;
+                        dash = true;
+                    }
+                    b'.' | b'/' => punct += 1,
                     b'\n' => nl += 1,
                     b' ' | b'\t' | b'\r' => {}
                     _ => break,
@@ -942,9 +976,9 @@ fn collapse_numbers(text: &str, drop_ws: bool) -> String {
                 && punct <= 1
                 && nl <= 1
             {
-                if punct == 1 {
+                if punct == 1 && (dash || !dash_only) {
                     out.push('-');
-                } else if !(drop_ws && k - ss <= 3) {
+                } else if punct == 1 || !(drop_ws && k - ss <= 3) {
                     out.push(' ');
                 }
                 j = k;
@@ -961,6 +995,24 @@ fn collapse_numbers(text: &str, drop_ws: bool) -> String {
 fn has_context(lower: &str, start: usize, end: usize, kws: &[String]) -> bool {
     let lo = snap_down(lower, start.saturating_sub(CONTEXT_WINDOW));
     let hi = snap_up(lower, (end + CONTEXT_WINDOW).min(lower.len()));
+    let win = &lower[lo..hi];
+    kws.iter().any(|k| win.contains(k.as_str()))
+}
+
+/// Whether one of `kws` occurs within `chars` characters of [start,end).
+fn has_context_chars(lower: &str, start: usize, end: usize, kws: &[String], chars: usize) -> bool {
+    let lo = lower[..start]
+        .char_indices()
+        .rev()
+        .take(chars)
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(start);
+    let hi = lower[end..]
+        .char_indices()
+        .nth(chars)
+        .map(|(i, _)| end + i)
+        .unwrap_or(lower.len());
     let win = &lower[lo..hi];
     kws.iter().any(|k| win.contains(k.as_str()))
 }
@@ -1237,13 +1289,13 @@ mod r2_tests {
             ("endash", "900101–1234567"),
             ("emdash", "900101—1234567"),
             ("minus", "900101−1234567"),
-            ("dot", "900101.1234567"),
+            ("dot", "900101.1234568"),
             ("spaced", "9 0 0 1 0 1 - 1 2 3 4 5 6 7"),
-            ("slash", "900101/1234567"),
+            ("slash", "900101/1234568"),
             ("sp-dash-sp", "900101 - 1234567"),
-            ("nbsp", "900101\u{a0}1234567"),
+            ("nbsp", "900101\u{a0}1234568"),
             ("thin-space", "900101\u{2009}-\u{2009}1234567"),
-            ("ideographic-space", "900101\u{3000}1234567"),
+            ("ideographic-space", "900101\u{3000}1234568"),
             ("newline", "900101-\r\n1234567"),
             ("fwhyphen", "900101－1234567"),
         ] {
@@ -1295,6 +1347,144 @@ mod r2_tests {
         for (l, raw) in cases {
             assert_rrn(l, raw);
         }
+    }
+
+    /// Deterministic xorshift for the synthetic corpora.
+    struct Rng(u64);
+    impl Rng {
+        fn r(&mut self, m: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % m
+        }
+    }
+
+    /// Accounting-style rows (dates next to amounts, unrelated 6+7 digit
+    /// pairs) must never be reported as resident registration numbers:
+    /// only a literal dash between the groups is accepted without the
+    /// checksum, and any other separator needs the checksum plus an RRN
+    /// keyword nearby.
+    #[test]
+    fn rrn_false_positive_corpus() {
+        let sc = s();
+        let mut rng = Rng(0x1234567);
+        type Gen = Box<dyn Fn(&mut Rng) -> String>;
+        let date = |r: &mut Rng| format!("{:02}{:02}{:02}", r.r(26), 1 + r.r(12), 1 + r.r(28));
+        let gens: Vec<(&str, Gen)> = vec![
+            (
+                "date<TAB>amount",
+                Box::new(move |r: &mut Rng| {
+                    format!("일자\t금액\n{}\t{}\n", date(r), 1_000_000 + r.r(9_000_000))
+                }),
+            ),
+            (
+                "(주)name<TAB>date<TAB>amount",
+                Box::new(move |r: &mut Rng| {
+                    format!("(주)한빛\t{}\t{}\r\n", date(r), 1_000_000 + r.r(9_000_000))
+                }),
+            ),
+            (
+                "date amount원",
+                Box::new(move |r: &mut Rng| {
+                    format!("{} {}원", date(r), 1_000_000 + r.r(9_000_000))
+                }),
+            ),
+            (
+                "date / amount",
+                Box::new(move |r: &mut Rng| {
+                    format!("{} / {}", date(r), 1_000_000 + r.r(9_000_000))
+                }),
+            ),
+            (
+                "date.amount",
+                Box::new(move |r: &mut Rng| {
+                    format!("value={}.{}", date(r), 1_000_000 + r.r(9_000_000))
+                }),
+            ),
+            (
+                "date<NL>amount",
+                Box::new(move |r: &mut Rng| {
+                    format!("{}\n{}\n", date(r), 1_000_000 + r.r(9_000_000))
+                }),
+            ),
+            (
+                "date<NBSP>amount",
+                Box::new(move |r: &mut Rng| {
+                    format!("{}\u{a0}{}", date(r), 1_000_000 + r.r(9_000_000))
+                }),
+            ),
+            (
+                "order 6 7",
+                Box::new(|r: &mut Rng| {
+                    format!("주문번호 {:06} {:07}", r.r(1_000_000), r.r(10_000_000))
+                }),
+            ),
+            (
+                "random 6/7",
+                Box::new(|r: &mut Rng| format!("{:06}/{:07}", r.r(1_000_000), r.r(10_000_000))),
+            ),
+        ];
+        let mut total = 0;
+        let mut report = Vec::new();
+        for (label, g) in &gens {
+            let mut hits = 0;
+            let mut ex = String::new();
+            for _ in 0..2000 {
+                let t = g(&mut rng);
+                let f = sc.scan_text("x", &normalize_text(&t, false));
+                if f.iter().any(|f| f.detector == "kr_rrn") {
+                    hits += 1;
+                    if ex.is_empty() {
+                        ex = t;
+                    }
+                }
+            }
+            report.push(format!("{label}: {hits}/2000 {ex:?}"));
+            total += hits;
+        }
+        eprintln!("RRN-FP\n{}", report.join("\n"));
+        // Non-dash separators still detect with the checksum and a keyword
+        // (but not without either).
+        let rrn = |t: &str| {
+            sc.scan_text("x", &normalize_text(t, false))
+                .iter()
+                .any(|f| f.detector == "kr_rrn")
+        };
+        for sep in [" ", "\t", "\n", " / ", ".", "\u{a0}", "\u{3000}"] {
+            assert!(rrn(&format!("주민번호: 900101{sep}1234568")), "{sep:?}");
+            assert!(
+                rrn(&format!("Resident Registration No 900101{sep}1234568")),
+                "{sep:?}"
+            );
+            assert!(!rrn(&format!("주민번호: 900101{sep}1234567")), "{sep:?}");
+            assert!(!rrn(&format!("주문번호: 900101{sep}1234568")), "{sep:?}");
+        }
+        assert!(rrn("JUMIN 900101 1234568"));
+        assert!(rrn("생년월일 900101 1234568"));
+        // A dash (or dash variant) needs neither.
+        assert!(rrn("900101-1234567"));
+        assert!(rrn("900101\u{2013}1234567"));
+        assert!(rrn("９００１０１－１２３４５６７"));
+        assert!(rrn("9 0 0 1 0 1 - 1 2 3 4 5 6 7"));
+        assert_eq!(total, 0, "{report:#?}");
+        // The whole TSV message does not trigger a hold.
+        let mut body = String::from("일자\t거래처\t금액\r\n");
+        for i in 0..10 {
+            body.push_str(&format!(
+                "(주)한빛\t2511{:02}\t{}\r\n",
+                10 + i,
+                1_250_000 + i * 31_000
+            ));
+        }
+        let raw = format!("From: a@corp.kr\r\nSubject: 11월 정산\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}");
+        let rep = sc.scan_message(raw.as_bytes());
+        assert!(
+            !rep.findings.iter().any(|f| f.detector == "kr_rrn"),
+            "{:?}",
+            rep.findings
+        );
+        assert_ne!(crate::outbound::decide(&rep, &policy()), "hold");
     }
 
     #[test]
