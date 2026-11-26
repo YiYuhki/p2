@@ -91,7 +91,10 @@ pub fn valid_rrn(v: &str) -> bool {
     if date.month() != mm || date.day() != dd || date > Utc::now().date_naive() {
         return false;
     }
-    if v.contains('-') {
+    // Written in its 6-7 form ("-" or a space between the groups): the
+    // shape plus a valid date is the signal (RRNs issued since 2020 carry no
+    // checksum). A bare 13-digit run must pass the checksum.
+    if v.contains('-') || v.contains(' ') {
         return true;
     }
     rrn_checksum(&d)

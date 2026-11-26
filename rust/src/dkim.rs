@@ -165,57 +165,58 @@ pub(crate) fn canon_header(raw: &[u8], c: Canon) -> Vec<u8> {
     out
 }
 
-/// Canonicalizes a CRLF body.
+/// Canonicalizes a CRLF body in one pass with no per-line allocation:
+/// trailing empty lines are counted and only emitted when content follows.
 pub(crate) fn canon_body(body: &[u8], c: Canon) -> Vec<u8> {
-    let mut lines: Vec<Vec<u8>> = Vec::new();
+    let mut out = Vec::with_capacity(body.len() + 2);
+    let mut pending_empty = 0usize;
     let mut rest = body;
     while !rest.is_empty() {
         let (line, next) = match find(rest, b"\r\n") {
             Some(i) => (&rest[..i], &rest[i + 2..]),
             None => (rest, &b""[..]),
         };
-        lines.push(match c {
-            Canon::Simple => line.to_vec(),
+        rest = next;
+        let empty = match c {
+            Canon::Simple => line.is_empty(),
+            Canon::Relaxed => line.iter().all(|&b| is_wsp(b)),
+        };
+        if empty {
+            pending_empty += 1;
+            continue;
+        }
+        for _ in 0..pending_empty {
+            out.extend_from_slice(b"\r\n");
+        }
+        pending_empty = 0;
+        match c {
+            Canon::Simple => out.extend_from_slice(line),
             Canon::Relaxed => {
-                let mut l: Vec<u8> = Vec::with_capacity(line.len());
                 let mut wsp = false;
                 for &b in line {
                     if is_wsp(b) {
                         wsp = true;
                     } else {
                         if wsp {
-                            l.push(b' ');
+                            out.push(b' ');
                         }
                         wsp = false;
-                        l.push(b);
+                        out.push(b);
                     }
                 }
-                l
             }
-        });
-        rest = next;
-    }
-    while lines.last().map(|l| l.is_empty()).unwrap_or(false) {
-        lines.pop();
-    }
-    let mut out = Vec::with_capacity(body.len() + 2);
-    if lines.is_empty() {
-        if c == Canon::Simple {
-            out.extend_from_slice(b"\r\n");
         }
-        return out;
+        out.extend_from_slice(b"\r\n");
     }
-    for l in lines {
-        out.extend_from_slice(&l);
+    if out.is_empty() && c == Canon::Simple {
         out.extend_from_slice(b"\r\n");
     }
     out
 }
-
 // ---------------------------------------------------------------------------
 // Tag lists
 
-fn parse_tags(value: &str) -> Option<Vec<(String, String)>> {
+pub(crate) fn parse_tags(value: &str) -> Option<Vec<(String, String)>> {
     let mut out = Vec::new();
     for part in value.split(';') {
         let p = part.trim_matches(|c: char| c.is_ascii_whitespace());
@@ -232,16 +233,16 @@ fn parse_tags(value: &str) -> Option<Vec<(String, String)>> {
     Some(out)
 }
 
-fn tag<'a>(tags: &'a [(String, String)], k: &str) -> Option<&'a str> {
+pub(crate) fn tag<'a>(tags: &'a [(String, String)], k: &str) -> Option<&'a str> {
     tags.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
 }
 
-fn strip_fws(s: &str) -> String {
+pub(crate) fn strip_fws(s: &str) -> String {
     s.chars().filter(|c| !c.is_ascii_whitespace()).collect()
 }
 
 /// Returns the raw DKIM-Signature field with the b= tag value removed.
-fn without_b(raw: &[u8]) -> Vec<u8> {
+pub(crate) fn without_b(raw: &[u8]) -> Vec<u8> {
     let colon = raw
         .iter()
         .position(|&b| b == b':')
@@ -288,14 +289,14 @@ fn without_b(raw: &[u8]) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 // Verification
 
-enum Fail {
+pub(crate) enum Fail {
     Perm,
     Temp,
     Bad,
 }
 
 impl Fail {
-    fn value(&self) -> &'static str {
+    pub(crate) fn value(&self) -> &'static str {
         match self {
             Fail::Perm => "permerror",
             Fail::Temp => "temperror",
@@ -308,13 +309,17 @@ impl Fail {
 /// considered valid).
 const MIN_KEY_BITS: u32 = 1024;
 
-/// A signature whose cheap checks and body hash succeeded; only the key lookup
-/// and header-hash verification remain.
+/// Most entries accepted in a signature's h= list (more is a permerror): the
+/// header hash is built before any key is fetched, so its cost must be
+/// bounded independently of the attacker's DNS.
+pub(crate) const MAX_H: usize = 64;
+
+/// A signature whose cheap checks, body hash and header hash are done; only
+/// the key lookup and the RSA verification remain.
 struct Pending {
-    sig_idx: usize,
     selector: String,
-    h: Vec<String>,
-    hc: Canon,
+    /// SHA-256 of the canonicalized signed headers + signature field.
+    digest: Vec<u8>,
     b: Vec<u8>,
 }
 
@@ -323,32 +328,101 @@ struct PreparedSig {
     stage: std::result::Result<Pending, Fail>,
 }
 
-/// DKIM signatures parsed and body-hashed: the CPU-bound part of verification
-/// (proportional to the message size), done synchronously so callers can run
-/// it on a blocking thread. Finish with [`verify_prepared`].
+/// DKIM signatures parsed, body-hashed and header-hashed: all the CPU-bound
+/// work of verification (proportional to the message size), done
+/// synchronously so callers can run it on a blocking thread. Finish with
+/// [`verify_prepared`] (key lookups + one RSA verification per signature).
 pub struct Prepared {
-    fields: Vec<Field>,
     sigs: Vec<PreparedSig>,
 }
 
-/// Parses and body-hashes up to five DKIM signatures (no I/O).
+/// Lowercase field name → field indices (top to bottom), built once per
+/// message so h= selection is linear.
+pub(crate) fn name_index(fields: &[Field]) -> std::collections::HashMap<&str, Vec<usize>> {
+    let mut m: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    for (i, f) in fields.iter().enumerate() {
+        m.entry(f.name.as_str()).or_default().push(i);
+    }
+    m
+}
+
+/// Canonicalized signed headers for an h= list: each name picks the next
+/// unused instance bottom-up (`skip` — the signature itself — is never
+/// picked). Linear in |h| + |fields|.
+pub(crate) fn signed_headers(
+    fields: &[Field],
+    index: &std::collections::HashMap<&str, Vec<usize>>,
+    h: &[String],
+    skip: usize,
+    c: Canon,
+) -> Vec<u8> {
+    let mut cursor: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut data = Vec::new();
+    for name in h {
+        let Some(list) = index.get(name.as_str()) else {
+            continue;
+        };
+        let pos = cursor.entry(name.as_str()).or_insert(list.len());
+        while *pos > 0 {
+            *pos -= 1;
+            let i = list[*pos];
+            if i != skip {
+                data.extend_from_slice(&canon_header(&fields[i].raw, c));
+                break;
+            }
+        }
+    }
+    data
+}
+
+/// Canonicalized bodies, computed at most once per canonicalization.
+#[derive(Default)]
+pub(crate) struct BodyCache {
+    simple: Option<Vec<u8>>,
+    relaxed: Option<Vec<u8>>,
+}
+
+impl BodyCache {
+    pub(crate) fn get(&mut self, body: &[u8], c: Canon) -> &[u8] {
+        let slot = match c {
+            Canon::Simple => &mut self.simple,
+            Canon::Relaxed => &mut self.relaxed,
+        };
+        slot.get_or_insert_with(|| canon_body(body, c))
+    }
+}
+
+/// Parses, body-hashes and header-hashes up to five DKIM signatures (no I/O).
 pub fn prepare(msg: &[u8]) -> Prepared {
     let msg = crlf(msg);
     let (fields, body) = split(&msg);
+    let index = name_index(&fields);
+    let mut cache = BodyCache::default();
     let sigs = fields
         .iter()
         .enumerate()
         .filter(|(_, f)| f.name == "dkim-signature")
         .take(MAX_VERIFICATIONS)
-        .map(|(idx, f)| prepare_one(idx, f, body))
+        .map(|(idx, f)| prepare_one(idx, f, &fields, &index, body, &mut cache))
         .collect();
-    Prepared { fields, sigs }
+    Prepared { sigs }
 }
 
 /// Verifies up to five DKIM signatures. An empty vector means the message
-/// carried no signatures.
+/// carried no signatures. The CPU-bound part runs on the blocking pool when
+/// called inside a multi-threaded Tokio runtime.
 pub async fn verify<R: Resolver + ?Sized>(msg: &[u8], resolver: &R) -> Vec<Result> {
-    verify_prepared(&prepare(msg), resolver).await
+    let prepared = match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            let owned = msg.to_vec();
+            match tokio::task::spawn_blocking(move || prepare(&owned)).await {
+                Ok(p) => p,
+                Err(_) => prepare(msg),
+            }
+        }
+        _ => prepare(msg),
+    };
+    verify_prepared(&prepared, resolver).await
 }
 
 /// Completes verification of [`prepare`]d signatures (key lookups).
@@ -357,7 +431,7 @@ pub async fn verify_prepared<R: Resolver + ?Sized>(p: &Prepared, resolver: &R) -
     for s in &p.sigs {
         let res = match &s.stage {
             Err(f) => Err(f.value()),
-            Ok(pending) => finish_one(&p.fields, pending, &s.domain, resolver)
+            Ok(pending) => finish_one(pending, &s.domain, resolver)
                 .await
                 .map_err(|f| f.value()),
         };
@@ -369,7 +443,14 @@ pub async fn verify_prepared<R: Resolver + ?Sized>(p: &Prepared, resolver: &R) -
     out
 }
 
-fn prepare_one(sig_idx: usize, sig: &Field, body: &[u8]) -> PreparedSig {
+fn prepare_one(
+    sig_idx: usize,
+    sig: &Field,
+    fields: &[Field],
+    index: &std::collections::HashMap<&str, Vec<usize>>,
+    body: &[u8],
+    cache: &mut BodyCache,
+) -> PreparedSig {
     let colon = sig.raw.iter().position(|&b| b == b':').unwrap_or(0);
     let value = String::from_utf8_lossy(&sig.raw[colon + 1..]).into_owned();
     let tags = match parse_tags(&value) {
@@ -396,19 +477,16 @@ fn prepare_one(sig_idx: usize, sig: &Field, body: &[u8]) -> PreparedSig {
         if domain.is_empty() || selector.is_empty() {
             return Err(Fail::Perm);
         }
+        let h = parse_h(tag(&tags, "h").ok_or(Fail::Perm)?)?;
+        if !h.iter().any(|n| n == "from") {
+            return Err(Fail::Perm);
+        }
         let b = base64::engine::general_purpose::STANDARD
             .decode(strip_fws(tag(&tags, "b").ok_or(Fail::Perm)?))
             .map_err(|_| Fail::Perm)?;
         let bh = base64::engine::general_purpose::STANDARD
             .decode(strip_fws(tag(&tags, "bh").ok_or(Fail::Perm)?))
             .map_err(|_| Fail::Perm)?;
-        let h: Vec<String> = strip_fws(tag(&tags, "h").ok_or(Fail::Perm)?)
-            .split(':')
-            .map(|s| s.to_ascii_lowercase())
-            .collect();
-        if !h.iter().any(|n| n == "from") {
-            return Err(Fail::Perm);
-        }
         let (hc, bc) = match tag(&tags, "c").map(|c| c.trim().to_ascii_lowercase()) {
             None => (Canon::Simple, Canon::Simple),
             Some(c) => {
@@ -433,8 +511,8 @@ fn prepare_one(sig_idx: usize, sig: &Field, body: &[u8]) -> PreparedSig {
             }
         }
 
-        // Body hash.
-        let cb = canon_body(body, bc);
+        // Body hash (canonical bodies are shared between signatures).
+        let cb = cache.get(body, bc);
         if let Some(l) = tag(&tags, "l") {
             let l: usize = l.trim().parse().map_err(|_| Fail::Perm)?;
             if l > cb.len() {
@@ -447,52 +525,55 @@ fn prepare_one(sig_idx: usize, sig: &Field, body: &[u8]) -> PreparedSig {
                 return Err(Fail::Bad);
             }
         }
-        if Sha256::digest(&cb).as_slice() != bh.as_slice() {
+        if Sha256::digest(cb).as_slice() != bh.as_slice() {
             return Err(Fail::Bad);
         }
+
+        // Header hash: each h= name picks the next unused instance bottom-up.
+        let mut data = signed_headers(fields, index, &h, sig_idx, hc);
+        let mut own = canon_header(&without_b(&sig.raw), hc);
+        if own.ends_with(b"\r\n") {
+            own.truncate(own.len() - 2);
+        }
+        data.extend_from_slice(&own);
         Ok(Pending {
-            sig_idx,
             selector: selector.to_string(),
-            h,
-            hc,
+            digest: Sha256::digest(&data).to_vec(),
             b,
         })
     })();
     PreparedSig { domain, stage }
 }
 
+/// Parses an h= list (lowercased); more than [`MAX_H`] entries is a
+/// permerror.
+pub(crate) fn parse_h(v: &str) -> std::result::Result<Vec<String>, Fail> {
+    let v = strip_fws(v);
+    if v.split(':').nth(MAX_H).is_some() {
+        return Err(Fail::Perm);
+    }
+    Ok(v.split(':').map(|s| s.to_ascii_lowercase()).collect())
+}
+
 async fn finish_one<R: Resolver + ?Sized>(
-    fields: &[Field],
     p: &Pending,
     domain: &str,
     resolver: &R,
 ) -> std::result::Result<(), Fail> {
     let key = lookup_key(resolver, &p.selector, domain).await?;
-
-    // Header hash: each h= name picks the next unused instance bottom-up.
-    let mut used = vec![false; fields.len()];
-    used[p.sig_idx] = true;
-    let mut data: Vec<u8> = Vec::new();
-    for name in &p.h {
-        if let Some(i) = (0..fields.len())
-            .rev()
-            .find(|&i| !used[i] && fields[i].name == *name)
-        {
-            used[i] = true;
-            data.extend_from_slice(&canon_header(&fields[i].raw, p.hc));
-        }
-    }
-    let mut own = canon_header(&without_b(&fields[p.sig_idx].raw), p.hc);
-    if own.ends_with(b"\r\n") {
-        own.truncate(own.len() - 2);
-    }
-    data.extend_from_slice(&own);
-    let digest = Sha256::digest(&data);
-    key.verify(Pkcs1v15Sign::new::<Sha256>(), &digest, &p.b)
-        .map_err(|_| Fail::Bad)
+    verify_digest(&key, &p.digest, &p.b)
 }
 
-fn parse_canon(s: &str) -> std::result::Result<Canon, Fail> {
+/// RSA-SHA256 PKCS#1 v1.5 verification of a precomputed digest.
+pub(crate) fn verify_digest(
+    key: &PublicKey,
+    digest: &[u8],
+    sig: &[u8],
+) -> std::result::Result<(), Fail> {
+    key.verify(Pkcs1v15Sign::new::<Sha256>(), digest, sig)
+        .map_err(|_| Fail::Bad)
+}
+pub(crate) fn parse_canon(s: &str) -> std::result::Result<Canon, Fail> {
     match s {
         "simple" => Ok(Canon::Simple),
         "relaxed" => Ok(Canon::Relaxed),
@@ -500,7 +581,7 @@ fn parse_canon(s: &str) -> std::result::Result<Canon, Fail> {
     }
 }
 
-async fn lookup_key<R: Resolver + ?Sized>(
+pub(crate) async fn lookup_key<R: Resolver + ?Sized>(
     r: &R,
     selector: &str,
     domain: &str,
@@ -795,5 +876,139 @@ mod tests {
         let signed = Signer::new("example.com", "sel", k).sign(MSG).unwrap();
         let p = std::thread::spawn(move || prepare(&signed)).join().unwrap();
         assert_eq!(verify_prepared(&p, &r).await[0].value, "pass");
+    }
+}
+
+/// Round-2 review regressions: h= / header-field CPU DoS.
+#[cfg(test)]
+mod r2_tests {
+    use super::*;
+    use crate::dns::Static;
+    use rsa::pkcs8::EncodePublicKey;
+
+    fn keyed() -> (PrivateKey, Static) {
+        let k = PrivateKey::new(&mut getrandom::SysRng, 1024).unwrap();
+        let der = k.to_public_key().to_public_key_der().unwrap();
+        let txt = format!(
+            "v=DKIM1; k=rsa; p={}",
+            base64::engine::general_purpose::STANDARD.encode(der.as_bytes())
+        );
+        let r = Static::default().with_txt("s1._domainkey.attacker.net", &[&txt]);
+        (k, r)
+    }
+
+    /// Signs `fields` + body with simple/simple over the given h= list.
+    fn sign(k: &PrivateKey, h: &[&str], fields: &str, body: &str) -> String {
+        let bh = base64::engine::general_purpose::STANDARD
+            .encode(Sha256::digest(canon_body(body.as_bytes(), Canon::Simple)));
+        let head = format!(
+            "DKIM-Signature: v=1; a=rsa-sha256; d=attacker.net; s=s1; h={}; bh={bh}; b=",
+            h.join(":")
+        );
+        let msg = crlf(format!("{head}\r\n{fields}\r\n{body}").as_bytes());
+        let (fl, _) = split(&msg);
+        let idx = name_index(&fl);
+        let hs: Vec<String> = h.iter().map(|s| s.to_ascii_lowercase()).collect();
+        let mut data = signed_headers(&fl, &idx, &hs, 0, Canon::Simple);
+        data.extend_from_slice(head.as_bytes());
+        let sig = k
+            .sign(Pkcs1v15Sign::new::<Sha256>(), &Sha256::digest(&data))
+            .unwrap();
+        format!(
+            "{head}{}\r\n{fields}\r\n{body}",
+            base64::engine::general_purpose::STANDARD.encode(sig)
+        )
+    }
+
+    #[tokio::test]
+    async fn huge_h_lists_are_refused_quickly() {
+        let (_k, r) = keyed();
+        for (nh, nf) in [(20_000usize, 20_000usize), (40_000, 40_000)] {
+            let bh = base64::engine::general_purpose::STANDARD
+                .encode(Sha256::digest(canon_body(b"hi\r\n", Canon::Simple)));
+            let mut msg = format!(
+                "DKIM-Signature: v=1; a=rsa-sha256; d=attacker.net; s=s1; h=from{}; bh={bh}; b=AAAA\r\n",
+                ":x".repeat(nh)
+            );
+            for _ in 0..nf {
+                msg.push_str("Y: z\r\n");
+            }
+            msg.push_str("From: a@attacker.net\r\n\r\nhi\r\n");
+            let t = std::time::Instant::now();
+            let res = verify(msg.as_bytes(), &r).await;
+            eprintln!(
+                "R2PERF dkim h={nh} fields={nf} ({} KB): {:?}",
+                msg.len() / 1024,
+                t.elapsed()
+            );
+            assert_eq!(res[0].value, "permerror");
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(2),
+                "{:?}",
+                t.elapsed()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn many_fields_and_max_h_stay_linear() {
+        let (k, r) = keyed();
+        // 64 h= entries over 100k header fields, five signatures: verifies,
+        // and quickly.
+        let mut fields = String::new();
+        for _ in 0..100_000 {
+            fields.push_str("X: z\r\n");
+        }
+        fields.push_str("From: a@attacker.net\r\n");
+        let mut h = vec!["from"];
+        h.extend(std::iter::repeat("x").take(63));
+        let one = sign(&k, &h, &fields, "hi\r\n");
+        let t = std::time::Instant::now();
+        let res = verify(one.as_bytes(), &r).await;
+        assert_eq!(res[0].value, "pass");
+        let el = t.elapsed();
+        eprintln!("R2PERF dkim 64 h= over 100k fields: {el:?}");
+        assert!(el < std::time::Duration::from_secs(5), "{el:?}");
+        // 65 entries: permerror.
+        h.push("x");
+        let two = sign(&k, &h, "From: a@attacker.net\r\n", "hi\r\n");
+        assert_eq!(verify(two.as_bytes(), &r).await[0].value, "permerror");
+    }
+
+    #[tokio::test]
+    async fn header_selection_is_bottom_up_and_skips_missing() {
+        let (k, r) = keyed();
+        // h= names a header twice and one that is absent (null string).
+        let fields = "Subject: top\r\nFrom: a@attacker.net\r\nSubject: bottom\r\n";
+        let m = sign(
+            &k,
+            &["from", "subject", "subject", "subject", "to"],
+            fields,
+            "b\r\n",
+        );
+        assert_eq!(verify(m.as_bytes(), &r).await[0].value, "pass");
+        // Adding a To afterwards breaks it (it was signed as absent).
+        let added = m.replace("\r\n\r\nb\r\n", "\r\nTo: x@y\r\n\r\nb\r\n");
+        assert_eq!(verify(added.as_bytes(), &r).await[0].value, "fail");
+        let swapped = m.replace("Subject: top", "Subject: TOP");
+        assert_eq!(verify(swapped.as_bytes(), &r).await[0].value, "fail");
+    }
+
+    #[test]
+    fn canon_body_matches_reference() {
+        for (body, s, rl) in [
+            (&b""[..], &b"\r\n"[..], &b""[..]),
+            (b"\r\n\r\n", b"\r\n", b""),
+            (
+                b"a\r\n\r\n \r\nb  \t\r\n\r\n",
+                b"a\r\n\r\n \r\nb  \t\r\n",
+                b"a\r\n\r\n\r\nb\r\n",
+            ),
+            (b"x", b"x\r\n", b"x\r\n"),
+            (b" \t \r\n", b" \t \r\n", b""),
+        ] {
+            assert_eq!(canon_body(body, Canon::Simple), s);
+            assert_eq!(canon_body(body, Canon::Relaxed), rl);
+        }
     }
 }
