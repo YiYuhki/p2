@@ -19,6 +19,8 @@ static RRN_NEGATIVE: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new
         // they may run on into the rest of the label ("법인등록번호").
         "사업자등록",
         "사업자번호",
+        "공급자등록",
+        "공급받는자등록",
         "법인등록",
         "법인번호",
         "차량등록",
@@ -56,9 +58,14 @@ static RRN_NEGATIVE_LABELS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLo
 });
 /// Words that clearly mean a personal RRN / alien registration number.
 static RRN_POSITIVE: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    // Korean labels are often written as one word ("대표자주민번호"), so these
+    // match anywhere (a stray hit only adds a finding: fails safe).
+    ["주민", "외국인"].iter().map(|s| s.to_string()).collect()
+});
+/// ASCII RRN keywords: must start a token ("President No." is not
+/// "resident no").
+static RRN_POSITIVE_ASCII: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
     [
-        "주민",
-        "외국인",
         "rrn",
         "residentreg",
         "residentno",
@@ -362,6 +369,14 @@ impl Scanner {
                                 abs_start,
                                 abs_end,
                                 &RRN_POSITIVE,
+                                SEP_CONTEXT_CHARS,
+                                Edge::Any,
+                            )
+                            && !has_compact_context(
+                                src_lower,
+                                abs_start,
+                                abs_end,
+                                &RRN_POSITIVE_ASCII,
                                 SEP_CONTEXT_CHARS,
                                 Edge::Start,
                             )
@@ -1610,6 +1625,29 @@ mod r2_tests {
                 .iter()
                 .any(|f| f.detector == "kr_rrn"),
                 "{label}"
+            );
+        }
+        // One-word Korean labels still count as RRN keywords.
+        for t in [
+            "법인명: 에이스상사 대표자주민번호 210315-4123450",
+            "공급받는자 본인주민등록번호 210315-4123450",
+        ] {
+            assert!(
+                sc.scan_text("x", &normalize_text(t, false))
+                    .iter()
+                    .any(|f| f.detector == "kr_rrn"),
+                "{t}"
+            );
+        }
+        for t in [
+            "공급자등록번호 110111-4138561",
+            "공급받는자등록번호 110111-4138561",
+        ] {
+            assert!(
+                !sc.scan_text("x", &normalize_text(t, false))
+                    .iter()
+                    .any(|f| f.detector == "kr_rrn"),
+                "{t}"
             );
         }
         // Token boundaries: "법인 명단" / "공급 자료" are not labels, and
