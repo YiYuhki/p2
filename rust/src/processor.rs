@@ -30,6 +30,9 @@ pub struct AuthOptions {
     pub spf: Option<Arc<dyn crate::spf::Check>>,
     /// DKIM verification resolver (None disables DKIM verification).
     pub dkim: Option<Arc<dyn Resolver>>,
+    /// Resolver for validating existing ARC chains before sealing (falls back
+    /// to `dkim`). Without either, existing chains are sealed cv=fail.
+    pub arc: Option<Arc<dyn Resolver>>,
     pub dmarc: Option<Arc<crate::dmarc::Evaluator<Arc<dyn Resolver>>>>,
     /// Reject `p=reject` DMARC failures.
     pub enforce_dmarc: bool,
@@ -115,7 +118,7 @@ impl InboundProcessor {
                 tokio::task::spawn_blocking(move || crate::arc::validate::prepare(&owned))
                     .await
                     .unwrap_or_else(|_| crate::arc::validate::prepare(raw));
-            arc = match &a.dkim {
+            arc = match a.arc.as_ref().or(a.dkim.as_ref()) {
                 Some(res) => crate::arc::validate::verify(&prepared, res.as_ref()).await,
                 None => prepared.unverified(),
             };
@@ -476,6 +479,7 @@ mod tests {
                 Duration::from_secs(2),
             ))),
             dkim: Some(r.clone()),
+            arc: None,
             dmarc: Some(Arc::new(crate::dmarc::Evaluator::new(
                 r,
                 Duration::from_secs(2),
@@ -690,6 +694,7 @@ mod r2_tests {
                 Duration::from_secs(2),
             ))),
             dkim: Some(r.clone()),
+            arc: None,
             dmarc: Some(Arc::new(crate::dmarc::Evaluator::new(
                 r,
                 Duration::from_secs(2),

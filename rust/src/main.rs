@@ -251,6 +251,7 @@ async fn run(cfg_path: &str) -> Result<(), String> {
             )) as Arc<dyn secmail::spf::Check>
         }),
         dkim: cfg.dkim.verify_inbound.then(|| resolver.clone()),
+        arc: cfg.arc.sign.then(|| resolver.clone()),
         dmarc: cfg.dmarc.verify_inbound.then(|| {
             Arc::new(secmail::dmarc::Evaluator::new(
                 resolver.clone(),
