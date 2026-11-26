@@ -404,6 +404,11 @@ async fn run(cfg_path: &str) -> Result<(), String> {
                 upstream: next_hop.clone(),
                 tls: smtp_tls.clone(),
                 allowed_clients: cfg.outbound.allowed_clients.clone(),
+                // Only allow-listed internal servers connect here, and they
+                // send everything from a few addresses: no per-IP caps
+                // beyond the global ones.
+                max_connections_per_ip: usize::MAX,
+                max_data_per_ip: usize::MAX,
                 ..limits(&cfg)
             },
         ));

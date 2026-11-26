@@ -39,11 +39,11 @@ pub const DEFAULT_MAX_RECIPIENTS: usize = 100;
 /// Default cap on a command line, including CRLF.
 pub const DEFAULT_MAX_LINE_LENGTH: usize = 2048;
 /// Default cap on concurrent DATA phases (messages buffered in memory).
-pub const DEFAULT_MAX_CONCURRENT_DATA: usize = 16;
+pub const DEFAULT_MAX_CONCURRENT_DATA: usize = 32;
 /// Limit on one DATA phase (client upload).
 pub const DEFAULT_DATA_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Concurrent DATA phases from one client IP (or IPv6 /64).
-pub const DEFAULT_MAX_DATA_PER_IP: usize = 4;
+pub const DEFAULT_MAX_DATA_PER_IP: usize = 8;
 /// Limit on processing one message (quarantine, auth, signing).
 pub const DEFAULT_PROCESS_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// How long DATA waits for a free slot before answering 451.

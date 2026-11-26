@@ -136,9 +136,9 @@ pub struct Smtp {
     /// Limit on processing one message (0 = 5m).
     #[serde(deserialize_with = "dur::de_opt")]
     pub process_timeout: Duration,
-    /// Concurrent DATA phases, all clients (0 = 16).
+    /// Concurrent DATA phases, all clients (0 = 32).
     pub max_concurrent_data: i32,
-    /// Concurrent DATA phases per client IP / IPv6 /64 (0 = 4).
+    /// Concurrent DATA phases per client IP / IPv6 /64 (0 = 8; inbound only).
     pub max_data_per_ip: i32,
 }
 
@@ -164,7 +164,7 @@ pub struct Rewrite {
     pub blocked_extensions: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct Dkim {
     pub verify_inbound: bool,
@@ -185,7 +185,7 @@ pub struct Arc {
     pub authserv_id: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct Spf {
     pub verify_inbound: bool,
@@ -193,7 +193,7 @@ pub struct Spf {
     pub timeout: Duration,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct Dmarc {
     pub verify_inbound: bool,
@@ -249,7 +249,7 @@ pub struct PortalAuth {
     pub otp_lockout_window: Duration,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct InternalApi {
     pub listen: String,
@@ -279,7 +279,7 @@ pub struct Database {
     pub conn_max_lifetime: Duration,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct Redis {
     pub addr: String,
@@ -307,7 +307,7 @@ impl Default for Queue {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct Outbound {
     pub enabled: bool,
@@ -403,6 +403,80 @@ pub struct Analysis {
 
 // ---- defaults (mirror Go Default()) ----
 
+// Section defaults live on the section types so that a partially written
+// section in YAML (`#[serde(default)]`) keeps the defaults of the fields it
+// omits, instead of falling back to zero values.
+
+impl Default for Dkim {
+    fn default() -> Self {
+        Dkim {
+            verify_inbound: false,
+            strip_original: true,
+            sign: false,
+            domain: String::new(),
+            selector: String::new(),
+            private_key_file: String::new(),
+        }
+    }
+}
+
+impl Default for Spf {
+    fn default() -> Self {
+        Spf {
+            verify_inbound: false,
+            timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+impl Default for Dmarc {
+    fn default() -> Self {
+        Dmarc {
+            verify_inbound: false,
+            timeout: Duration::from_secs(5),
+            enforce: false,
+        }
+    }
+}
+
+impl Default for InternalApi {
+    fn default() -> Self {
+        InternalApi {
+            listen: "127.0.0.1:8081".into(),
+            token: String::new(),
+            admin_token: String::new(),
+            advertise_url: String::new(),
+        }
+    }
+}
+
+impl Default for Redis {
+    fn default() -> Self {
+        Redis {
+            addr: "localhost:6379".into(),
+            pool_size: 0,
+            password: String::new(),
+            db: 0,
+        }
+    }
+}
+
+impl Default for Outbound {
+    fn default() -> Self {
+        Outbound {
+            enabled: false,
+            listen: ":10025".into(),
+            max_message_bytes: 50 << 20,
+            allowed_clients: Vec::new(),
+            sender_domains: Vec::new(),
+            next_hop: Upstream {
+                timeout: Duration::from_secs(60),
+                ..Default::default()
+            },
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -413,40 +487,17 @@ impl Default for Config {
                 ..Default::default()
             },
             rewrite: Rewrite::default(),
-            dkim: Dkim {
-                strip_original: true,
-                ..Default::default()
-            },
+            dkim: Dkim::default(),
             arc: Arc::default(),
-            spf: Spf {
-                timeout: Duration::from_secs(10),
-                ..Default::default()
-            },
-            dmarc: Dmarc {
-                timeout: Duration::from_secs(5),
-                ..Default::default()
-            },
+            spf: Spf::default(),
+            dmarc: Dmarc::default(),
             portal: Portal::default(),
-            internal_api: InternalApi {
-                listen: "127.0.0.1:8081".into(),
-                ..Default::default()
-            },
+            internal_api: InternalApi::default(),
             storage: Storage::default(),
             database: Database::default(),
             queue: Queue::default(),
-            redis: Redis {
-                addr: "localhost:6379".into(),
-                ..Default::default()
-            },
-            outbound: Outbound {
-                listen: ":10025".into(),
-                max_message_bytes: 50 << 20,
-                next_hop: Upstream {
-                    timeout: Duration::from_secs(60),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
+            redis: Redis::default(),
+            outbound: Outbound::default(),
             dlp: Dlp::default(),
             webhook: Webhook::default(),
             dnsbl: Dnsbl::default(),
@@ -872,6 +923,24 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_sections_keep_field_defaults() {
+        let cfg = load_str(
+            "smtp:\n  accepted_domains: [corp.test]\nupstream:\n  addr: 127.0.0.1:25\n\
+             outbound:\n  enabled: true\n  allowed_clients: [10.0.0.5]\n  next_hop:\n    addr: 127.0.0.1:26\n\
+             dkim:\n  verify_inbound: true\nspf:\n  verify_inbound: true\n\
+             internal_api:\n  token: 0123456789abcdef0123\nredis:\n  db: 2\n\
+             dlp:\n  notify_from: d@corp.test\n  admins: [a@corp.test]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.outbound.max_message_bytes, 50 << 20);
+        assert_eq!(cfg.outbound.listen, ":10025");
+        assert!(cfg.dkim.strip_original);
+        assert_eq!(cfg.spf.timeout, Duration::from_secs(10));
+        assert_eq!(cfg.internal_api.listen, "127.0.0.1:8081");
+        assert_eq!(cfg.redis.addr, "localhost:6379");
+    }
 
     #[test]
     fn duration_parsing() {
