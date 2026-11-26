@@ -111,16 +111,31 @@ impl Postgres {
     /// Applies embedded migrations in lexical order under an advisory lock.
     async fn migrate(&self) -> Result<()> {
         let mut client = self.pool.get().await.map_err(other)?;
+        // Waiting for another replica's migration and building indexes on
+        // large tables can legitimately exceed the per-statement timeout.
         client
-            .execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_ID])
+            .batch_execute("SET statement_timeout = 0")
             .await
             .map_err(other)?;
-        let res = apply_migrations(&mut client).await;
-        let unlock = client
-            .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_ID])
+        let res = async {
+            client
+                .execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_ID])
+                .await
+                .map_err(other)?;
+            let res = apply_migrations(&mut client).await;
+            let unlock = client
+                .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_ID])
+                .await
+                .map_err(other);
+            res.and(unlock.map(|_| ()))
+        }
+        .await;
+        // The pooled connection is reused: restore the session default.
+        let reset = client
+            .batch_execute("RESET statement_timeout")
             .await
             .map_err(other);
-        res.and(unlock.map(|_| ()))
+        res.and(reset)
     }
 
     async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>> {
@@ -808,18 +823,24 @@ impl Store for Postgres {
     }
 
     async fn prune_audit_events(&self, cutoff: DateTime<Utc>) -> Result<i64> {
-        let mut client = self.pool.get().await.map_err(other)?;
-        let tx = client.transaction().await.map_err(other)?;
-        let dlp = tx
-            .execute("DELETE FROM dlp_events WHERE at < $1", &[&cutoff])
-            .await
-            .map_err(other)?;
-        let downloads = tx
-            .execute("DELETE FROM download_events WHERE at < $1", &[&cutoff])
-            .await
-            .map_err(other)?;
-        tx.commit().await.map_err(other)?;
-        Ok(i64::try_from(dlp + downloads).unwrap_or(i64::MAX))
+        // Batched so a large backlog makes progress within the statement
+        // timeout instead of one huge DELETE that is cancelled every sweep.
+        const BATCH: i64 = 10_000;
+        let mut total: u64 = 0;
+        for table in ["dlp_events", "download_events"] {
+            let sql = format!(
+                "DELETE FROM {table} WHERE ctid IN \
+                 (SELECT ctid FROM {table} WHERE at < $1 LIMIT $2)"
+            );
+            loop {
+                let n = self.execute(&sql, &[&cutoff, &BATCH]).await?;
+                total += n;
+                if n < BATCH as u64 {
+                    break;
+                }
+            }
+        }
+        Ok(i64::try_from(total).unwrap_or(i64::MAX))
     }
 
     async fn record_admin_action(&self, a: AdminAction) -> Result<()> {

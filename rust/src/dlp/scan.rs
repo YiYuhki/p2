@@ -15,9 +15,12 @@ use super::detectors::{
 /// Words marking non-personal registration numbers with the RRN's 6-7 shape.
 static RRN_NEGATIVE: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
     [
-        "사업자",
-        "법인",
-        "차량",
+        "사업자등록",
+        "사업자번호",
+        "법인등록",
+        "법인번호",
+        "차량등록",
+        "차량번호",
         "business reg",
         "corporate reg",
         "company reg",
@@ -28,10 +31,20 @@ static RRN_NEGATIVE: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new
 });
 /// Words that clearly mean a personal RRN / alien registration number.
 static RRN_POSITIVE: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
-    ["주민", "외국인", "rrn", "resident", "alien", "jumin"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    [
+        "주민",
+        "외국인",
+        "rrn",
+        "resident reg",
+        "resident no",
+        "resident id",
+        "alien reg",
+        "alien no",
+        "jumin",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 });
 
 /// Byte ranges of a text.
@@ -1473,6 +1486,24 @@ mod r2_tests {
                 "{h}"
             );
         }
+        // "방법인" is not "법인": a dashed post-2020 RRN (no checksum) counts.
+        assert!(sc
+            .scan_text(
+                "x",
+                &normalize_text("이게 확인 방법인데 200301-3999999 입니다", false)
+            )
+            .iter()
+            .any(|f| f.detector == "kr_rrn"));
+        // "president" is not "resident": no positive keyword is invented.
+        assert!(!sc
+            .scan_text(
+                "x",
+                &normalize_text("president 법인등록번호 110111 4138561", false)
+            )
+            .iter()
+            .any(
+                |f| f.detector == "kr_rrn" && !super::super::detectors::valid_rrn("1101114138561")
+            ));
         // A real RRN next to a business number is still found.
         assert!(sc
             .scan_text(

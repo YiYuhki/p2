@@ -1051,8 +1051,11 @@ fn uu_data_line(t: &[u8]) -> bool {
     if n == 0 || n > 45 {
         return false;
     }
+    // Lenient like client decoders (short lines are padded; MTAs may strip
+    // trailing spaces). Prose is excluded by the character range: lowercase
+    // letters are outside ' '..='`'.
     let want = 1 + n.div_ceil(3) * 4;
-    (want..=want + 2).contains(&t.len()) && t.iter().all(|&b| (b' '..=b'`').contains(&b))
+    (2..=want + 2).contains(&t.len()) && t.iter().all(|&b| (b' '..=b'`').contains(&b))
 }
 
 fn trim_eol(l: &[u8]) -> &[u8] {
@@ -2832,6 +2835,14 @@ mod r3_tests {
         );
         // Malformed runs never panic.
         let _ = crate::mimeproc::decode_utf7(b"+////////+\xff+2D3cAA");
+    }
+
+    #[test]
+    fn short_mode_with_short_data_line_still_uuencode() {
+        let raw = b"From: a@b.c\r\nContent-Type: text/plain\r\n\r\nhi\r\nbegin 7 evil.exe\r\nM3$%&\r\n`\r\nend\r\n";
+        let mut p = parse(raw);
+        let r = extract(&mut p, &Options::default()).unwrap();
+        assert_eq!(r.attachments.len(), 1);
     }
 
     #[test]

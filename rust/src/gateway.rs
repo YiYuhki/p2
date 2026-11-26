@@ -836,13 +836,19 @@ impl Backend {
                     let env2 = env.clone();
                     // The DATA slot and permit move into the task: if it
                     // outlives the wait it still counts against capacity.
+                    // They come back with the result and are held until the
+                    // processed message has been relayed upstream.
                     let guards = (_data_slot, _data_permit);
                     let task = tokio::spawn(async move {
-                        let _guards = guards;
-                        proc.process(&env2, &raw).await
+                        let r = proc.process(&env2, &raw).await;
+                        (r, guards)
                     });
+                    let mut _relay_guards = None;
                     let outcome = match timeout(PROCESS_WAIT, task).await {
-                        Ok(Ok(o)) => o,
+                        Ok(Ok((o, g))) => {
+                            _relay_guards = Some(g);
+                            o
+                        }
                         Ok(Err(_)) => Err(ProcessError::TempFail),
                         Err(_) => {
                             eprintln!(

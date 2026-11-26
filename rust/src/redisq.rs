@@ -321,7 +321,10 @@ impl RedisQueue {
         }
     }
 
-    /// LPUSH on the shared connection, reconnecting once if it dropped.
+    /// LPUSH on the shared connection, reconnecting once if it dropped or
+    /// timed out. After a timeout the first push may have landed, so a job
+    /// can be queued twice; that is harmless (a duplicate analysis yields a
+    /// duplicate verdict, which the store ignores as already decided).
     async fn lpush(&self, key: &str, value: &str) -> redis::RedisResult<()> {
         let mut conn = self.cmd_conn();
         match conn.lpush::<_, _, ()>(key, value).await {
