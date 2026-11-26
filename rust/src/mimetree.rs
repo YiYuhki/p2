@@ -1088,7 +1088,8 @@ fn uu_begin(t: &[u8]) -> Option<String> {
     let r = r.trim_ascii_start();
     let sp = r.iter().position(|&b| b == b' ' || b == b'\t')?;
     let (mode, name) = (&r[..sp], &r[sp + 1..]);
-    // Clients (e.g. Thunderbird) accept any 1+ digit mode.
+    // Lenient decoders (e.g. Python uu) accept short modes; those are only
+    // honoured with a data line and an "end" line (see split_uuencode).
     if !(1..=6).contains(&mode.len()) || !mode.iter().all(|b| (b'0'..=b'7').contains(b)) {
         return None;
     }

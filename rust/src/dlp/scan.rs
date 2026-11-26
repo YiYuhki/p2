@@ -15,20 +15,39 @@ use super::detectors::{
 /// Words marking non-personal registration numbers with the RRN's 6-7 shape.
 static RRN_NEGATIVE: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
     [
-        // Compact forms (whitespace/punctuation removed before matching).
+        // Compact prefixes (whitespace/punctuation removed before matching);
+        // they may run on into the rest of the label ("법인등록번호").
         "사업자등록",
         "사업자번호",
         "법인등록",
         "법인번호",
+        "차량등록",
+        "차량번호",
+        "businessregistration",
+        "businessregno",
+        "corporateregistration",
+        "corporateregno",
+        "corporationregistration",
+        "corporationregno",
+        "corpregistration",
+        "corpregno",
+        "companyregistration",
+        "companyregno",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+});
+/// Complete invoice/registration labels: only count when they end a token
+/// ("법인명:" yes, "법인 명단" no; "Corp. Reg" yes, "Corp.\nRegards" no).
+static RRN_NEGATIVE_LABELS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    [
         "법인명",
         "공급자",
         "공급받는자",
-        "차량등록",
-        "차량번호",
-        "businessreg",
-        "corporatereg",
-        "corporationreg",
         "corpreg",
+        "corporatereg",
+        "businessreg",
         "companyreg",
     ]
     .iter()
@@ -323,13 +342,28 @@ impl Scanner {
                         // the 6-7 shape: near those words (and no RRN keyword)
                         // only a checksum-valid number counts.
                         if d.id == "kr_rrn"
-                            && has_compact_context(src_lower, abs_start, abs_end, &RRN_NEGATIVE, 30)
+                            && (has_compact_context(
+                                src_lower,
+                                abs_start,
+                                abs_end,
+                                &RRN_NEGATIVE,
+                                30,
+                                Edge::Any,
+                            ) || has_compact_context(
+                                src_lower,
+                                abs_start,
+                                abs_end,
+                                &RRN_NEGATIVE_LABELS,
+                                30,
+                                Edge::End,
+                            ))
                             && !has_compact_context(
                                 src_lower,
                                 abs_start,
                                 abs_end,
                                 &RRN_POSITIVE,
                                 SEP_CONTEXT_CHARS,
+                                Edge::Start,
                             )
                             && !super::detectors::valid_rrn(&super::detectors::digits(v))
                         {
@@ -1077,15 +1111,29 @@ fn has_context(lower: &str, start: usize, end: usize, kws: &[String]) -> bool {
 }
 
 /// Whether one of `kws` occurs within `chars` characters of [start,end).
-/// Like [`has_context_chars`] but ignores whitespace and punctuation on both
-/// sides, so "법인 등록번호", "법인(등록)번호" and "Corp. Reg." match the
-/// compact keywords "법인등록", "corpreg".
+/// Which raw-text token boundary a compact keyword match must respect.
+#[derive(Clone, Copy)]
+enum Edge {
+    /// No boundary requirement (prefix keywords).
+    Any,
+    /// The match must end a token (next raw char is not a letter): negative
+    /// labels such as "법인명" must not match "법인 명단".
+    End,
+    /// The match must start a token (previous raw char is not a letter):
+    /// "resident no" must not match inside "President No.".
+    Start,
+}
+
+/// Like [`has_context_chars`] but ignores whitespace and punctuation, so
+/// "법인 등록번호", "법인(등록)번호" and "Corp. Reg." match the compact keywords
+/// "법인등록", "corpreg"; `edge` keeps matches on raw token boundaries.
 fn has_compact_context(
     lower: &str,
     start: usize,
     end: usize,
     kws: &[String],
     chars: usize,
+    edge: Edge,
 ) -> bool {
     let lo = lower[..start]
         .char_indices()
@@ -1099,11 +1147,35 @@ fn has_compact_context(
         .nth(chars)
         .map(|(i, _)| end + i)
         .unwrap_or(lower.len());
-    let win: String = lower[lo..hi]
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .collect();
-    kws.iter().any(|k| win.contains(k.as_str()))
+    let raw: Vec<char> = lower[lo..hi].chars().collect();
+    // Compact text plus, per compact char, its index in `raw`.
+    let mut compact: Vec<char> = Vec::with_capacity(raw.len());
+    let mut at: Vec<usize> = Vec::with_capacity(raw.len());
+    for (ri, &c) in raw.iter().enumerate() {
+        if c.is_alphanumeric() {
+            compact.push(c);
+            at.push(ri);
+        }
+    }
+    kws.iter().any(|k| {
+        let k: Vec<char> = k.chars().collect();
+        if k.is_empty() || k.len() > compact.len() {
+            return false;
+        }
+        (0..=compact.len() - k.len()).any(|ci| {
+            if compact[ci..ci + k.len()] != k[..] {
+                return false;
+            }
+            match edge {
+                Edge::Any => true,
+                Edge::End => !raw
+                    .get(at[ci + k.len() - 1] + 1)
+                    .map(|c| c.is_alphabetic())
+                    .unwrap_or(false),
+                Edge::Start => at[ci] == 0 || !raw[at[ci] - 1].is_alphabetic(),
+            }
+        })
+    })
 }
 
 fn has_context_chars(lower: &str, start: usize, end: usize, kws: &[String], chars: usize) -> bool {
@@ -1540,6 +1612,27 @@ mod r2_tests {
                 "{label}"
             );
         }
+        // Token boundaries: "법인 명단" / "공급 자료" are not labels, and
+        // "President No." is not an RRN keyword.
+        for t in [
+            "법인 명단 홍길동 210315-4123450",
+            "상품 공급 자료 첨부합니다. 자녀 210315-4123450",
+            "Acme Corp. Regards 210315-4123450",
+        ] {
+            assert!(
+                sc.scan_text("x", &normalize_text(t, false))
+                    .iter()
+                    .any(|f| f.detector == "kr_rrn"),
+                "{t}"
+            );
+        }
+        assert!(!sc
+            .scan_text(
+                "x",
+                &normalize_text("법인번호 210315-4123450 President No. 3", false)
+            )
+            .iter()
+            .any(|f| f.detector == "kr_rrn"));
         // "방법인" is not "법인": a dashed post-2020 RRN (no checksum) counts.
         assert!(sc
             .scan_text(
