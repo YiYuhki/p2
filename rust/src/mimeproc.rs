@@ -165,6 +165,11 @@ fn walk(part: &Part, msg_depth: usize, prefix: &str, out: &mut Parsed, uu_budget
     if is_text_like(&mt) {
         let mut body = part.decode_body();
         let mut stripped = false;
+        if mt == "text/plain" && mimetree::has_other_binary_encoding(&body) {
+            out.uninspectable.push(format!(
+                "{prefix}yEnc/BinHex로 인코딩된 파일이 포함되어 검사할 수 없음"
+            ));
+        }
         if mt == "text/plain" {
             // uuencoded files inside the text are attachments to recipients.
             let (rest, blocks, remainder) = mimetree::split_uuencode(&body, *uu_budget);

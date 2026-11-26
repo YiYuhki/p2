@@ -184,6 +184,11 @@ impl Client {
             st.stuff_into(piece, &mut buf);
             self.write_all(&buf).await?;
         }
+        buf.clear();
+        st.finish(&mut buf);
+        if !buf.is_empty() {
+            self.write_all(&buf).await?;
+        }
         let end: &[u8] = if msg.is_empty() || st.ends_crlf() {
             b".\r\n"
         } else {
@@ -357,14 +362,19 @@ pub async fn read_line_limited<R: AsyncBufRead + Unpin>(
 #[cfg(test)]
 fn dot_stuff(msg: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(msg.len() + 64);
-    StuffState::default().stuff_into(msg, &mut out);
+    let mut st = StuffState::default();
+    st.stuff_into(msg, &mut out);
+    st.finish(&mut out);
     out
 }
 
-/// Incremental dot-stuffing (and bare-LF -> CRLF) across chunk boundaries.
+/// Incremental dot-stuffing across chunk boundaries. Bare LF and bare CR
+/// are both normalized to CRLF on the wire, so no "<CR>.<CR><LF>"-style
+/// sequence can reach the upstream unstuffed (SMTP smuggling).
 struct StuffState {
     bol: bool,
-    prev: u8,
+    /// A CR was seen and not yet emitted (waiting to see if LF follows).
+    pending_cr: bool,
     last2: [u8; 2],
 }
 
@@ -372,26 +382,53 @@ impl Default for StuffState {
     fn default() -> Self {
         StuffState {
             bol: true,
-            prev: 0,
+            pending_cr: false,
             last2: [0, 0],
         }
     }
 }
 
 impl StuffState {
+    fn push(&mut self, out: &mut Vec<u8>, b: u8) {
+        out.push(b);
+        self.last2 = [self.last2[1], b];
+    }
+
+    fn eol(&mut self, out: &mut Vec<u8>) {
+        self.push(out, b'\r');
+        self.push(out, b'\n');
+        self.bol = true;
+    }
+
     fn stuff_into(&mut self, msg: &[u8], out: &mut Vec<u8>) {
         for &b in msg {
-            if self.bol && b == b'.' {
-                out.push(b'.');
+            if self.pending_cr {
+                self.pending_cr = false;
+                self.eol(out);
+                if b == b'\n' {
+                    continue; // CRLF
+                }
+                // bare CR: already emitted as CRLF; process b on a new line
             }
-            if b == b'\n' && self.prev != b'\r' {
-                out.push(b'\r');
-                self.last2 = [self.last2[1], b'\r'];
+            match b {
+                b'\r' => self.pending_cr = true,
+                b'\n' => self.eol(out), // bare LF
+                _ => {
+                    if self.bol && b == b'.' {
+                        self.push(out, b'.');
+                    }
+                    self.push(out, b);
+                    self.bol = false;
+                }
             }
-            out.push(b);
-            self.last2 = [self.last2[1], b];
-            self.bol = b == b'\n';
-            self.prev = b;
+        }
+    }
+
+    /// Flushes a trailing CR (at end of message).
+    fn finish(&mut self, out: &mut Vec<u8>) {
+        if self.pending_cr {
+            self.pending_cr = false;
+            self.eol(out);
         }
     }
 
@@ -463,13 +500,14 @@ pub async fn read_data<R: AsyncBufRead + Unpin>(
     read_data_timeout(r, max_bytes, None).await
 }
 
-/// Like [`read_data`], with an idle timeout applied to every read.
 /// Minimum average upload rate (bytes/second) enforced after
 /// [`MIN_RATE_GRACE`], so slow-drip clients cannot hold DATA slots.
-pub const MIN_DATA_RATE: f64 = 256.0;
+pub const MIN_DATA_RATE: f64 = 1024.0;
 /// Time before the minimum rate is enforced.
 pub const MIN_RATE_GRACE: Duration = Duration::from_secs(60);
 
+/// Like [`read_data`], with an idle timeout applied to every read and the
+/// [`MIN_DATA_RATE`] floor.
 pub async fn read_data_timeout<R: AsyncBufRead + Unpin>(
     r: &mut R,
     max_bytes: usize,
@@ -582,6 +620,22 @@ mod tests {
         assert!(String::from_utf8_lossy(&stuffed).contains("..hidden"));
         let back = un_dot_stuff(&stuffed);
         assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn bare_cr_cannot_smuggle_end_of_data() {
+        let msg = b"Subject: x\r\n\r\nhi\r.\r\nMAIL FROM:<ceo@corp>\r\n";
+        let wire = dot_stuff(msg);
+        // The dot after the bare CR is now at the start of a CRLF line and
+        // gets stuffed; no "<CRLF>.<CRLF>" terminator can appear early.
+        assert!(!wire.windows(5).any(|w| w == b"\r\n.\r\n"));
+        assert!(wire.windows(5).any(|w| w == b"\r\n..\r"));
+        assert!(!wire
+            .iter()
+            .enumerate()
+            .any(|(i, &b)| b == b'\r' && wire.get(i + 1) != Some(&b'\n')));
+        // Trailing bare CR is flushed as CRLF.
+        assert_eq!(dot_stuff(b"a\r"), b"a\r\n");
     }
 
     #[test]

@@ -292,9 +292,14 @@ fn fold_header(name: &str, value: &str) -> String {
     for word in value.split(' ').filter(|w| !w.is_empty()) {
         // A single token can't be folded; cap it so the line stays under the
         // RFC 5322 998-octet limit (HELO names and domains are attacker input).
-        let word = match word.char_indices().nth(255) {
-            Some((i, _)) => &word[..i],
-            None => word,
+        let word = if word.len() > 255 {
+            let mut i = 255;
+            while !word.is_char_boundary(i) {
+                i -= 1;
+            }
+            &word[..i]
+        } else {
+            word
         };
         if col + 1 + word.len() > 900 && col > name.len() + 1 {
             out.push_str("\r\n\t");
@@ -389,17 +394,19 @@ fn strip_header_fields(raw: &[u8], drop: impl Fn(&str, &str) -> bool) -> Vec<u8>
     let mut dropped: Vec<(usize, usize)> = Vec::new(); // byte ranges
     for &(a, b) in &fields {
         let (fs, fe) = (lines[a].0, lines[b].2);
-        let first = &raw[lines[a].0..lines[a].1];
-        let Some(c) = first.iter().position(|&x| x == b':') else {
+        // Unfold the whole field first: the colon may sit on a continuation
+        // line ("Name\r\n : value"), which unfold-then-parse readers accept.
+        let mut unfolded: Vec<u8> = Vec::new();
+        for &(ls, le, _) in &lines[a..=b] {
+            unfolded.extend_from_slice(&raw[ls..le]);
+        }
+        let Some(c) = unfolded.iter().position(|&x| x == b':') else {
             continue;
         };
-        let name = String::from_utf8_lossy(&first[..c])
+        let name = String::from_utf8_lossy(&unfolded[..c])
             .trim()
             .to_ascii_lowercase();
-        let mut value: Vec<u8> = first[c + 1..].to_vec();
-        for &(ls, le, _) in &lines[a + 1..=b] {
-            value.extend_from_slice(&raw[ls..le]);
-        }
+        let value: Vec<u8> = unfolded[c + 1..].to_vec();
         if drop(&name, String::from_utf8_lossy(&value).trim()) {
             dropped.push((fs, fe));
         }
@@ -876,6 +883,16 @@ mod r2_tests {
 #[cfg(test)]
 mod r3_tests {
     use super::*;
+
+    #[test]
+    fn forged_header_with_colon_on_continuation_is_stripped() {
+        let raw = b"Authentication-Results\r\n : gw.corp.test; dmarc=pass\r\nX-SecMail-Processed\r\n : x\r\nSubject: hi\r\n\r\nbody\r\n";
+        let out = strip_header_fields(raw, |name, value| {
+            name.starts_with("x-secmail-")
+                || (name == "authentication-results" && auth_results_id(value) == "gw.corp.test")
+        });
+        assert_eq!(out, b"Subject: hi\r\n\r\nbody\r\n");
+    }
     use crate::dns::Static;
     use std::time::Duration;
 

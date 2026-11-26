@@ -605,6 +605,17 @@ impl Part {
                         seen.push(k);
                     }
                 }
+                // RFC 2231: `name` together with `name*` / `name*N[*]` is
+                // ambiguous (clients prefer the starred form; this parser and
+                // mailparse may use the plain one).
+                let plain: Vec<&str> = seen.iter().copied().filter(|k| !k.contains('*')).collect();
+                if seen.iter().any(|k| {
+                    k.split_once('*')
+                        .map(|(base, _)| plain.contains(&base))
+                        .unwrap_or(false)
+                }) {
+                    return true;
+                }
             }
         }
         false
@@ -888,12 +899,24 @@ fn trim_eol(l: &[u8]) -> &[u8] {
 
 /// "begin 644 name" → name. Lenient like the decoders clients use: leading
 /// whitespace and an octal mode of three to six digits are accepted.
+/// Embedded binary encodings other than uuencode that mail clients render as
+/// attachments (yEnc, BinHex 4.0). Not decoded here: a text part carrying one
+/// is extracted whole.
+pub(crate) fn has_other_binary_encoding(data: &[u8]) -> bool {
+    data.split(|&b| b == b'\n').any(|line| {
+        let t = line.trim_ascii_start();
+        (t.starts_with(b"=ybegin ") && t.windows(5).any(|w| w == b"name="))
+            || t.starts_with(b"(This file must be converted with BinHex")
+    })
+}
+
 fn uu_begin(t: &[u8]) -> Option<String> {
     let r = t.trim_ascii_start().strip_prefix(b"begin ")?;
     let r = r.trim_ascii_start();
     let sp = r.iter().position(|&b| b == b' ' || b == b'\t')?;
     let (mode, name) = (&r[..sp], &r[sp + 1..]);
-    if !(3..=6).contains(&mode.len()) || !mode.iter().all(|b| (b'0'..=b'7').contains(b)) {
+    // Clients (e.g. Thunderbird) accept any 1+ digit mode.
+    if !(1..=6).contains(&mode.len()) || !mode.iter().all(|b| (b'0'..=b'7').contains(b)) {
         return None;
     }
     let name = String::from_utf8_lossy(name).trim().to_string();
@@ -1089,7 +1112,11 @@ fn any_blocked_name(p: &Part, blocked: &dyn Fn(&str) -> bool) -> bool {
         return true;
     }
     if !p.is_multipart() && p.opaque.is_none() && p.media_type().0 == "text/plain" {
-        let (_, blocks, rest) = split_uuencode(&p.decode_body(), MAX_PARTS);
+        let body = p.decode_body();
+        if has_other_binary_encoding(&body) {
+            return true;
+        }
+        let (_, blocks, rest) = split_uuencode(&body, MAX_PARTS);
         if rest.is_some()
             || blocks.iter().any(|b| {
                 let n = crate::mimeproc::sanitize_filename(&b.name);
@@ -1319,6 +1346,14 @@ fn extract_uuencoded(p: &mut Part, ctx: &mut Ctx) -> bool {
         return false;
     }
     let data = p.decode_body();
+    if has_other_binary_encoding(&data) {
+        // yEnc / BinHex: move the whole text out as one opaque attachment.
+        ctx.budget = ctx.budget.saturating_sub(1);
+        ctx.push_raw(data);
+        p.set_header("Content-Transfer-Encoding", "7bit");
+        p.body = Vec::new();
+        return true;
+    }
     let max = ctx.budget.min(MAX_ATTACHMENTS);
     let (rest, blocks, remainder) = split_uuencode(&data, max);
     if blocks.is_empty() && remainder.is_none() {
@@ -2634,6 +2669,36 @@ mod r3_tests {
         );
         // Malformed runs never panic.
         let _ = crate::mimeproc::decode_utf7(b"+////////+\xff+2D3cAA");
+    }
+
+    #[test]
+    fn short_mode_uuencode_and_yenc_binhex_extracted() {
+        let opts = Options::default();
+        for body in [
+            "hi\r\nbegin 7 evil.exe\r\n#35H*\r\n`\r\nend\r\n",
+            "hi\r\n=ybegin line=128 size=2 name=evil.exe\r\nxx\r\n=yend size=2\r\n",
+            "(This file must be converted with BinHex 4.0)\r\n:abc:\r\n",
+        ] {
+            let raw = format!("From: a@b.c\r\nContent-Type: text/plain\r\n\r\n{body}");
+            let mut p = parse(raw.as_bytes());
+            let r = extract(&mut p, &opts).unwrap();
+            assert_eq!(r.attachments.len(), 1, "{body:?}");
+            assert!(
+                !String::from_utf8_lossy(&p.to_bytes()).contains("evil.exe")
+                    || body.starts_with("(This")
+            );
+        }
+    }
+
+    #[test]
+    fn rfc2231_plain_and_starred_param_is_ambiguous() {
+        let img = b"Content-Type: image/png; name=logo.png; name*=utf-8''evil.exe\r\nContent-ID: <x>\r\n\r\niVBORw0K\r\n";
+        assert_eq!(parse(img).opaque(), Some(Opaque::Ambiguous));
+        let cd = b"Content-Type: application/pgp-signature\r\nContent-Disposition: inline; filename=s.asc; filename*0*=utf-8''run.bat\r\n\r\nx\r\n";
+        assert_eq!(parse(cd).opaque(), Some(Opaque::Ambiguous));
+        // Continuations alone are fine.
+        let ok = b"Content-Type: application/pdf; name*0=a; name*1=b.pdf\r\n\r\nx\r\n";
+        assert_eq!(parse(ok).opaque(), None);
     }
 
     #[test]

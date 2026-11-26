@@ -111,6 +111,20 @@ pub fn valid_rrn(v: &str) -> bool {
     rrn_checksum(&d)
 }
 
+/// Date + gender-digit shape of an RRN without the checksum (RRNs issued
+/// since 2020 carry none). Used only when an RRN keyword is nearby.
+pub fn valid_rrn_shape(v: &str) -> bool {
+    let d = digits(v);
+    if d.len() != 13 {
+        return false;
+    }
+    let mut dashed = String::with_capacity(14);
+    dashed.push_str(&d[..6]);
+    dashed.push('-');
+    dashed.push_str(&d[6..]);
+    valid_rrn(&dashed)
+}
+
 fn rrn_checksum(d: &str) -> bool {
     let w = [2, 3, 4, 5, 6, 7, 8, 9, 2, 3, 4, 5];
     let mut sum = 0;
@@ -365,7 +379,18 @@ pub fn builtin() -> Vec<Detector> {
             hints_fold: vec![],
             back: 0,
             ahead: 0,
-            sep_context: sv(&["주민", "생년월일", "rrn", "resident registration", "jumin"]),
+            sep_context: sv(&[
+                "주민",
+                "생년월일",
+                "외국인",
+                "등록번호",
+                "rrn",
+                "resident registration",
+                "resident no",
+                "alien registration",
+                "alien no",
+                "jumin",
+            ]),
         },
         Detector {
             id: "credit_card".into(),

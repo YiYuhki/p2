@@ -46,6 +46,8 @@ pub const DEFAULT_DATA_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub const DEFAULT_MAX_DATA_PER_IP: usize = 8;
 /// How long DATA waits for a free slot before answering 451.
 const DATA_SLOT_WAIT: Duration = Duration::from_secs(30);
+/// How long a session waits for message processing before deferring.
+const PROCESS_WAIT: Duration = Duration::from_secs(5 * 60);
 /// Protocol errors tolerated before the session is dropped.
 const MAX_ERRORS: u32 = 20;
 
@@ -825,10 +827,25 @@ impl Backend {
                         helo: helo.clone(),
                         tls: tls_on,
                     };
-                    // Not cancelled midway: a hold or records may already be
-                    // committed, and a client retry would duplicate them.
-                    let outcome = self.proc.process(&env, &raw).await;
-                    drop(raw);
+                    // Runs in its own task so it is never cancelled midway (a
+                    // hold or records may already be committed). The session
+                    // waits a bounded time so a hung dependency cannot pin
+                    // DATA slots forever; past that the client gets 451 while
+                    // the task finishes on its own.
+                    let proc = self.proc.clone();
+                    let env2 = env.clone();
+                    let task = tokio::spawn(async move { proc.process(&env2, &raw).await });
+                    let outcome = match timeout(PROCESS_WAIT, task).await {
+                        Ok(Ok(o)) => o,
+                        Ok(Err(_)) => Err(ProcessError::TempFail),
+                        Err(_) => {
+                            eprintln!(
+                                "smtp {}: message processing exceeded {:?}; deferring client",
+                                self.opts.name, PROCESS_WAIT
+                            );
+                            Err(ProcessError::TempFail)
+                        }
+                    };
                     match outcome {
                         Ok(out) => {
                             let res = match txn.up.as_mut() {

@@ -231,6 +231,11 @@ impl Scanner {
             }
             let mut seen: HashSet<String> = HashSet::new();
             let mut samples: Vec<String> = Vec::new();
+            // Strict detectors: checksum-valid matches that only lacked a
+            // nearby keyword. Counted once another match in the same text is
+            // confirmed (a table under one "주민등록번호" header).
+            let mut pending: Vec<(String, String)> = Vec::new();
+            let mut pending_keys: HashSet<String> = HashSet::new();
             for (si, (src, src_lower, windows)) in sources.into_iter().enumerate() {
                 for (ws, we) in windows {
                     let seg = &src[ws..we];
@@ -250,25 +255,33 @@ impl Scanner {
                         if seen.contains(&key) {
                             continue;
                         }
+                        let needs_kw = strict
+                            && !v.contains('-')
+                            && (si > 0 || v.bytes().any(|c| !c.is_ascii_digit()));
+                        let kw = needs_kw
+                            && has_context_chars(
+                                src_lower,
+                                abs_start,
+                                abs_end,
+                                &d.sep_context,
+                                SEP_CONTEXT_CHARS,
+                            );
                         if let Some(validate) = d.validate {
-                            if !validate(v) {
+                            // With an RRN keyword right there, the checksum-
+                            // less shape (post-2020 numbers) is enough.
+                            let relaxed =
+                                kw && d.id == "kr_rrn" && super::detectors::valid_rrn_shape(v);
+                            if !validate(v) && !relaxed {
                                 continue;
                             }
                         }
                         // Not in its canonical dashed form: a non-dash
                         // separator, or only seen once separators were
                         // collapsed — require a keyword close by.
-                        if strict
-                            && !v.contains('-')
-                            && (si > 0 || v.bytes().any(|c| !c.is_ascii_digit()))
-                            && !has_context_chars(
-                                src_lower,
-                                abs_start,
-                                abs_end,
-                                &d.sep_context,
-                                SEP_CONTEXT_CHARS,
-                            )
-                        {
+                        if needs_kw && !kw {
+                            if pending.len() < 10_000 && pending_keys.insert(key.clone()) {
+                                pending.push((key, (d.mask)(v)));
+                            }
                             continue;
                         }
                         if !d.context.is_empty()
@@ -281,6 +294,13 @@ impl Scanner {
                         if samples.len() < 3 {
                             samples.push((d.mask)(v));
                         }
+                    }
+                }
+            }
+            if !seen.is_empty() {
+                for (k, masked) in pending {
+                    if seen.insert(k) && samples.len() < 3 {
+                        samples.push(masked);
                     }
                 }
             }
@@ -1366,6 +1386,58 @@ mod r2_tests {
     /// checksum, and any other separator needs the checksum plus an RRN
     /// keyword nearby.
     #[test]
+    fn rrn_keywords_tables_and_post_2020() {
+        fn with_checksum(first12: &str) -> String {
+            let w = [2, 3, 4, 5, 6, 7, 8, 9, 2, 3, 4, 5];
+            let sum: u32 = first12
+                .bytes()
+                .zip(w)
+                .map(|(b, m)| (b - b'0') as u32 * m)
+                .sum();
+            format!("{first12}{}", (11 - sum % 11) % 10)
+        }
+        let sc = s();
+        let count = |t: &str| {
+            sc.scan_text("x", &normalize_text(t, false))
+                .iter()
+                .find(|f| f.detector == "kr_rrn")
+                .map(|f| f.count)
+                .unwrap_or(0)
+        };
+        // Foreigner keyword.
+        let fr = with_checksum("900101523456");
+        assert_eq!(
+            count(&format!("외국인등록번호: {} {}", &fr[..6], &fr[6..])),
+            1
+        );
+        // A 50-row table under one header counts every row.
+        let mut t = String::from(
+            "성명	주민등록번호
+",
+        );
+        for i in 0..50 {
+            let n = with_checksum(&format!(
+                "8{:01}0{}0{}1{:05}",
+                i % 10,
+                1 + i % 9,
+                1 + i % 2,
+                i
+            ));
+            t.push_str(&format!(
+                "홍길동{i}	{} {}
+",
+                &n[..6],
+                &n[6..]
+            ));
+        }
+        assert_eq!(count(&t), 50);
+        // Post-2020 number (no checksum) with the keyword nearby.
+        assert_eq!(count("주민번호 200301 3999999"), 1);
+        // ...but not without it.
+        assert_eq!(count("주문 200301 3999999"), 0);
+    }
+
+    #[test]
     fn rrn_false_positive_corpus() {
         let sc = s();
         let mut rng = Rng(0x1234567);
@@ -1457,7 +1529,10 @@ mod r2_tests {
                 rrn(&format!("Resident Registration No 900101{sep}1234568")),
                 "{sep:?}"
             );
-            assert!(!rrn(&format!("주민번호: 900101{sep}1234567")), "{sep:?}");
+            // With the keyword right there, the checksum-less shape counts
+            // (RRNs issued since 2020 carry no checksum).
+            assert!(rrn(&format!("주민번호: 900101{sep}1234567")), "{sep:?}");
+            assert!(!rrn(&format!("주문번호: 900101{sep}1234567")), "{sep:?}");
             assert!(!rrn(&format!("주문번호: 900101{sep}1234568")), "{sep:?}");
         }
         assert!(rrn("JUMIN 900101 1234568"));

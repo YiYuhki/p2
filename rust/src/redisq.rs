@@ -53,6 +53,15 @@ const HEARTBEAT_EVERY: Duration = Duration::from_secs(10);
 const RECOVER_EVERY: Duration = Duration::from_secs(60);
 
 /// Redis-backed [`Queue`] plus the job / verdict consumers.
+/// Command-connection settings: a half-open socket must fail fast rather than
+/// hang callers (enqueue runs inside SMTP DATA processing). Blocking
+/// BLMOVE/BRPOP use their own connections without a response timeout.
+fn cmd_conn_config() -> redis::AsyncConnectionConfig {
+    redis::AsyncConnectionConfig::new()
+        .set_connection_timeout(Duration::from_secs(5))
+        .set_response_timeout(Duration::from_secs(5))
+}
+
 pub struct RedisQueue {
     client: redis::Client,
     /// Shared connection for non-blocking commands (LPUSH etc.). Replaced
@@ -73,7 +82,7 @@ impl RedisQueue {
     pub async fn connect(url: &str, prefix: &str) -> Result<Self, String> {
         let client = redis::Client::open(url).map_err(|e| format!("redis: open {url}: {e}"))?;
         let conn = client
-            .get_multiplexed_async_connection()
+            .get_multiplexed_async_connection_with_config(&cmd_conn_config())
             .await
             .map_err(|e| format!("redis: connect: {e}"))?;
         let prefix = if prefix.is_empty() {
@@ -137,6 +146,8 @@ impl RedisQueue {
     /// Registers this consumer and (re)arms its heartbeat key, reconnecting
     /// the command connection once if it dropped.
     async fn heartbeat(&self) -> redis::RedisResult<()> {
+        // Stamp before sending: the server TTL starts no earlier than this.
+        let sent = tokio::time::Instant::now();
         let r = match self.heartbeat_once().await {
             Err(_) => {
                 self.reconnect_cmd().await;
@@ -145,7 +156,7 @@ impl RedisQueue {
             ok => ok,
         };
         if r.is_ok() {
-            *self.last_beat.lock().unwrap() = Some(tokio::time::Instant::now());
+            *self.last_beat.lock().unwrap() = Some(sent);
         }
         r
     }
@@ -300,7 +311,11 @@ impl RedisQueue {
 
     /// Re-establishes the shared command connection after it dropped.
     async fn reconnect_cmd(&self) {
-        match self.client.get_multiplexed_async_connection().await {
+        match self
+            .client
+            .get_multiplexed_async_connection_with_config(&cmd_conn_config())
+            .await
+        {
             Ok(c) => *self.conn.lock().unwrap() = c,
             Err(e) => eprintln!("redisq: reconnect failed: {e}"),
         }
