@@ -257,6 +257,15 @@ func (s *Service) createHold(ctx context.Context, env gateway.Envelope, subject 
 	return h, s.opts.PublicBaseURL + "/dlp/" + tok, nil
 }
 
+// RelayUnknown is the reason recorded on a RELEASED hold whose relay may or
+// may not have been accepted by the next hop.
+const RelayUnknown = "relay result unknown"
+
+// holdReasonSetter is implemented by stores that can annotate a decided hold.
+type holdReasonSetter interface {
+	SetHoldReason(ctx context.Context, id, reason string) error
+}
+
 // ErrNotHeld is returned when a hold was already decided (wraps store.ErrConflict).
 var ErrNotHeld = fmt.Errorf("hold is no longer pending: %w", store.ErrConflict)
 
@@ -287,6 +296,19 @@ func (s *Service) Release(ctx context.Context, id, by string) error {
 	raw, err := s.load(ctx, h)
 	if err == nil {
 		err = s.relay(h.MailFrom, h.RcptTo, raw)
+	}
+	if err != nil && smtpclient.IsResultUnknown(err) {
+		// The next hop may already have accepted the message: never reopen
+		// (a second release would deliver it twice). Keep it RELEASED, flag
+		// it and keep the stored copy for manual follow-up.
+		s.log.Error("relay result unknown for released hold", "hold", id, "err", err)
+		if rs, ok := s.store.(holdReasonSetter); ok {
+			if rerr := rs.SetHoldReason(context.WithoutCancel(ctx), id, RelayUnknown); rerr != nil {
+				s.log.Error("flag hold relay result unknown", "hold", id, "err", rerr)
+			}
+		}
+		metrics.Holds.WithLabelValues("relay_unknown").Inc()
+		return fmt.Errorf("relay held message: %s: %w", RelayUnknown, err)
 	}
 	if err != nil {
 		if rerr := s.store.ReopenHold(ctx, id); rerr != nil {

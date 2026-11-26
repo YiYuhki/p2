@@ -454,7 +454,13 @@ func ParsePrefixes(list []string) ([]netip.Prefix, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, p.Masked())
+		p = p.Masked()
+		// Peers are compared unmapped, so an IPv4-mapped network
+		// (::ffff:a.b.c.d/96+n) is stored as the IPv4 network a.b.c.d/n.
+		if p.Addr().Is4In6() && p.Bits() >= 96 {
+			p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96).Masked()
+		}
+		out = append(out, p)
 	}
 	return out, nil
 }

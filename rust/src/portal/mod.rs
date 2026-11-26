@@ -54,8 +54,8 @@ mod tests;
 
 pub use admin::csv_safe;
 pub use auth::{
-    code_message, normalize_email, sign_session, valid_email, verify_session, CodeStore, Mailer,
-    MemoryCodes, NoopMailer, RecordingMailer, SESSION_COOKIE,
+    code_message, normalize_email, sign_session, valid_email, verify_session, CodeCheck, CodeStore,
+    Mailer, MemoryCodes, NoopMailer, RecordingMailer, SESSION_COOKIE,
 };
 pub use dlp::{truncate, HoldReviewer, StoreHoldReviewer};
 pub use html::html_escape;
@@ -1002,14 +1002,22 @@ async fn download(State(st): State<Portal>, Path(token): Path<String>, req: Requ
     st.metrics.portal_requests.with_label_values(&["ok"]).inc();
 
     let attachment_id = a.id.clone();
-    let rest = rest.inspect(move |c| {
+    let expected = u64::try_from(a.size).ok();
+    let body = futures_util::stream::iter(first).chain(rest);
+    let body = exact_length(body, expected).inspect(move |c| {
         if let Err(e) = c {
             eprintln!("portal: download aborted attachment={attachment_id}: {e}");
         }
     });
-    let body = futures_util::stream::iter(first).chain(rest);
     let mut resp = Response::new(Body::from_stream(body));
     let h = resp.headers_mut();
+    // The plaintext size is known: declare it so a body that ends early (a
+    // decrypt / read error mid-stream) is a visible framing error for every
+    // client, including HTTP/1.0 ones (nginx's default upstream protocol)
+    // where a close-delimited body would otherwise look complete.
+    if let Some(n) = expected {
+        h.insert(header::CONTENT_LENGTH, HeaderValue::from(n));
+    }
     h.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
@@ -1069,6 +1077,48 @@ async fn logout(State(st): State<Portal>, Path(token): Path<String>, req: Reques
     let mut resp = redirect(&base);
     auth::clear_session(&st, &mut resp);
     resp
+}
+
+/// Passes `s` through, but fails the stream unless it yields exactly
+/// `expected` bytes (when known): a short or overlong object is an error that
+/// aborts the response rather than a "complete" transfer of the wrong file.
+pub(crate) fn exact_length<S>(
+    s: S,
+    expected: Option<u64>,
+) -> impl futures_util::Stream<Item = std::io::Result<axum::body::Bytes>> + Send
+where
+    S: futures_util::Stream<Item = std::io::Result<axum::body::Bytes>> + Send + Unpin,
+{
+    futures_util::stream::unfold((s, 0u64, false), move |(mut s, seen, done)| async move {
+        if done {
+            return None;
+        }
+        let Some(want) = expected else {
+            return s.next().await.map(|c| (c, (s, seen, false)));
+        };
+        match s.next().await {
+            Some(Ok(c)) => {
+                let seen = seen + c.len() as u64;
+                if seen > want {
+                    let e = std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("object longer than its recorded size {want}"),
+                    );
+                    return Some((Err(e), (s, seen, true)));
+                }
+                Some((Ok(c), (s, seen, false)))
+            }
+            Some(Err(e)) => Some((Err(e), (s, seen, true))),
+            None if seen != want => {
+                let e = std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("object ended after {seen} of {want} bytes"),
+                );
+                Some((Err(e), (s, seen, true)))
+            }
+            None => None,
+        }
+    })
 }
 
 /// Builds an "attachment" Content-Disposition that is always a safe bare

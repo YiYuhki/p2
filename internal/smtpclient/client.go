@@ -54,14 +54,36 @@ func Dial(o Options) (*smtp.Client, error) {
 	return c, nil
 }
 
-// Send delivers one message and closes the connection.
+// ResultUnknownError reports a failure after the whole message, including
+// the terminating ".", may have reached the server, without a definite SMTP
+// reply: the server may or may not have accepted (and will deliver) it, so
+// the caller must not simply retry.
+type ResultUnknownError struct{ Err error }
+
+func (e *ResultUnknownError) Error() string {
+	return "smtp: delivery result unknown: " + e.Err.Error()
+}
+
+func (e *ResultUnknownError) Unwrap() error { return e.Err }
+
+// IsResultUnknown reports whether err (or an error it wraps) is a
+// *ResultUnknownError.
+func IsResultUnknown(err error) bool {
+	var u *ResultUnknownError
+	return errors.As(err, &u)
+}
+
+// Send delivers one message and closes the connection. A transport failure
+// after the message body was handed over (while finishing DATA or waiting
+// for the final reply) is returned as a *ResultUnknownError; every other
+// error means the message was not accepted.
 func Send(o Options, from string, to []string, msg []byte) error {
 	c, err := Dial(o)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
-	if err := c.SendMail(from, to, bytes.NewReader(msg)); err != nil {
+	if err := sendMail(c, from, to, msg); err != nil {
 		return err
 	}
 	// The server accepted the message once DATA got its 250: a failing QUIT
@@ -69,6 +91,58 @@ func Send(o Options, from string, to []string, msg []byte) error {
 	// (e.g. reopen a released hold) and send it twice.
 	_ = c.Quit()
 	return nil
+}
+
+// sendMail is smtp.Client.SendMail with failures classified by whether the
+// server could have accepted the message.
+func sendMail(c *smtp.Client, from string, to []string, msg []byte) error {
+	var opts *smtp.MailOptions
+	if !isASCII(from) || !allASCII(to) {
+		opts = &smtp.MailOptions{UTF8: true}
+	}
+	if err := c.Mail(from, opts); err != nil {
+		return err
+	}
+	for _, addr := range to {
+		if err := c.Rcpt(addr, nil); err != nil {
+			return err
+		}
+	}
+	w, err := c.Data()
+	if err != nil {
+		return err
+	}
+	// Until Close sends the terminating "." the server cannot accept the
+	// message, so a write error here is a definite failure.
+	if _, err := io.Copy(w, bytes.NewReader(msg)); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		var se *smtp.SMTPError
+		if errors.As(err, &se) {
+			return err // a definite reply: not accepted
+		}
+		return &ResultUnknownError{Err: err}
+	}
+	return nil
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] > 127 {
+			return false
+		}
+	}
+	return true
+}
+
+func allASCII(ss []string) bool {
+	for _, s := range ss {
+		if !isASCII(s) {
+			return false
+		}
+	}
+	return true
 }
 
 // startTLS performs the plaintext EHLO/STARTTLS exchange itself because

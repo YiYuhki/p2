@@ -7,6 +7,22 @@ import (
 	"testing"
 )
 
+func TestParsePrefixesUnmapsIPv4Mapped(t *testing.T) {
+	got, err := ParsePrefixes([]string{"::ffff:10.1.2.3/120", "::ffff:192.0.2.7/128", "::ffff:198.51.100.9", "10.0.0.0/8", "2001:db8::/32", "::ffff:0:0/95"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"10.1.2.0/24", "192.0.2.7/32", "198.51.100.9/32", "10.0.0.0/8", "2001:db8::/32", "::fffe:0:0/95"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v", got)
+	}
+	for i := range want {
+		if got[i].String() != want[i] {
+			t.Errorf("%d: got %s, want %s", i, got[i], want[i])
+		}
+	}
+}
+
 func TestExampleConfigLoads(t *testing.T) {
 	t.Setenv("SECMAIL_INTERNAL_TOKEN", "0123456789abcdef0123")
 	t.Setenv("SECMAIL_SESSION_SECRET", strings.Repeat("s", 32))

@@ -7,7 +7,17 @@
 //! <prefix>:jobs:normal   LIST  retries / rescans
 //! <prefix>:results       LIST  verdicts pushed by the analyzer (LPUSH)
 //! <prefix>:results:dead  LIST  undecodable / permanently-failed verdicts
+//! <prefix>:results:consumers          SET     ids of verdict consumers
+//! <prefix>:results:processing:<id>    LIST    verdicts consumer <id> is handling
+//! <prefix>:results:alive:<id>         STRING  consumer <id>'s heartbeat (TTL)
 //! ```
+//!
+//! Every verdict consumer (one per process) has its own processing list and
+//! keeps a heartbeat key alive while it runs. Recovery (at startup and then
+//! periodically) only re-queues the processing lists of consumers whose
+//! heartbeat has expired, never the in-flight verdicts of live replicas. The
+//! pre-heartbeat shared `<prefix>:results:processing` list is drained once on
+//! startup (upgrade path).
 //!
 //! A consumer that runs `BRPOP <prefix>:jobs:high <prefix>:jobs:normal <t>`
 //! automatically drains high priority first.
@@ -34,6 +44,13 @@ const DEFAULT_PREFIX: &str = "secmail";
 const BRPOP_TIMEOUT_SECS: f64 = 1.0;
 /// Pause after a Redis error before retrying.
 const ERROR_BACKOFF: Duration = Duration::from_secs(2);
+/// Lifetime of a consumer's heartbeat key; a consumer silent for this long is
+/// presumed dead and its processing list is re-queued.
+const HEARTBEAT_TTL_SECS: u64 = 30;
+/// How often a running consumer refreshes its heartbeat.
+const HEARTBEAT_EVERY: Duration = Duration::from_secs(10);
+/// How often a running consumer looks for dead consumers' processing lists.
+const RECOVER_EVERY: Duration = Duration::from_secs(60);
 
 /// Redis-backed [`Queue`] plus the job / verdict consumers.
 pub struct RedisQueue {
@@ -42,6 +59,8 @@ pub struct RedisQueue {
     /// after the underlying socket drops.
     conn: Mutex<MultiplexedConnection>,
     prefix: String,
+    /// This process's verdict-consumer id (names its processing list).
+    consumer_id: String,
 }
 
 impl RedisQueue {
@@ -62,7 +81,13 @@ impl RedisQueue {
             client,
             conn: Mutex::new(conn),
             prefix: prefix.to_string(),
+            consumer_id: uuid::Uuid::new_v4().to_string(),
         })
+    }
+
+    /// This process's verdict-consumer id.
+    pub fn consumer_id(&self) -> &str {
+        &self.consumer_id
     }
 
     pub fn prefix(&self) -> &str {
@@ -84,33 +109,129 @@ impl RedisQueue {
         format!("{}:results:dead", self.prefix)
     }
 
-    /// Verdicts taken by a consumer but not yet fully handled. A verdict is
+    /// Verdicts taken by this consumer but not yet fully handled. A verdict is
     /// moved here atomically (BLMOVE) and removed once applied or
     /// dead-lettered, so a crash mid-handling does not lose it.
     pub fn processing_key(&self) -> String {
+        self.processing_key_for(&self.consumer_id)
+    }
+
+    fn processing_key_for(&self, id: &str) -> String {
+        format!("{}:results:processing:{id}", self.prefix)
+    }
+
+    /// The shared processing list used before per-consumer lists existed.
+    fn legacy_processing_key(&self) -> String {
         format!("{}:results:processing", self.prefix)
     }
 
-    /// Moves verdicts left in the processing list (by a consumer that died
-    /// mid-handling) back to the consuming end of the results list, oldest
-    /// first. Applying a verdict twice is harmless (duplicates are ignored).
-    pub async fn recover_results(&self) -> redis::RedisResult<usize> {
+    /// Set of registered verdict-consumer ids.
+    pub fn consumers_key(&self) -> String {
+        format!("{}:results:consumers", self.prefix)
+    }
+
+    fn heartbeat_key_for(&self, id: &str) -> String {
+        format!("{}:results:alive:{id}", self.prefix)
+    }
+
+    /// Registers this consumer and (re)arms its heartbeat key.
+    async fn heartbeat(&self) -> redis::RedisResult<()> {
         let mut conn = self.cmd_conn();
-        let (src, dst) = (self.processing_key(), self.results_key());
+        redis::pipe()
+            .atomic()
+            .sadd(self.consumers_key(), &self.consumer_id)
+            .ignore()
+            .set_ex(
+                self.heartbeat_key_for(&self.consumer_id),
+                1,
+                HEARTBEAT_TTL_SECS,
+            )
+            .ignore()
+            .query_async::<()>(&mut conn)
+            .await
+    }
+
+    /// Drops the heartbeat on a clean shutdown. The consumer stays registered
+    /// when its processing list is not empty (a failed ack), so the next
+    /// recovery re-queues what is left.
+    async fn deregister(&self) {
+        let mut conn = self.cmd_conn();
+        let hb = self.heartbeat_key_for(&self.consumer_id);
+        if let Err(e) = conn.del::<_, ()>(&hb).await {
+            eprintln!("redisq: results: drop heartbeat: {e}");
+            return;
+        }
+        match conn.llen::<_, usize>(self.processing_key()).await {
+            Ok(0) => {
+                let _ = conn
+                    .srem::<_, _, ()>(self.consumers_key(), &self.consumer_id)
+                    .await;
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("redisq: results: deregister: {e}"),
+        }
+    }
+
+    /// Moves every entry of `src` back to the consuming end of the results
+    /// list, oldest first.
+    async fn drain(
+        &self,
+        conn: &mut MultiplexedConnection,
+        src: &str,
+    ) -> redis::RedisResult<usize> {
+        let dst = self.results_key();
         let mut n = 0;
         loop {
             let moved: Option<String> = redis::cmd("LMOVE")
-                .arg(&src)
+                .arg(src)
                 .arg(&dst)
                 .arg("LEFT")
                 .arg("RIGHT")
-                .query_async(&mut conn)
+                .query_async(conn)
                 .await?;
             if moved.is_none() {
                 return Ok(n);
             }
             n += 1;
         }
+    }
+
+    /// Re-queues verdicts left in the processing lists of consumers that died
+    /// mid-handling (their heartbeat expired), oldest first. Live consumers'
+    /// lists, including other replicas' in-flight verdicts, are left alone.
+    /// Applying a verdict twice is harmless (duplicates are ignored).
+    async fn recover_dead(&self) -> redis::RedisResult<usize> {
+        let mut conn = self.cmd_conn();
+        let ids: Vec<String> = conn.smembers(self.consumers_key()).await?;
+        let mut n = 0;
+        for id in ids {
+            if id == self.consumer_id {
+                continue;
+            }
+            let alive: bool = conn.exists(self.heartbeat_key_for(&id)).await?;
+            if alive {
+                continue;
+            }
+            let src = self.processing_key_for(&id);
+            n += self.drain(&mut conn, &src).await?;
+            // Forget the consumer once its list is empty. Should it turn out
+            // to be alive after all, its next heartbeat registers it again.
+            let left: usize = conn.llen(&src).await?;
+            if left == 0 {
+                conn.srem::<_, _, ()>(self.consumers_key(), &id).await?;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Startup recovery: registers this consumer, drains the legacy shared
+    /// processing list and re-queues dead consumers' processing lists.
+    pub async fn recover_results(&self) -> redis::RedisResult<usize> {
+        self.heartbeat().await?;
+        let mut conn = self.cmd_conn();
+        let legacy = self.legacy_processing_key();
+        let n = self.drain(&mut conn, &legacy).await?;
+        Ok(n + self.recover_dead().await?)
     }
 
     /// Removes a handled verdict from the processing list.
@@ -199,9 +320,10 @@ impl RedisQueue {
 
     /// Consumes verdicts until `shutdown` turns true (or its sender drops),
     /// applying each with retry; undecodable and permanently-failed verdicts
-    /// are pushed to `<prefix>:results:dead`. Each verdict is moved to
-    /// `<prefix>:results:processing` while it is handled and removed after,
-    /// and verdicts found there at startup are re-queued first.
+    /// are pushed to `<prefix>:results:dead`. Each verdict is moved to this
+    /// consumer's `<prefix>:results:processing:<id>` list while it is handled
+    /// and removed after; the processing lists of dead consumers (expired
+    /// heartbeat) are re-queued at startup and periodically after.
     pub async fn consume_results<H: ResultHandler>(
         &self,
         handler: &H,
@@ -212,20 +334,49 @@ impl RedisQueue {
             Ok(n) => eprintln!("redisq: results: recovered {n} unacknowledged verdict(s)"),
             Err(e) => eprintln!("redisq: results: recovery failed: {e}"),
         }
-        let mut blocking = None;
-        while !stopping(&shutdown) {
-            let payload = match self.take_result(&mut blocking).await {
-                Ok(Some(payload)) => payload,
-                Ok(None) => continue,
-                Err(e) => {
-                    eprintln!("redisq: results: blmove failed: {e}");
-                    backoff(&mut shutdown).await;
-                    continue;
+        let work = async {
+            let mut blocking = None;
+            let mut last_recover = tokio::time::Instant::now();
+            while !stopping(&shutdown) {
+                if last_recover.elapsed() >= RECOVER_EVERY {
+                    last_recover = tokio::time::Instant::now();
+                    match self.recover_dead().await {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            eprintln!("redisq: results: recovered {n} verdict(s) of dead consumers")
+                        }
+                        Err(e) => eprintln!("redisq: results: recovery failed: {e}"),
+                    }
                 }
-            };
-            self.handle_result(handler, &payload).await;
-            self.ack_result(&payload).await;
+                let payload = match self.take_result(&mut blocking).await {
+                    Ok(Some(payload)) => payload,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        eprintln!("redisq: results: blmove failed: {e}");
+                        backoff(&mut shutdown).await;
+                        continue;
+                    }
+                };
+                self.handle_result(handler, &payload).await;
+                self.ack_result(&payload).await;
+            }
+        };
+        // The heartbeat runs beside the loop (not between verdicts) so a
+        // verdict whose handling retries for a long time is not mistaken for
+        // the work of a dead consumer.
+        let beat = async {
+            loop {
+                tokio::time::sleep(HEARTBEAT_EVERY).await;
+                if let Err(e) = self.heartbeat().await {
+                    eprintln!("redisq: results: heartbeat failed: {e}");
+                }
+            }
+        };
+        tokio::select! {
+            _ = work => {}
+            _ = beat => {}
         }
+        self.deregister().await;
     }
 
     async fn handle_result<H: ResultHandler>(&self, handler: &H, payload: &str) {
@@ -339,14 +490,10 @@ mod tests {
 
     async fn cleanup(q: &RedisQueue) {
         let mut c = q.cmd_conn();
-        let keys = [
-            q.jobs_key(Priority::High),
-            q.jobs_key(Priority::Normal),
-            q.results_key(),
-            q.dead_key(),
-            q.processing_key(),
-        ];
-        let _: () = c.del(&keys).await.unwrap();
+        let keys: Vec<String> = c.keys(format!("{}:*", q.prefix())).await.unwrap();
+        if !keys.is_empty() {
+            let _: () = c.del(&keys).await.unwrap();
+        }
     }
 
     async fn lrange(q: &RedisQueue, key: &str) -> Vec<String> {
@@ -548,15 +695,17 @@ mod tests {
     async fn unacknowledged_verdicts_are_recovered_on_startup() {
         let Some(q) = setup().await else { return };
         let mut c = q.cmd_conn();
-        // A previous consumer took v1 then v2 (BLMOVE pushes to the head)
-        // and died before acknowledging; v3 is still queued.
+        // A previous consumer ("dead": registered, heartbeat expired) took v1
+        // then v2 (BLMOVE pushes to the head) and died before acknowledging;
+        // v3 is still queued.
         let (v1, v2, v3) = (
             serde_json::to_string(&verdict("r1")).unwrap(),
             serde_json::to_string(&verdict("r2")).unwrap(),
             serde_json::to_string(&verdict("r3")).unwrap(),
         );
-        let _: () = c.lpush(q.processing_key(), &v1).await.unwrap();
-        let _: () = c.lpush(q.processing_key(), &v2).await.unwrap();
+        let _: () = c.sadd(q.consumers_key(), "dead").await.unwrap();
+        let _: () = c.lpush(q.processing_key_for("dead"), &v1).await.unwrap();
+        let _: () = c.lpush(q.processing_key_for("dead"), &v2).await.unwrap();
         let _: () = c.lpush(q.results_key(), &v3).await.unwrap();
 
         let (tx, rx) = watch::channel(false);
@@ -577,7 +726,74 @@ mod tests {
             .collect();
         assert_eq!(ids, ["r1", "r2", "r3"], "recovered first, oldest first");
         assert!(lrange(&q, &q.processing_key()).await.is_empty());
+        assert!(lrange(&q, &q.processing_key_for("dead")).await.is_empty());
         assert!(lrange(&q, &q.results_key()).await.is_empty());
+        let members: Vec<String> = c.smembers(q.consumers_key()).await.unwrap();
+        assert!(
+            members.is_empty(),
+            "dead consumer forgotten, self deregistered on shutdown: {members:?}"
+        );
+        let hb: bool = c
+            .exists(q.heartbeat_key_for(q.consumer_id()))
+            .await
+            .unwrap();
+        assert!(!hb, "heartbeat dropped on clean shutdown");
+        cleanup(&q).await;
+    }
+
+    /// Review round 2: startup recovery used to move every entry of one
+    /// shared processing list back, including the in-flight verdicts of live
+    /// replicas (applied twice, concurrently). Only consumers whose heartbeat
+    /// expired are recovered now, plus the legacy shared list.
+    #[tokio::test]
+    async fn recovery_skips_live_replicas() {
+        let Some(q) = setup().await else { return };
+        let url = std::env::var("SECMAIL_TEST_REDIS").unwrap();
+        let live = RedisQueue::connect(&url, q.prefix()).await.unwrap();
+        assert_ne!(live.consumer_id(), q.consumer_id());
+        let mut c = q.cmd_conn();
+        let inflight = serde_json::to_string(&verdict("live1")).unwrap();
+        let legacy = serde_json::to_string(&verdict("legacy1")).unwrap();
+        let dead = serde_json::to_string(&verdict("dead1")).unwrap();
+        // A live replica (fresh heartbeat) is handling `inflight`.
+        live.heartbeat().await.unwrap();
+        let _: () = c.lpush(live.processing_key(), &inflight).await.unwrap();
+        // A dead one left `dead` behind; an old version left `legacy`.
+        let _: () = c.sadd(q.consumers_key(), "gone").await.unwrap();
+        let _: () = c.lpush(q.processing_key_for("gone"), &dead).await.unwrap();
+        let _: () = c.lpush(q.legacy_processing_key(), &legacy).await.unwrap();
+
+        assert_eq!(q.recover_results().await.unwrap(), 2);
+        assert_eq!(
+            lrange(&q, &live.processing_key()).await,
+            vec![inflight.clone()]
+        );
+        let mut queued = lrange(&q, &q.results_key()).await;
+        queued.sort();
+        let mut want = vec![dead, legacy];
+        want.sort();
+        assert_eq!(queued, want);
+        let mut members: Vec<String> = c.smembers(q.consumers_key()).await.unwrap();
+        members.sort();
+        let mut want = vec![live.consumer_id().to_string(), q.consumer_id().to_string()];
+        want.sort();
+        assert_eq!(
+            members, want,
+            "dead consumer forgotten, both live registered"
+        );
+
+        // Once the live replica's heartbeat lapses its list is recovered too.
+        let _: () = c
+            .del(live.heartbeat_key_for(live.consumer_id()))
+            .await
+            .unwrap();
+        assert_eq!(q.recover_dead().await.unwrap(), 1);
+        assert!(lrange(&q, &live.processing_key()).await.is_empty());
+        let hb_ttl: i64 = c.ttl(q.heartbeat_key_for(q.consumer_id())).await.unwrap();
+        assert!(
+            hb_ttl > 0 && hb_ttl <= HEARTBEAT_TTL_SECS as i64,
+            "ttl {hb_ttl}"
+        );
         cleanup(&q).await;
     }
 

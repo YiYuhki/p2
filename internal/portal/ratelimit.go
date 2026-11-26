@@ -122,8 +122,8 @@ func clientIP(r *http.Request, trusted []netip.Prefix) string {
 	}
 	client := peer
 	for i := len(hops) - 1; i >= 0; i-- {
-		a, err := netip.ParseAddr(strings.TrimSpace(hops[i]))
-		if err != nil {
+		a, ok := parseHop(hops[i])
+		if !ok {
 			break // garbage: keep the last hop we could vouch for
 		}
 		client = a.Unmap()
@@ -132,6 +132,25 @@ func clientIP(r *http.Request, trusted []netip.Prefix) string {
 		}
 	}
 	return client.String()
+}
+
+// parseHop parses one X-Forwarded-For entry: a bare address, or one with a
+// port ("1.2.3.4:5678", "[2001:db8::1]:80") or in brackets ("[::1]") as
+// some proxies write them.
+func parseHop(s string) (netip.Addr, bool) {
+	s = strings.TrimSpace(s)
+	if a, err := netip.ParseAddr(s); err == nil {
+		return a, true
+	}
+	if ap, err := netip.ParseAddrPort(s); err == nil {
+		return ap.Addr(), true
+	}
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		if a, err := netip.ParseAddr(s[1 : len(s)-1]); err == nil && a.Is6() {
+			return a, true
+		}
+	}
+	return netip.Addr{}, false
 }
 
 // sweep drops idle per-IP entries. Caller holds l.mu.
@@ -189,8 +208,9 @@ func (l *ipLimiter) AllowFail(ip string) bool {
 	e.seen = now
 	perIP := e.l.Allow()
 	l.mu.Unlock()
-	// Always consume from the global budget so that a spread-out attack is
-	// still capped even when no single IP exceeds its own allowance.
-	glob := l.global.Allow()
-	return perIP && glob
+	// Misses the per-IP budget allowed also draw on the global budget, so a
+	// spread-out attack is still capped even when no single IP exceeds its
+	// own allowance; misses already refused per IP do not, so one source
+	// cannot drain the global budget for everyone.
+	return perIP && l.global.Allow()
 }

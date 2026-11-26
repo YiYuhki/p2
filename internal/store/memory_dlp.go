@@ -133,6 +133,22 @@ func (s *Memory) ListDLPEvents(_ context.Context, f EventFilter, limit int, page
 	return all, nil
 }
 
+// SetHoldReason annotates an already decided hold (e.g. a RELEASED hold
+// whose relay result is unknown). ErrConflict while it is still HELD.
+func (s *Memory) SetHoldReason(_ context.Context, id, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h, ok := s.holds[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if h.Status == model.HoldHeld {
+		return ErrConflict
+	}
+	h.Reason = reason
+	return nil
+}
+
 func (s *Memory) ReopenHold(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

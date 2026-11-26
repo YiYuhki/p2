@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"net/textproto"
 	"os"
 	"os/exec"
 	"strings"
@@ -252,6 +253,109 @@ func TestReleaseFailureReopensHold(t *testing.T) {
 	h, _ := e.store.GetHold(context.Background(), holds[0].ID)
 	if h.Status != model.HoldHeld {
 		t.Fatalf("hold should be reopened, got %s", h.Status)
+	}
+}
+
+// fakeNextHop speaks just enough SMTP to take one message; after the
+// terminating "." it either replies with final (when non-empty) or drops the
+// connection without a reply.
+func fakeNextHop(t *testing.T, final string) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				tp := textproto.NewConn(c)
+				tp.PrintfLine("220 fake")
+				inData := false
+				for {
+					line, err := tp.ReadLine()
+					if err != nil {
+						return
+					}
+					if inData {
+						if line == "." {
+							if final != "" {
+								tp.PrintfLine("%s", final)
+								continue
+							}
+							return // drop: result unknown to the client
+						}
+						continue
+					}
+					switch cmd := strings.ToUpper(strings.SplitN(line, " ", 2)[0]); cmd {
+					case "EHLO", "HELO":
+						tp.PrintfLine("250 fake")
+					case "DATA":
+						inData = true
+						tp.PrintfLine("354 go ahead")
+					case "QUIT":
+						tp.PrintfLine("221 bye")
+						return
+					default:
+						tp.PrintfLine("250 ok")
+					}
+				}
+			}(c)
+		}
+	}()
+	return l.Addr().String()
+}
+
+// Review round 2: a transport error after DATA while waiting for the final
+// reply used to reopen the hold, so a second release could deliver the
+// message twice. It now stays RELEASED, flagged, with the copy kept.
+func TestReleaseResultUnknownKeepsReleased(t *testing.T) {
+	e := setup(t, nil)
+	ctx := context.Background()
+	e.send("kim@example.com", []string{"partner@ext.org"}, mail("x", "AKIAIOSFODNN7EXAMPLE"))
+	holds, _ := e.store.ListHolds(ctx, model.HoldHeld, 10, store.Page{})
+	if len(holds) != 1 {
+		t.Fatalf("holds %d", len(holds))
+	}
+	hop := smtpclient.Options{Addr: fakeNextHop(t, ""), Timeout: 5 * time.Second}
+	e.svc.relay = func(from string, to []string, msg []byte) error {
+		return smtpclient.Send(hop, from, to, msg)
+	}
+	err := e.svc.Release(ctx, holds[0].ID, "sec")
+	if err == nil || !smtpclient.IsResultUnknown(err) || !strings.Contains(err.Error(), RelayUnknown) {
+		t.Fatalf("want a result-unknown error, got %v", err)
+	}
+	h, _ := e.store.GetHold(ctx, holds[0].ID)
+	if h.Status != model.HoldReleased || h.Reason != RelayUnknown {
+		t.Fatalf("hold must stay RELEASED and be flagged, got %s %q", h.Status, h.Reason)
+	}
+	if r, err := e.svc.storage.Get(ctx, h.StorageKey); err != nil {
+		t.Fatalf("stored copy must be kept: %v", err)
+	} else {
+		r.Close()
+	}
+	if err := e.svc.Release(ctx, holds[0].ID, "sec"); !errors.Is(err, ErrNotHeld) {
+		t.Fatalf("second release must be refused: %v", err)
+	}
+
+	// A definite rejection after DATA still reopens the hold.
+	e.send("kim@example.com", []string{"partner@ext.org"}, mail("y", "AKIAIOSFODNN7EXAMPLE"))
+	holds, _ = e.store.ListHolds(ctx, model.HoldHeld, 10, store.Page{})
+	if len(holds) != 1 {
+		t.Fatalf("holds %d", len(holds))
+	}
+	hop.Addr = fakeNextHop(t, "554 rejected")
+	err = e.svc.Release(ctx, holds[0].ID, "sec")
+	if err == nil || smtpclient.IsResultUnknown(err) {
+		t.Fatalf("want a definite error, got %v", err)
+	}
+	if h, _ := e.store.GetHold(ctx, holds[0].ID); h.Status != model.HoldHeld {
+		t.Fatalf("rejected relay must reopen the hold, got %s", h.Status)
 	}
 }
 
