@@ -194,7 +194,13 @@ impl MessageProcessor for Service {
             self.record_event(env, "exempt", &empty).await;
             return Ok(raw.to_vec());
         }
-        let report = self.scanner.scan_message(raw);
+        // MIME parsing + regex scanning of up to max_message_bytes is
+        // CPU-bound: run it on the blocking pool.
+        let scanner = self.scanner.clone();
+        let owned = raw.to_vec();
+        let report = tokio::task::spawn_blocking(move || scanner.scan_message(&owned))
+            .await
+            .map_err(|_| ProcessError::TempFail)?;
         let action = decide(&report, &self.policy);
         self.record_event(env, &action, &report).await;
 

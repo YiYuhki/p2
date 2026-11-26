@@ -55,13 +55,15 @@ impl<R: Resolver> Evaluator<R> {
         let frag = |v: &str| format!("dmarc={v} header.from={from}");
 
         let lookup = tokio::time::timeout(self.timeout, self.lookup_policy(&from)).await;
-        let rec = match lookup {
+        let (rec, at_org) = match lookup {
             Err(_) | Ok(Lookup::Temp) => return mk(frag("temperror"), "temperror", ""),
             Ok(Lookup::None) => return mk(frag("none"), "none", ""),
-            Ok(Lookup::Found(r)) => r,
+            Ok(Lookup::Found(r, at_org)) => (r, at_org),
         };
         let (adkim, aspf) = alignment_modes(&rec);
-        let policy = policy_of(&rec);
+        // RFC 7489 §6.3: a record found at the organizational domain governs a
+        // subdomain's mail through sp= (falling back to p=).
+        let policy = policy_of(&rec, at_org);
 
         if dkim
             .iter()
@@ -72,9 +74,15 @@ impl<R: Resolver> Evaluator<R> {
         if spf_result.eq_ignore_ascii_case("pass") && aligned(spf_domain, &from, aspf) {
             return mk(frag("pass"), "pass", policy);
         }
-        // Nothing aligned. A transient underlying error → temperror (retry), not
-        // a hard fail of legitimate mail.
-        if is_temp(spf_result) || dkim.iter().any(|s| is_temp(&s.result)) {
+        // Nothing aligned. A transient error on an identifier that *would*
+        // align → temperror (retry), not a hard fail of legitimate mail. A
+        // temperror on an unaligned identifier could never produce a pass, so
+        // it must not soften the verdict (that would bypass p=reject).
+        let spf_temp = is_temp(spf_result) && aligned(spf_domain, &from, aspf);
+        let dkim_temp = dkim
+            .iter()
+            .any(|s| is_temp(&s.result) && aligned(&s.domain, &from, adkim));
+        if spf_temp || dkim_temp {
             return mk(frag("temperror"), "temperror", policy);
         }
         mk(frag("fail"), "fail", policy)
@@ -87,7 +95,10 @@ impl<R: Resolver> Evaluator<R> {
         }
         let org = org_domain(domain);
         if !org.is_empty() && org != domain {
-            return self.fetch(&org).await;
+            return match self.fetch(&org).await {
+                Lookup::Found(r, _) => Lookup::Found(r, true),
+                other => other,
+            };
         }
         Lookup::None
     }
@@ -103,7 +114,7 @@ impl<R: Resolver> Evaluator<R> {
                     .collect();
                 // RFC 7489 §6.6.3: more than one record → no discoverable policy.
                 if recs.len() == 1 {
-                    Lookup::Found(recs[0].clone())
+                    Lookup::Found(recs[0].clone(), false)
                 } else {
                     Lookup::None
                 }
@@ -113,7 +124,9 @@ impl<R: Resolver> Evaluator<R> {
 }
 
 enum Lookup {
-    Found(String),
+    /// The record, and whether it came from the organizational domain (the
+    /// From domain being a subdomain of it).
+    Found(String, bool),
     None,
     Temp,
 }
@@ -137,18 +150,30 @@ fn tags(rec: &str) -> impl Iterator<Item = (String, String)> + '_ {
     })
 }
 
-/// Parses p= (none|quarantine|reject); unknown/absent → none.
-fn policy_of(rec: &str) -> &'static str {
+/// Parses p= (none|quarantine|reject); unknown/absent → none. For a
+/// subdomain governed by its organizational domain's record, sp= takes
+/// precedence when present and valid.
+fn policy_of(rec: &str, subdomain: bool) -> &'static str {
+    let parse = |v: &str| match v {
+        "none" => Some("none"),
+        "quarantine" => Some("quarantine"),
+        "reject" => Some("reject"),
+        _ => None,
+    };
+    let (mut p, mut sp) = (None, None);
     for (k, v) in tags(rec) {
-        if k == "p" {
-            match v.as_str() {
-                "quarantine" => return "quarantine",
-                "reject" => return "reject",
-                _ => {}
-            }
+        match k.as_str() {
+            "p" if p.is_none() => p = parse(&v),
+            "sp" if sp.is_none() => sp = parse(&v),
+            _ => {}
         }
     }
-    "none"
+    let p = p.unwrap_or("none");
+    if subdomain {
+        sp.unwrap_or(p)
+    } else {
+        p
+    }
 }
 
 /// adkim/aspf alignment modes; `true` = strict. Both default to relaxed.
@@ -279,5 +304,60 @@ mod tests {
             .await;
         assert_eq!(r.verdict, "temperror");
         assert_eq!(r.policy, "reject");
+    }
+
+    #[tokio::test]
+    async fn unaligned_temperror_does_not_soften_reject() {
+        let e = ev(Static::default().with_txt("_dmarc.victim.com", &["v=DMARC1; p=reject"]));
+        let r = e
+            .evaluate("victim.com", "temperror", "attacker.net", &[])
+            .await;
+        assert_eq!((r.verdict.as_str(), r.policy.as_str()), ("fail", "reject"));
+        let r = e
+            .evaluate(
+                "victim.com",
+                "fail",
+                "attacker.net",
+                &[sig("temperror", "attacker.net")],
+            )
+            .await;
+        assert_eq!((r.verdict.as_str(), r.policy.as_str()), ("fail", "reject"));
+        // An aligned identifier's temperror still yields temperror.
+        let r = e
+            .evaluate(
+                "victim.com",
+                "fail",
+                "attacker.net",
+                &[sig("temperror", "mail.victim.com")],
+            )
+            .await;
+        assert_eq!(r.verdict, "temperror");
+    }
+
+    #[tokio::test]
+    async fn subdomain_policy_applies_via_org_record() {
+        let e =
+            ev(Static::default().with_txt("_dmarc.victim.com", &["v=DMARC1; p=none; sp=reject"]));
+        let r = e
+            .evaluate("sub.victim.com", "fail", "attacker.net", &[])
+            .await;
+        assert_eq!((r.verdict.as_str(), r.policy.as_str()), ("fail", "reject"));
+        // The org domain itself uses p=.
+        let r = e.evaluate("victim.com", "fail", "attacker.net", &[]).await;
+        assert_eq!(r.policy, "none");
+        // Without sp=, subdomains inherit p=.
+        let e = ev(Static::default().with_txt("_dmarc.victim.com", &["v=DMARC1; p=quarantine"]));
+        let r = e
+            .evaluate("sub.victim.com", "fail", "attacker.net", &[])
+            .await;
+        assert_eq!(r.policy, "quarantine");
+        // A subdomain's own record ignores sp=.
+        let e =
+            ev(Static::default()
+                .with_txt("_dmarc.sub.victim.com", &["v=DMARC1; p=none; sp=reject"]));
+        let r = e
+            .evaluate("sub.victim.com", "fail", "attacker.net", &[])
+            .await;
+        assert_eq!(r.policy, "none");
     }
 }
