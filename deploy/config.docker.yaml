@@ -36,6 +36,7 @@ database:
   dsn: postgres://secmail:secmail@postgres:5432/secmail?sslmode=disable
 redis:
   addr: redis:6379
+  password: ${SECMAIL_REDIS_PASSWORD}   # redis runs with requirepass
 queue:
   type: redis
 analysis:
@@ -47,7 +48,15 @@ analysis:
 outbound:
   enabled: true
   listen: ":10025"
-  allowed_clients: ["127.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "10.0.0.0/8"]
+  # This listener relays to the Internet without authentication, so only the
+  # internal MTA may use it. In this demo there is no MTA container: you submit
+  # from the docker host via the loopback-only published port, and Docker's
+  # port proxy delivers those connections from the network gateway
+  # (172.28.0.1, fixed in docker-compose.yml). Other containers on the network
+  # (172.28.0.2-254) are refused. Never list whole private ranges here: a
+  # port published on 0.0.0.0 arrives from the gateway too, which would turn
+  # the gateway entry into an open relay. In production list your MTA's IPs.
+  allowed_clients: ["127.0.0.1/32", "172.28.0.1/32"]
   next_hop:
     addr: mailpit:1025
 dlp:

@@ -36,13 +36,16 @@ func TestValidation(t *testing.T) {
 		t.Fatal("domains should be normalised")
 	}
 	bad := map[string]string{
-		"no upstream":       "smtp: {accepted_domains: [a.com]}\ninternal_api: {listen: ''}\n",
-		"open relay":        "upstream: {addr: 'mx:25'}\ninternal_api: {listen: ''}\n",
-		"short secret":      base + "portal: {auth: {mode: otp, session_secret: short, otp_from: a@b.c}}\n",
-		"otp without from":  base + "portal: {auth: {mode: otp, session_secret: " + strings.Repeat("x", 32) + "}}\n",
-		"header w/o name":   base + "portal: {auth: {mode: header}}\n",
-		"unknown auth mode": base + "portal: {auth: {mode: magic}}\n",
-		"weak api token":    "upstream: {addr: 'mx:25'}\nsmtp: {accepted_domains: [a.com]}\ninternal_api: {listen: ':8081', token: x}\n",
+		"no upstream":        "smtp: {accepted_domains: [a.com]}\ninternal_api: {listen: ''}\n",
+		"open relay":         "upstream: {addr: 'mx:25'}\ninternal_api: {listen: ''}\n",
+		"short secret":       base + "portal: {auth: {mode: otp, session_secret: short, otp_from: a@b.c}}\n",
+		"otp without from":   base + "portal: {auth: {mode: otp, session_secret: " + strings.Repeat("x", 32) + "}}\n",
+		"header w/o name":    base + "portal: {auth: {mode: header}}\n",
+		"header w/o proxies": base + "portal: {auth: {mode: header, trusted_header: X-Email}}\n",
+		"xff w/o proxies":    base + "portal: {trust_proxy_headers: true}\n",
+		"bad proxy cidr":     base + "portal: {trusted_proxies: [not-an-ip]}\n",
+		"unknown auth mode":  base + "portal: {auth: {mode: magic}}\n",
+		"weak api token":     "upstream: {addr: 'mx:25'}\nsmtp: {accepted_domains: [a.com]}\ninternal_api: {listen: ':8081', token: x}\n",
 		"bad encrypted action": base + "outbound: {enabled: true, allowed_clients: [10.0.0.1]}\n" +
 			"dlp: {notify_from: a@b.c, admins: [s@b.c], actions: {high: hold, medium: notify, low: allow, uninspectable: notify, encrypted: magic}}\n",
 	}

@@ -275,8 +275,10 @@ func (s *Service) SweepOnce(ctx context.Context) {
 			}
 			continue
 		}
-		if err := s.store.MarkRequeued(ctx, a.ID, now); err != nil {
-			s.log.Error("janitor: requeue", "attachment", a.ID, "err", err)
+		if err := s.store.MarkRequeued(ctx, a.ID, a.QueuedAt, now); err != nil {
+			if !errors.Is(err, store.ErrConflict) { // conflict: another replica requeued it / verdict arrived
+				s.log.Error("janitor: requeue", "attachment", a.ID, "err", err)
+			}
 			continue
 		}
 		a.Attempts++

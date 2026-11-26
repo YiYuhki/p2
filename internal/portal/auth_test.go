@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -71,6 +72,8 @@ func newAuthFixture(t *testing.T, auth AuthOptions) *authFixture {
 	p := New(st, obj, NewMemoryTickets(), Options{
 		TicketTTL: time.Minute, RateLimitRPS: 1000, RateLimitBurst: 1000,
 		Auth: auth, Codes: NewMemoryCodes(), Mailer: m,
+		// httptest clients connect from loopback, standing in for the SSO proxy.
+		TrustedProxies: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8"), netip.MustParsePrefix("::1/128")},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	srv := httptest.NewServer(p.Handler())
 	t.Cleanup(srv.Close)

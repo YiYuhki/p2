@@ -297,6 +297,7 @@ func run(cfgPath, components string, log *slog.Logger) error {
 		be := gateway.NewBackend(proc, gateway.BackendOptions{
 			RecipientDomains: cfg.SMTP.AcceptedDomains,
 			Upstream:         upstreamOpts(cfg),
+			DataTimeout:      cfg.SMTP.DataTimeout,
 		}, log)
 		var tlsConf *tls.Config
 		if cfg.SMTP.TLSCertFile != "" {
@@ -326,6 +327,7 @@ func run(cfgPath, components string, log *slog.Logger) error {
 				SenderDomains:  cfg.Outbound.SenderDomains,
 				AllowedClients: clients,
 				Upstream:       nextHopOpts(cfg),
+				DataTimeout:    cfg.SMTP.DataTimeout,
 			}, log)
 			// No per-IP cap: clients are the allow-listed internal servers.
 			shut, err := startSMTP(&wg, errCh, log, smtpParams{
@@ -342,7 +344,12 @@ func run(cfgPath, components string, log *slog.Logger) error {
 
 	// ---- public portal ----
 	if enabled["portal"] {
+		proxies, err := config.ParsePrefixes(cfg.Portal.TrustedProxies)
+		if err != nil {
+			return fmt.Errorf("portal.trusted_proxies: %w", err)
+		}
 		p := portal.New(st, obj, tickets, portal.Options{
+			TrustedProxies:    proxies,
 			TicketTTL:         cfg.Portal.TicketTTL,
 			RateLimitRPS:      cfg.Portal.RateLimitRPS,
 			RateLimitBurst:    cfg.Portal.RateLimitBurst,
@@ -494,7 +501,9 @@ func startSMTP(wg *sync.WaitGroup, errCh chan<- error, log *slog.Logger, p smtpP
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", p.name, err)
 	}
-	ln = gateway.NewLimitListener(ln, p.maxConns, p.perIP, log)
+	ll := gateway.NewLimitListener(ln, p.maxConns, p.perIP, log)
+	ll.SessionTimeout = p.cfg.SMTP.MaxSessionDuration
+	ln = ll
 
 	wg.Add(1)
 	go func() {

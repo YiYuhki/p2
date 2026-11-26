@@ -213,6 +213,9 @@ func deliverWithRetry(ctx context.Context, h ResultHandler, v model.Verdict, log
 
 // ---- Memory (dev / tests) ----
 
+// maxMemoryJobs bounds the Jobs history kept by the in-memory queue.
+const maxMemoryJobs = 10000
+
 type Memory struct {
 	mu      sync.Mutex
 	Jobs    []model.Job
@@ -227,6 +230,11 @@ func NewMemory() *Memory {
 func (q *Memory) Enqueue(_ context.Context, job model.Job, _ Priority) error {
 	q.mu.Lock()
 	q.Jobs = append(q.Jobs, job)
+	if len(q.Jobs) > maxMemoryJobs {
+		// Keep only the most recent history so a long-running dev instance
+		// does not grow without bound.
+		q.Jobs = append(q.Jobs[:0:0], q.Jobs[len(q.Jobs)-maxMemoryJobs/2:]...)
+	}
 	q.mu.Unlock()
 	// Deliver to an in-process consumer if one is running; never block the
 	// enqueuer when none is (the job is still recorded in Jobs/Snapshot).

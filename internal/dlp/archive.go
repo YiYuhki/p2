@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -182,14 +183,31 @@ func (x *extractor) sevenZip(loc, name string, data []byte, depth int) {
 	ctx, cancel := context.WithTimeout(context.Background(), at.Timeout)
 	defer cancel()
 
-	if at.encrypted(ctx, in) {
+	// List first: refuse to extract anything whose declared contents exceed
+	// the entry count or the remaining inflate budget, so a bomb never hits
+	// the disk. (Sizes a format cannot declare up front, e.g. a zstd stream,
+	// are bounded by RLIMIT_FSIZE below.)
+	ls := at.list(ctx, in)
+	if ls.encrypted {
 		x.locked(loc, "암호가 설정된 압축파일")
 		return
+	}
+	if ls.files > x.lim.MaxEntries {
+		x.problem(loc, "압축파일 내 파일 수 한도 초과")
+		return
+	}
+	if x.budget <= 0 || ls.totalSize > x.budget {
+		x.problem(loc, "압축 해제 한도 초과 (압축폭탄 의심)")
+		return
+	}
+	lim := DefaultProcLimits
+	if mb := int((x.budget + 1<<20 - 1) >> 20); lim.OutputFileMB <= 0 || mb < lim.OutputFileMB {
+		lim.OutputFileMB = mb
 	}
 	out := filepath.Join(dir, "out")
 	// -p (empty password), stdin from /dev/null: never wait for a prompt.
 	defer metrics.Time("archive")()
-	cmd := sandboxCmd(ctx, DefaultProcLimits, nil, at.SevenZip, "x", "-p", "-y", "-bd", "-snl-", "-o"+out, in)
+	cmd := sandboxCmd(ctx, lim, nil, at.SevenZip, "x", "-p", "-y", "-bd", "-snl-", "-o"+out, in)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, io.Discard, io.Discard
 	if err := cmd.Run(); err != nil && ctx.Err() != nil {
 		x.problem(loc, "압축 해제 시간 초과")
@@ -241,18 +259,81 @@ func (at *ArchiveTools) acquire() (func(), error) {
 	return func() { <-at.sem }, nil
 }
 
-// encrypted reports whether any entry needs a password. `7z l -slt` prints
-// "Encrypted = +" per entry; header-encrypted archives fail to list at all
-// without a password, which also counts as encrypted.
-func (at *ArchiveTools) encrypted(ctx context.Context, path string) bool {
+// archiveListing summarises `7z l -slt` output.
+type archiveListing struct {
+	encrypted bool
+	files     int   // non-directory entries
+	totalSize int64 // sum of the declared uncompressed sizes
+}
+
+// list runs `7z l -slt`. Any entry with "Encrypted = +" marks the archive as
+// encrypted; header-encrypted archives fail to list at all without a
+// password, which also counts as encrypted.
+func (at *ArchiveTools) list(ctx context.Context, path string) archiveListing {
 	cmd := sandboxCmd(ctx, DefaultProcLimits, nil, at.SevenZip, "l", "-slt", "-p", path)
 	cmd.Stdin = nil
 	out, err := cmd.CombinedOutput()
 	s := string(out)
+	ls := parseSevenZipListing(s)
 	if err != nil && (strings.Contains(s, "Wrong password") || strings.Contains(s, "Cannot open encrypted archive")) {
-		return true
+		ls.encrypted = true
 	}
-	return strings.Contains(s, "Encrypted = +")
+	return ls
+}
+
+// parseSevenZipListing reads the per-entry blocks that follow the
+// "----------" separator of `7z l -slt`. Each block starts with "Path = ".
+func parseSevenZipListing(s string) archiveListing {
+	var ls archiveListing
+	_, entries, ok := strings.Cut("\n"+s, "\n----------")
+	if !ok {
+		ls.encrypted = strings.Contains(s, "Encrypted = +")
+		return ls
+	}
+	var size int64
+	inEntry, isDir := false, false
+	flush := func() {
+		if inEntry && !isDir {
+			ls.files++
+			if size > 0 {
+				if ls.totalSize > (1<<62)-size {
+					ls.totalSize = 1 << 62 // saturate instead of overflowing
+				} else {
+					ls.totalSize += size
+				}
+			}
+		}
+		inEntry, isDir, size = false, false, 0
+	}
+	for _, line := range strings.Split(entries, "\n") {
+		k, v, ok := strings.Cut(strings.TrimRight(line, "\r"), " = ")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "Path":
+			flush()
+			inEntry = true
+		case "Size":
+			if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n > 0 {
+				size = n
+			}
+		case "Folder":
+			if strings.TrimSpace(v) == "+" {
+				isDir = true
+			}
+		case "Attributes":
+			if strings.HasPrefix(strings.TrimSpace(v), "D") {
+				isDir = true
+			}
+		case "Encrypted":
+			if strings.TrimSpace(v) == "+" {
+				ls.encrypted = true
+			}
+		}
+	}
+	flush()
+	return ls
 }
 
 func archiveName(name string) string {

@@ -47,6 +47,9 @@ type BackendOptions struct {
 	// AllowedClients restricts connecting IPs (outbound: internal servers).
 	AllowedClients []netip.Prefix
 	Upstream       UpstreamOptions
+	// DataTimeout bounds how long the client may take to transmit the
+	// message body (DATA). Zero leaves the server's read timeout in charge.
+	DataTimeout time.Duration
 	// Name labels log lines ("inbound" / "outbound").
 	Name string
 }
@@ -199,6 +202,12 @@ func domainIn(addr string, domains []string) bool {
 func (s *session) Data(r io.Reader) error {
 	if s.up == nil || len(s.rcpt) == 0 {
 		return &smtp.SMTPError{Code: 503, EnhancedCode: smtp.EnhancedCode{5, 5, 1}, Message: "Need RCPT command"}
+	}
+	if d := s.b.opts.DataTimeout; d > 0 && s.conn != nil && s.conn.Conn() != nil {
+		// go-smtp does not refresh the read deadline while streaming DATA,
+		// so this bounds the whole transfer (clamped to the session cap by
+		// LimitListener). The next command line resets it.
+		_ = s.conn.Conn().SetReadDeadline(time.Now().Add(d))
 	}
 	raw, err := io.ReadAll(r)
 	if err != nil {

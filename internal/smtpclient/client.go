@@ -64,7 +64,11 @@ func Send(o Options, from string, to []string, msg []byte) error {
 	if err := c.SendMail(from, to, bytes.NewReader(msg)); err != nil {
 		return err
 	}
-	return c.Quit()
+	// The server accepted the message once DATA got its 250: a failing QUIT
+	// must not be reported as a delivery failure, or callers would retry
+	// (e.g. reopen a released hold) and send it twice.
+	_ = c.Quit()
+	return nil
 }
 
 // startTLS performs the plaintext EHLO/STARTTLS exchange itself because

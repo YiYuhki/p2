@@ -69,8 +69,12 @@ func conformance(t *testing.T, s Store) {
 	if err != nil || !containsID(stale, a2.ID) || containsID(stale, a1.ID) {
 		t.Fatalf("stale: %v", err)
 	}
-	if err := s.MarkRequeued(ctx, a2.ID, now.Add(time.Minute)); err != nil {
+	if err := s.MarkRequeued(ctx, a2.ID, now, now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
+	}
+	// A second sweeper that listed the old queued_at loses the race.
+	if err := s.MarkRequeued(ctx, a2.ID, now, now.Add(2*time.Minute)); !errors.Is(err, ErrConflict) {
+		t.Fatalf("concurrent requeue: %v, want ErrConflict", err)
 	}
 	g2, _ := s.GetAttachment(ctx, a2.ID)
 	if g2.Attempts != 2 || !g2.QueuedAt.Equal(now.Add(time.Minute)) {

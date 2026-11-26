@@ -3,6 +3,7 @@ package portal
 import (
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -24,16 +25,16 @@ import (
 //     distributed guessing attack spread across many source IPs is still
 //     capped in aggregate.
 type ipLimiter struct {
-	mu         sync.Mutex
-	m          map[string]*limiterEntry // general per-IP
-	fails      map[string]*limiterEntry // per-IP failed-lookup budget
-	global     *rate.Limiter            // aggregate failed-lookup budget
-	rps        rate.Limit
-	burst      int
-	failRPS    rate.Limit
-	failBurst  int
-	trustProxy bool
-	lastSweep  time.Time
+	mu        sync.Mutex
+	m         map[string]*limiterEntry // general per-IP
+	fails     map[string]*limiterEntry // per-IP failed-lookup budget
+	global    *rate.Limiter            // aggregate failed-lookup budget
+	rps       rate.Limit
+	burst     int
+	failRPS   rate.Limit
+	failBurst int
+	trusted   []netip.Prefix // proxies whose X-Forwarded-For is honoured
+	lastSweep time.Time
 }
 
 type limiterEntry struct {
@@ -41,15 +42,13 @@ type limiterEntry struct {
 	seen time.Time
 }
 
-func newIPLimiter(rps float64, burst int, trustProxy bool) *ipLimiter {
-	return newIPLimiterFull(rps, burst, 0, 0, 0, trustProxy)
-}
-
-// newIPLimiterFull also configures the enumeration (failed-lookup) budget.
-// failBurst is the per-IP allowance of consecutive misses; globalFailRPS caps
-// the aggregate miss rate across all clients. Non-positive values fall back to
-// safe defaults.
-func newIPLimiterFull(rps float64, burst int, failBurst int, globalFailRPS float64, globalFailBurst int, trustProxy bool) *ipLimiter {
+// newIPLimiterFull configures the general and the enumeration (failed-lookup)
+// budgets. failBurst is the per-IP allowance of consecutive misses;
+// globalFailRPS caps the aggregate miss rate across all clients. Non-positive
+// values fall back to safe defaults. X-Forwarded-For is honoured only for
+// requests whose peer is in xffFrom (the trusted reverse proxies); nil
+// ignores the header entirely.
+func newIPLimiterFull(rps float64, burst int, failBurst int, globalFailRPS float64, globalFailBurst int, xffFrom []netip.Prefix) *ipLimiter {
 	if failBurst <= 0 {
 		failBurst = 10
 	}
@@ -60,28 +59,79 @@ func newIPLimiterFull(rps float64, burst int, failBurst int, globalFailRPS float
 		globalFailBurst = 2 * int(globalFailRPS)
 	}
 	return &ipLimiter{
-		m:          map[string]*limiterEntry{},
-		fails:      map[string]*limiterEntry{},
-		global:     rate.NewLimiter(rate.Limit(globalFailRPS), globalFailBurst),
-		rps:        rate.Limit(rps),
-		burst:      burst,
-		failRPS:    1, // one sustained retry per second per IP after the burst
-		failBurst:  failBurst,
-		trustProxy: trustProxy,
+		m:         map[string]*limiterEntry{},
+		fails:     map[string]*limiterEntry{},
+		global:    rate.NewLimiter(rate.Limit(globalFailRPS), globalFailBurst),
+		rps:       rate.Limit(rps),
+		burst:     burst,
+		failRPS:   1, // one sustained retry per second per IP after the burst
+		failBurst: failBurst,
+		trusted:   xffFrom,
 	}
 }
 
 func (l *ipLimiter) clientIP(r *http.Request) string {
-	if l.trustProxy {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			return strings.TrimSpace(strings.Split(xff, ",")[0])
-		}
-	}
+	return clientIP(r, l.trusted)
+}
+
+// peerAddr returns the address of the directly connected peer.
+func peerAddr(r *http.Request) (netip.Addr, bool) {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
+		host = r.RemoteAddr
+	}
+	a, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return a.Unmap(), true
+}
+
+func inPrefixes(a netip.Addr, list []netip.Prefix) bool {
+	for _, p := range list {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
+// fromTrustedProxy reports whether the request came directly from one of the
+// trusted reverse proxies.
+func fromTrustedProxy(r *http.Request, trusted []netip.Prefix) bool {
+	a, ok := peerAddr(r)
+	return ok && inPrefixes(a, trusted)
+}
+
+// clientIP returns the client address used for rate limiting. The
+// X-Forwarded-For chain is only consulted when the peer is a trusted proxy,
+// and then walked from the right (entries appended by our own proxies),
+// skipping trusted hops: the first untrusted address is the client. The
+// leftmost entries are client-controlled and are never used on their own.
+func clientIP(r *http.Request, trusted []netip.Prefix) string {
+	peer, ok := peerAddr(r)
+	if !ok {
 		return r.RemoteAddr
 	}
-	return host
+	if len(trusted) == 0 || !inPrefixes(peer, trusted) {
+		return peer.String()
+	}
+	var hops []string
+	for _, v := range r.Header.Values("X-Forwarded-For") {
+		hops = append(hops, strings.Split(v, ",")...)
+	}
+	client := peer
+	for i := len(hops) - 1; i >= 0; i-- {
+		a, err := netip.ParseAddr(strings.TrimSpace(hops[i]))
+		if err != nil {
+			break // garbage: keep the last hop we could vouch for
+		}
+		client = a.Unmap()
+		if !inPrefixes(client, trusted) {
+			break
+		}
+	}
+	return client.String()
 }
 
 // sweep drops idle per-IP entries. Caller holds l.mu.

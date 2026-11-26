@@ -17,12 +17,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -61,6 +65,7 @@ type worker struct {
 	sc       *scan.Scanner
 	log      *slog.Logger
 	token    string
+	apiBase  *url.URL // the bearer token is only ever sent below this URL
 	fetchCap int64
 	httpc    *http.Client
 }
@@ -68,8 +73,10 @@ type worker struct {
 func main() {
 	var (
 		redisAddr   = flag.String("redis", "localhost:6379", "redis address")
+		redisPass   = flag.String("redis-password", os.Getenv("SECMAIL_REDIS_PASSWORD"), "redis password (default $SECMAIL_REDIS_PASSWORD)")
 		prefix      = flag.String("prefix", "secmail", "queue key prefix")
 		apiToken    = flag.String("token", os.Getenv("SECMAIL_INTERNAL_TOKEN"), "internal API bearer token")
+		apiBase     = flag.String("api-base", os.Getenv("SECMAIL_API_BASE"), "secmail internal API base URL (e.g. http://secmail:8081); the token is only sent to content/verdict URLs under it")
 		viaRedis    = flag.Bool("reply-redis", false, "push verdicts to the Redis results list instead of HTTP")
 		yaraDir     = flag.String("yara-dir", os.Getenv("MALENGINE_YARA_DIR"), "directory of YARA rules (empty: engine default / skip YARA)")
 		threatIntel = flag.Bool("threat-intel", false, "enable outbound threat-intel lookups (abuse.ch, VirusTotal)")
@@ -77,11 +84,17 @@ func main() {
 		blockLevel  = flag.String("block-level", "suspicious", "block at this verdict level or worse: clean|suspicious|likely|malicious")
 		maxSize     = flag.Int64("max-size", 0, "max attachment size in bytes the engine will analyze (0: engine default)")
 		tmpDir      = flag.String("tmp-dir", "", "scratch directory for AnalyzeBytes (empty: OS temp)")
-		fetchCap    = flag.Int64("fetch-limit", 256<<20, "max bytes to download per attachment")
+		fetchCap    = flag.Int64("fetch-limit", 256<<20, "max bytes to download per attachment (larger attachments get an ERROR verdict)")
 	)
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	base, err := parseAPIBase(*apiBase)
+	if err != nil {
+		log.Error("invalid -api-base", "err", err)
+		os.Exit(2)
+	}
 
 	opts := scan.Options{
 		ThreatIntelEnabled: *threatIntel,
@@ -103,6 +116,7 @@ func main() {
 		sc:       sc,
 		log:      log,
 		token:    *apiToken,
+		apiBase:  base,
 		fetchCap: *fetchCap,
 		httpc:    &http.Client{Timeout: 60 * time.Second},
 	}
@@ -110,26 +124,45 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	rdb := redis.NewClient(&redis.Options{Addr: *redisAddr})
+	rdb := redis.NewClient(&redis.Options{Addr: *redisAddr, Password: *redisPass})
 	high, normal, results := *prefix+":jobs:high", *prefix+":jobs:normal", *prefix+":results"
 	log.Info("analyzer started",
 		"queues", []string{high, normal},
+		"api_base", base.String(),
 		"yara", sc.YaraAvailable(),
 		"sandbox", *sandbox,
 		"threat_intel", *threatIntel,
 		"block_level", strings.ToUpper(*blockLevel))
 
+	var backoff time.Duration
 	for ctx.Err() == nil {
 		res, err := rdb.BRPop(ctx, 5*time.Second, high, normal).Result()
-		if err != nil {
-			continue // timeout or shutdown
+		if ctx.Err() != nil {
+			break
 		}
+		if errors.Is(err, redis.Nil) {
+			backoff = 0
+			continue // timeout: nothing queued
+		}
+		if err != nil {
+			// Redis down / auth failure: back off instead of spinning.
+			backoff = nextBackoff(backoff)
+			log.Error("brpop failed", "err", err, "retry_in", backoff)
+			sleepCtx(ctx, backoff)
+			continue
+		}
+		backoff = 0
 		var j job
 		if err := json.Unmarshal([]byte(res[1]), &j); err != nil {
 			log.Warn("bad job", "err", err)
 			continue
 		}
-		v := w.analyze(ctx, j)
+		v, ok := w.analyze(ctx, j)
+		if !ok {
+			// Transient failure: post nothing. The attachment stays PENDING
+			// and secmail's stale-job sweep re-queues it.
+			continue
+		}
 		log.Info("analyzed", "attachment", j.AttachmentID, "file", j.Filename, "status", v.Status, "threat", v.ThreatName)
 
 		if *viaRedis || j.VerdictURL == "" {
@@ -145,25 +178,97 @@ func main() {
 	}
 }
 
+// parseAPIBase validates the internal API base URL.
+func parseAPIBase(s string) (*url.URL, error) {
+	if s == "" {
+		return nil, errors.New("required: the internal API base URL (or set SECMAIL_API_BASE)")
+	}
+	u, err := url.Parse(strings.TrimRight(s, "/"))
+	if err != nil {
+		return nil, err
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("%q must be an http(s) URL with a host and no credentials/query", s)
+	}
+	return u, nil
+}
+
+// underBase reports whether target is on the API origin and below its path,
+// so a job naming another host never receives the bearer token.
+func underBase(base *url.URL, target string) bool {
+	if base == nil {
+		return false
+	}
+	u, err := url.Parse(target)
+	if err != nil || u.User != nil {
+		return false
+	}
+	if !strings.EqualFold(u.Scheme, base.Scheme) || !strings.EqualFold(u.Host, base.Host) {
+		return false
+	}
+	p := u.EscapedPath()
+	bp := base.EscapedPath()
+	if bp == "" {
+		return true
+	}
+	return p == bp || strings.HasPrefix(p, bp+"/")
+}
+
+func nextBackoff(d time.Duration) time.Duration {
+	if d == 0 {
+		return time.Second
+	}
+	if d *= 2; d > 30*time.Second {
+		d = 30 * time.Second
+	}
+	return d
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
+}
+
+// transientError marks a failure worth retrying later (network, timeout,
+// 5xx/429): no verdict is posted for it.
+type transientError struct{ err error }
+
+func (e *transientError) Error() string { return e.err.Error() }
+func (e *transientError) Unwrap() error { return e.err }
+
 // analyze fetches the attachment and scans it, mapping the result onto the
-// contract's status. On a fetch failure it returns ERROR so secmail fails
-// closed (blocks the download).
-func (w *worker) analyze(ctx context.Context, j job) verdict {
+// contract's status. A permanent fetch failure (bad job, 4xx, oversize,
+// hash mismatch) yields ERROR so secmail fails closed; a transient one
+// returns ok=false and no verdict.
+func (w *worker) analyze(ctx context.Context, j job) (verdict, bool) {
 	v := verdict{AttachmentID: j.AttachmentID}
 	var r scan.Result
-	if data, err := w.fetch(ctx, j); err != nil {
-		r = scan.ErrorResult("fetch", err)
-	} else {
+	data, err := w.fetch(ctx, j)
+	var te *transientError
+	switch {
+	case err == nil:
 		r = w.sc.Scan(ctx, j.Filename, data)
+	case errors.As(err, &te) || ctx.Err() != nil:
+		w.log.Warn("fetch failed (transient); leaving the job to be re-queued", "attachment", j.AttachmentID, "err", err)
+		return v, false
+	default:
+		r = scan.ErrorResult("fetch", err)
 	}
 	v.Status, v.ThreatName, v.Detail = r.Status, r.ThreatName, r.Detail
-	return v
+	return v, true
 }
 
 // fetch downloads the attachment bytes from the internal API's content_url.
 func (w *worker) fetch(ctx context.Context, j job) ([]byte, error) {
 	if j.ContentURL == "" {
 		return nil, fmt.Errorf("job has no content_url (set secmail internal_api.advertise_url)")
+	}
+	if !underBase(w.apiBase, j.ContentURL) {
+		return nil, fmt.Errorf("content_url %q is outside -api-base; refusing to send the token", j.ContentURL)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, j.ContentURL, nil)
 	if err != nil {
@@ -172,20 +277,42 @@ func (w *worker) fetch(ctx context.Context, j job) ([]byte, error) {
 	req.Header.Set("Authorization", "Bearer "+w.token)
 	resp, err := w.httpc.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, &transientError{err} // network error / timeout
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("content: HTTP %d", resp.StatusCode)
+		err := fmt.Errorf("content: HTTP %d", resp.StatusCode)
+		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
+			return nil, &transientError{err}
+		}
+		return nil, err
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, w.fetchCap))
+	// Read one byte past the cap: a larger attachment is an error, never
+	// silently truncated (scanning only a prefix could miss the payload).
+	data, err := io.ReadAll(io.LimitReader(resp.Body, w.fetchCap+1))
+	if err != nil {
+		return nil, &transientError{err}
+	}
+	if int64(len(data)) > w.fetchCap {
+		return nil, fmt.Errorf("attachment exceeds -fetch-limit (%d bytes)", w.fetchCap)
+	}
+	if j.SHA256 != "" {
+		sum := sha256.Sum256(data)
+		if !strings.EqualFold(hex.EncodeToString(sum[:]), j.SHA256) {
+			return nil, errors.New("downloaded content does not match the job's sha256")
+		}
+	}
+	return data, nil
 }
 
 // postVerdict reports the verdict over HTTP. 2xx and 409 (already finalized,
 // idempotent) are treated as success.
-func (w *worker) postVerdict(ctx context.Context, url string, v verdict) error {
+func (w *worker) postVerdict(ctx context.Context, target string, v verdict) error {
+	if !underBase(w.apiBase, target) {
+		return fmt.Errorf("verdict_url %q is outside -api-base; refusing to send the token", target)
+	}
 	b, _ := json.Marshal(v)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(b))
 	if err != nil {
 		return err
 	}

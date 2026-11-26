@@ -14,8 +14,9 @@ services:
     build:
       context: ../..
       dockerfile: p2/analyzer/Dockerfile
-    command: ["-redis", "redis:6379", "-yara-dir", "/rules/yara"]
+    command: ["-redis", "redis:6379", "-yara-dir", "/rules/yara", "-api-base", "http://secmail:8081"]
     environment:
       SECMAIL_INTERNAL_TOKEN: demo-internal-token-change-me
+      SECMAIL_REDIS_PASSWORD: demo-redis-password-change-me
     depends_on: [redis, secmail]
     restart: unless-stopped

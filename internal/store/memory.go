@@ -115,12 +115,15 @@ func (s *Memory) FindReusableVerdict(_ context.Context, sha string, since time.T
 	return clone(best), nil
 }
 
-func (s *Memory) MarkRequeued(_ context.Context, id string, at time.Time) error {
+func (s *Memory) MarkRequeued(_ context.Context, id string, queuedAt, at time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a, ok := s.atts[id]
 	if !ok {
 		return ErrNotFound
+	}
+	if a.Status != model.StatusPending || !a.QueuedAt.Equal(queuedAt) {
+		return ErrConflict
 	}
 	a.Attempts++
 	a.QueuedAt, a.UpdatedAt = at, at

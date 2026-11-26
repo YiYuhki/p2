@@ -15,6 +15,8 @@ smtp:
   max_connections: 1024          # concurrent connections per listener (0 = unlimited)
   max_connections_per_ip: 50     # concurrent connections per client IP on the inbound listener
   read_timeout: 60s
+  max_session_duration: 30m      # hard cap per SMTP connection (slow-loris); 0 = unlimited
+  data_timeout: 10m              # max time to transmit one message body
   write_timeout: 60s
   tls_cert_file: /etc/secmail/tls.crt   # enables inbound STARTTLS (recommended)
   tls_key_file: /etc/secmail/tls.key
@@ -63,6 +65,7 @@ portal:
   enum_per_ip_burst: 10          # missed (unknown) tokens per IP before throttling — anti-guessing
   enum_global_rps: 20            # aggregate miss rate across all IPs (defeats distributed guessing)
   trust_proxy_headers: true      # behind a reverse proxy / load balancer
+  trusted_proxies: ["10.0.0.10/32"]  # the proxies/LB: only they may set X-Forwarded-For (and the header-mode identity header)
   auth:                          # recipient authentication (see docs/deployment.md)
     mode: otp                    # none | otp | header
     session_secret: ${SECMAIL_SESSION_SECRET}   # >= 32 chars, signs the session cookie
