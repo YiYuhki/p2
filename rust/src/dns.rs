@@ -73,11 +73,11 @@ impl Hickory {
             Ok(b) => b,
             Err(_) => hickory_resolver::TokioResolver::builder_with_config(
                 hickory_resolver::config::ResolverConfig::default(),
-                hickory_resolver::name_server::TokioConnectionProvider::default(),
+                hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
             ),
         };
         Hickory {
-            inner: builder.build(),
+            inner: builder.build().expect("dns resolver"),
         }
     }
 }
@@ -88,7 +88,7 @@ impl Default for Hickory {
     }
 }
 
-fn classify(e: hickory_resolver::ResolveError) -> DnsError {
+fn classify(e: hickory_resolver::net::NetError) -> DnsError {
     if e.is_nx_domain() || e.is_no_records_found() {
         DnsError::NotFound
     } else {
@@ -99,15 +99,25 @@ fn classify(e: hickory_resolver::ResolveError) -> DnsError {
 #[async_trait]
 impl Resolver for Hickory {
     async fn txt(&self, name: &str) -> Result<Vec<String>> {
+        use hickory_resolver::proto::rr::RData;
         let l = self.inner.txt_lookup(fqdn(name)).await.map_err(classify)?;
-        Ok(l.iter()
-            .map(|t| {
-                t.txt_data()
-                    .iter()
-                    .map(|s| String::from_utf8_lossy(s).into_owned())
-                    .collect::<String>()
+        let out: Vec<String> = l
+            .answers()
+            .iter()
+            .filter_map(|r| match &r.data {
+                RData::TXT(t) => Some(
+                    t.txt_data
+                        .iter()
+                        .map(|s| String::from_utf8_lossy(s).into_owned())
+                        .collect::<String>(),
+                ),
+                _ => None,
             })
-            .collect())
+            .collect();
+        if out.is_empty() {
+            return Err(DnsError::NotFound);
+        }
+        Ok(out)
     }
 
     async fn ip(&self, name: &str) -> Result<Vec<IpAddr>> {
@@ -116,16 +126,22 @@ impl Resolver for Hickory {
     }
 
     async fn mx(&self, name: &str) -> Result<Vec<String>> {
+        use hickory_resolver::proto::rr::RData;
         let l = self.inner.mx_lookup(fqdn(name)).await.map_err(classify)?;
         let mut v: Vec<(u16, String)> = l
+            .answers()
             .iter()
-            .map(|m| {
-                (
-                    m.preference(),
-                    m.exchange().to_utf8().trim_end_matches('.').to_string(),
-                )
+            .filter_map(|r| match &r.data {
+                RData::MX(m) => Some((
+                    m.preference,
+                    m.exchange.to_utf8().trim_end_matches('.').to_string(),
+                )),
+                _ => None,
             })
             .collect();
+        if v.is_empty() {
+            return Err(DnsError::NotFound);
+        }
         v.sort();
         Ok(v.into_iter().map(|(_, h)| h).collect())
     }

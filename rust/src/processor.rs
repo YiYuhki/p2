@@ -378,7 +378,7 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_dkim_signature_verifies_downstream() {
-        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap();
+        let key = rsa::PrivateKey::new(&mut getrandom::SysRng, 1024).unwrap();
         use base64::Engine;
         use rsa::pkcs8::EncodePublicKey;
         let txt = format!(

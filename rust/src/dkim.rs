@@ -7,7 +7,7 @@
 use base64::Engine;
 use rsa::pkcs1::{DecodeRsaPrivateKey, DecodeRsaPublicKey};
 use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey};
-use rsa::{Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
+use rsa::{Pkcs1v15Sign, PrivateKey, PublicKey};
 use sha2::{Digest, Sha256};
 
 use crate::authres::sanitize;
@@ -440,7 +440,7 @@ async fn lookup_key<R: Resolver + ?Sized>(
     r: &R,
     selector: &str,
     domain: &str,
-) -> std::result::Result<RsaPublicKey, Fail> {
+) -> std::result::Result<PublicKey, Fail> {
     let txts = match r.txt(&format!("{selector}._domainkey.{domain}")).await {
         Ok(t) => t,
         Err(DnsError::NotFound) => return Err(Fail::Perm),
@@ -465,8 +465,8 @@ async fn lookup_key<R: Resolver + ?Sized>(
     let der = base64::engine::general_purpose::STANDARD
         .decode(p)
         .map_err(|_| Fail::Perm)?;
-    RsaPublicKey::from_public_key_der(&der)
-        .or_else(|_| RsaPublicKey::from_pkcs1_der(&der))
+    PublicKey::from_public_key_der(&der)
+        .or_else(|_| PublicKey::from_pkcs1_der(&der))
         .map_err(|_| Fail::Perm)
 }
 
@@ -477,12 +477,12 @@ async fn lookup_key<R: Resolver + ?Sized>(
 pub struct Signer {
     domain: String,
     selector: String,
-    key: RsaPrivateKey,
+    key: PrivateKey,
     now: fn() -> i64,
 }
 
 impl Signer {
-    pub fn new(domain: &str, selector: &str, key: RsaPrivateKey) -> Self {
+    pub fn new(domain: &str, selector: &str, key: PrivateKey) -> Self {
         Signer {
             domain: domain.into(),
             selector: selector.into(),
@@ -496,8 +496,8 @@ impl Signer {
         if domain.is_empty() || selector.is_empty() {
             return Err("dkim: domain and selector are required".into());
         }
-        let key = RsaPrivateKey::from_pkcs1_pem(pem)
-            .or_else(|_| RsaPrivateKey::from_pkcs8_pem(pem))
+        let key = PrivateKey::from_pkcs1_pem(pem)
+            .or_else(|_| PrivateKey::from_pkcs8_pem(pem))
             .map_err(|e| format!("dkim: parse key: {e}"))?;
         Ok(Self::new(domain, selector, key))
     }
@@ -566,11 +566,11 @@ mod tests {
     use crate::dns::Static;
     use rsa::pkcs8::EncodePublicKey;
 
-    fn key() -> RsaPrivateKey {
-        RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap()
+    fn key() -> PrivateKey {
+        PrivateKey::new(&mut getrandom::SysRng, 1024).unwrap()
     }
 
-    fn txt_for(k: &RsaPrivateKey) -> String {
+    fn txt_for(k: &PrivateKey) -> String {
         let der = k.to_public_key().to_public_key_der().unwrap();
         format!(
             "v=DKIM1; k=rsa; p={}",

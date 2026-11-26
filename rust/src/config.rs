@@ -593,7 +593,7 @@ pub fn load(path: &str) -> Result<Config, String> {
 pub fn load_str(raw: &str) -> Result<Config, String> {
     let expanded = expand_env(raw);
     let mut cfg: Config =
-        serde_yml::from_str(&expanded).map_err(|e| format!("parse config: {e}"))?;
+        serde_norway::from_str(&expanded).map_err(|e| format!("parse config: {e}"))?;
     cfg.validate()?;
     Ok(cfg)
 }

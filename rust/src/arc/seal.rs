@@ -6,7 +6,7 @@
 use base64::Engine;
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::DecodePrivateKey;
-use rsa::{Pkcs1v15Sign, RsaPrivateKey};
+use rsa::{Pkcs1v15Sign, PrivateKey};
 use sha2::{Digest, Sha256};
 
 use super::canon::{relaxed_body, relaxed_header};
@@ -33,13 +33,13 @@ pub struct Sealer {
     domain: String,
     selector: String,
     authserv: String,
-    key: RsaPrivateKey,
+    key: PrivateKey,
     now: Box<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl Sealer {
     /// Returns a Sealer, or `None` when any required field is empty (disabled).
-    pub fn new(domain: &str, selector: &str, authserv: &str, key: RsaPrivateKey) -> Option<Self> {
+    pub fn new(domain: &str, selector: &str, authserv: &str, key: PrivateKey) -> Option<Self> {
         if domain.is_empty() || selector.is_empty() {
             return None;
         }
@@ -59,8 +59,8 @@ impl Sealer {
 
     /// Loads a PEM private key (PKCS#1 or PKCS#8 RSA) and builds a Sealer.
     pub fn load(domain: &str, selector: &str, authserv: &str, pem: &str) -> Result<Self, String> {
-        let key = RsaPrivateKey::from_pkcs1_pem(pem)
-            .or_else(|_| RsaPrivateKey::from_pkcs8_pem(pem))
+        let key = PrivateKey::from_pkcs1_pem(pem)
+            .or_else(|_| PrivateKey::from_pkcs8_pem(pem))
             .map_err(|e| format!("arc: parse key: {e}"))?;
         Self::new(domain, selector, authserv, key)
             .ok_or_else(|| "arc: domain and selector are required".to_string())
@@ -246,7 +246,7 @@ mod tests {
     use super::*;
     use rsa::pkcs1v15::VerifyingKey;
     use rsa::signature::Verifier;
-    use rsa::RsaPublicKey;
+    use rsa::PublicKey;
 
     fn parse_tags(v: &str) -> std::collections::HashMap<String, String> {
         let v: String = v.replace("\r\n", "").replace('\n', "");
@@ -297,7 +297,7 @@ mod tests {
         out
     }
 
-    fn verify(pk: &RsaPublicKey, input: &str, sig_b64: &str) -> bool {
+    fn verify(pk: &PublicKey, input: &str, sig_b64: &str) -> bool {
         let sig = base64::engine::general_purpose::STANDARD
             .decode(sig_b64)
             .unwrap();
@@ -308,9 +308,8 @@ mod tests {
 
     #[test]
     fn seal_round_trip() {
-        let mut rng = rand::thread_rng();
-        let key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let pk = RsaPublicKey::from(&key);
+        let key = PrivateKey::new(&mut getrandom::SysRng, 2048).unwrap();
+        let pk = PublicKey::from(&key);
         let s = Sealer::new("gw.example.com", "arc1", "gw.example.com", key)
             .unwrap()
             .with_now(Box::new(|| 1_700_000_000));
@@ -363,8 +362,7 @@ mod tests {
 
     #[test]
     fn disabled_when_missing_fields() {
-        let mut rng = rand::thread_rng();
-        let key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let key = PrivateKey::new(&mut getrandom::SysRng, 2048).unwrap();
         assert!(Sealer::new("", "s", "a", key).is_none());
     }
 }

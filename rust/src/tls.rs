@@ -25,15 +25,15 @@ pub fn server_config_from_pem(
     cert_pem: &[u8],
     key_pem: &[u8],
 ) -> Result<Arc<ServerConfig>, String> {
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &cert_pem[..])
+    use rustls::pki_types::pem::PemObject;
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
         .collect::<Result<_, _>>()
         .map_err(|e| format!("tls: parse certificate: {e}"))?;
     if certs.is_empty() {
         return Err("tls: no certificate found".into());
     }
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut &key_pem[..])
-        .map_err(|e| format!("tls: parse key: {e}"))?
-        .ok_or("tls: no private key found")?;
+    let key: PrivateKeyDer<'static> =
+        PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| format!("tls: parse key: {e}"))?;
     let cfg = ServerConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .map_err(|e| e.to_string())?
