@@ -36,27 +36,6 @@ fn main() {
     }
 }
 
-/// Adapts a DNSBL checker to the gateway's async connection gate, running the
-/// blocking DNS lookup off the async executor.
-struct DnsblGate {
-    checker: Arc<secmail::dnsbl::Checker<secmail::dnsbl::StdResolver>>,
-}
-
-#[async_trait::async_trait]
-impl secmail::gateway::ConnGate for DnsblGate {
-    async fn gate(&self, ip: std::net::IpAddr) -> Option<secmail::gateway::SmtpError> {
-        let c = self.checker.clone();
-        let zone = tokio::task::spawn_blocking(move || c.listed(ip))
-            .await
-            .ok()
-            .flatten()?;
-        Some(secmail::gateway::SmtpError::new(
-            554,
-            &format!("Client host [{ip}] blocked by {zone}"),
-        ))
-    }
-}
-
 /// Finds `-flag value` in argv.
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -93,6 +72,20 @@ fn smtp_opts(u: &config::Upstream, default_helo: &str) -> SmtpOptions {
         starttls: u.starttls,
         require_tls: u.require_tls,
         insecure_skip_verify: u.insecure_skip_verify,
+    }
+}
+
+/// Connection/session limits shared by the inbound and outbound listeners.
+fn limits(cfg: &Config) -> BackendOptions {
+    let n = |v: i32| usize::try_from(v).unwrap_or(0);
+    BackendOptions {
+        read_timeout: cfg.smtp.read_timeout,
+        write_timeout: cfg.smtp.write_timeout,
+        max_connections: n(cfg.smtp.max_connections),
+        max_connections_per_ip: n(cfg.smtp.max_connections_per_ip),
+        max_recipients: n(cfg.smtp.max_recipients),
+        max_line_length: n(cfg.smtp.max_line_length),
+        ..Default::default()
     }
 }
 
@@ -332,12 +325,10 @@ async fn run(cfg_path: &str) -> Result<(), String> {
         eprintln!("inbound per-IP rate limit enabled");
     }
     let mut conn_gate: Option<Arc<dyn secmail::gateway::ConnGate>> = None;
-    if let Some(checker) =
-        secmail::dnsbl::Checker::new(&cfg.dnsbl.zones, secmail::dnsbl::StdResolver)
+    if let Some(c) =
+        secmail::dnsbl::AsyncChecker::new(&cfg.dnsbl.zones, resolver.clone(), cfg.dnsbl.timeout)
     {
-        conn_gate = Some(Arc::new(DnsblGate {
-            checker: Arc::new(checker),
-        }));
+        conn_gate = Some(Arc::new(c));
         eprintln!("dnsbl enabled: {:?}", cfg.dnsbl.zones);
     }
     let smtp_tls = if cfg.smtp.tls_cert_file.is_empty() {
@@ -362,7 +353,7 @@ async fn run(cfg_path: &str) -> Result<(), String> {
             greylist,
             rate_limit,
             tls: smtp_tls.clone(),
-            ..Default::default()
+            ..limits(&cfg)
         },
     ));
 
@@ -406,7 +397,8 @@ async fn run(cfg_path: &str) -> Result<(), String> {
                 max_message_bytes: cfg.outbound.max_message_bytes as usize,
                 upstream: next_hop.clone(),
                 tls: smtp_tls.clone(),
-                ..Default::default()
+                allowed_clients: cfg.outbound.allowed_clients.clone(),
+                ..limits(&cfg)
             },
         ));
         let out_listen = bind_addr(&cfg.outbound.listen);
