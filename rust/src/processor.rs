@@ -186,25 +186,39 @@ impl MessageProcessor for InboundProcessor {
                 || (name == "authentication-results" && auth_results_id(value) == id)
         });
         let cleaned = pre.to_bytes();
+        drop(pre);
 
-        let quarantined = match &self.service {
-            Some(s) => s.quarantine(env, &cleaned).await?,
-            None => cleaned.clone(),
+        // Quarantine; `modified` tells whether the body changed.
+        let (body, modified) = match &self.service {
+            Some(s) => {
+                let q = s.quarantine(env, &cleaned).await?;
+                let m = q != cleaned;
+                drop(cleaned);
+                (q, m)
+            }
+            None => (cleaned, false),
         };
-        let modified = quarantined != cleaned;
-
-        let mut root = crate::mimetree::parse(&quarantined);
-        if modified && self.opts.strip_original_dkim {
+        let body = if modified && self.opts.strip_original_dkim {
+            let mut root = crate::mimetree::parse(&body);
             root.rename_header("DKIM-Signature", "X-SecMail-Original-DKIM-Signature");
-        }
+            root.to_bytes()
+        } else {
+            body
+        };
+
+        // Prepend trace headers as raw bytes (no re-parse of the message).
+        let mut head = String::new();
+        head.push_str(&fold_header("Received", &self.received(env)));
         if !auth.results.is_empty() {
-            root.prepend_header(
+            head.push_str(&fold_header(
                 "Authentication-Results",
                 &format!("{}; {}", self.opts.hostname, auth.results),
-            );
+            ));
         }
-        root.prepend_header("Received", &self.received(env));
-        let mut out = root.to_bytes();
+        let mut out = Vec::with_capacity(head.len() + body.len());
+        out.extend_from_slice(head.as_bytes());
+        out.extend_from_slice(&body);
+        drop(body);
 
         // ARC-seal before DKIM signing so the seal covers our results. ARC is
         // advisory: a sealing error leaves the message unsealed. Both hash the
@@ -233,6 +247,26 @@ impl MessageProcessor for InboundProcessor {
         }
         Ok(out)
     }
+}
+
+/// "Name: value\r\n", folded at whitespace only when a line nears the
+/// RFC 5322 998-octet limit.
+fn fold_header(name: &str, value: &str) -> String {
+    let mut out = format!("{name}:");
+    let mut col = out.len();
+    for word in value.split(' ').filter(|w| !w.is_empty()) {
+        if col + 1 + word.len() > 900 && col > name.len() + 1 {
+            out.push_str("\r\n\t");
+            col = 1;
+        } else {
+            out.push(' ');
+            col += 1;
+        }
+        out.push_str(word);
+        col += word.len();
+    }
+    out.push_str("\r\n");
+    out
 }
 
 /// Increments inbound_auth{method,result} for each "method=result" entry.

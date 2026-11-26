@@ -127,6 +127,19 @@ pub struct Smtp {
     pub tls_key_file: String,
     pub rate_limit_per_ip_rps: f64,
     pub rate_limit_per_ip_burst: i64,
+    /// Limit on a whole SMTP session (0 = 30m).
+    #[serde(deserialize_with = "dur::de_opt")]
+    pub session_timeout: Duration,
+    /// Limit on one DATA upload (0 = 10m).
+    #[serde(deserialize_with = "dur::de_opt")]
+    pub data_timeout: Duration,
+    /// Limit on processing one message (0 = 5m).
+    #[serde(deserialize_with = "dur::de_opt")]
+    pub process_timeout: Duration,
+    /// Concurrent DATA phases, all clients (0 = 16).
+    pub max_concurrent_data: i32,
+    /// Concurrent DATA phases per client IP / IPv6 /64 (0 = 4).
+    pub max_data_per_ip: i32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -460,6 +473,11 @@ impl Default for Smtp {
             tls_key_file: String::new(),
             rate_limit_per_ip_rps: 0.0,
             rate_limit_per_ip_burst: 0,
+            session_timeout: Duration::ZERO,
+            data_timeout: Duration::ZERO,
+            process_timeout: Duration::ZERO,
+            max_concurrent_data: 0,
+            max_data_per_ip: 0,
         }
     }
 }
@@ -668,6 +686,14 @@ impl Config {
         }
         if (self.portal.tls_cert_file.is_empty()) != (self.portal.tls_key_file.is_empty()) {
             errs.push("portal.tls_cert_file and portal.tls_key_file must be set together".into());
+        }
+        if self.smtp.max_message_bytes <= 0 {
+            errs.push(
+                "smtp.max_message_bytes must be positive (messages are buffered in memory)".into(),
+            );
+        }
+        if self.outbound.enabled && self.outbound.max_message_bytes <= 0 {
+            errs.push("outbound.max_message_bytes must be positive".into());
         }
         if self.smtp.accepted_domains.is_empty() {
             errs.push("smtp.accepted_domains must not be empty (open relay protection)".into());

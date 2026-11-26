@@ -175,9 +175,16 @@ impl Client {
         if code != 354 {
             return Err(Error::Smtp { code, message: m });
         }
-        let stuffed = dot_stuff(msg);
-        self.write_all(&stuffed).await?;
-        let end: &[u8] = if stuffed.is_empty() || stuffed.ends_with(b"\r\n") {
+        // Dot-stuff in bounded chunks instead of copying the whole message.
+        const CHUNK: usize = 64 * 1024;
+        let mut st = StuffState::default();
+        let mut buf = Vec::with_capacity(CHUNK + 1024);
+        for piece in msg.chunks(CHUNK) {
+            buf.clear();
+            st.stuff_into(piece, &mut buf);
+            self.write_all(&buf).await?;
+        }
+        let end: &[u8] = if msg.is_empty() || st.ends_crlf() {
             b".\r\n"
         } else {
             b"\r\n.\r\n"
@@ -347,22 +354,50 @@ pub async fn read_line_limited<R: AsyncBufRead + Unpin>(
 
 /// Dot-stuffs a message per RFC 5321 §4.5.2 (a line starting with "." gets an
 /// extra "."), normalizing bare LF to CRLF. Byte-exact for 8-bit content.
+#[cfg(test)]
 fn dot_stuff(msg: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(msg.len() + 64);
-    let mut bol = true;
-    let mut prev = 0u8;
-    for &b in msg {
-        if bol && b == b'.' {
-            out.push(b'.');
-        }
-        if b == b'\n' && prev != b'\r' {
-            out.push(b'\r');
-        }
-        out.push(b);
-        bol = b == b'\n';
-        prev = b;
-    }
+    StuffState::default().stuff_into(msg, &mut out);
     out
+}
+
+/// Incremental dot-stuffing (and bare-LF -> CRLF) across chunk boundaries.
+struct StuffState {
+    bol: bool,
+    prev: u8,
+    last2: [u8; 2],
+}
+
+impl Default for StuffState {
+    fn default() -> Self {
+        StuffState {
+            bol: true,
+            prev: 0,
+            last2: [0, 0],
+        }
+    }
+}
+
+impl StuffState {
+    fn stuff_into(&mut self, msg: &[u8], out: &mut Vec<u8>) {
+        for &b in msg {
+            if self.bol && b == b'.' {
+                out.push(b'.');
+            }
+            if b == b'\n' && self.prev != b'\r' {
+                out.push(b'\r');
+                self.last2 = [self.last2[1], b'\r'];
+            }
+            out.push(b);
+            self.last2 = [self.last2[1], b];
+            self.bol = b == b'\n';
+            self.prev = b;
+        }
+    }
+
+    fn ends_crlf(&self) -> bool {
+        self.last2 == *b"\r\n"
+    }
 }
 
 /// The host part of "host:port" (for TLS server-name verification).
@@ -526,6 +561,22 @@ mod tests {
         assert!(String::from_utf8_lossy(&stuffed).contains("..hidden"));
         let back = un_dot_stuff(&stuffed);
         assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn chunked_stuffing_matches_whole() {
+        let msg = b"a\r\n.b\n.c\r\nd.\r\n..e\r\n.";
+        let whole = dot_stuff(msg);
+        for split in 0..msg.len() {
+            let mut st = StuffState::default();
+            let mut out = Vec::new();
+            st.stuff_into(&msg[..split], &mut out);
+            st.stuff_into(&msg[split..], &mut out);
+            assert_eq!(out, whole, "split at {split}");
+        }
+        let mut st = StuffState::default();
+        st.stuff_into(b"x\n", &mut Vec::new());
+        assert!(st.ends_crlf(), "bare LF counted as CRLF ending");
     }
 
     #[test]

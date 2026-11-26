@@ -23,9 +23,31 @@ pub struct Greylist {
     // `now` is injectable for tests; it maps a logical clock to Instant-like
     // ordering via a base Instant plus elapsed nanoseconds.
     clock: Box<dyn Fn() -> Instant + Send + Sync>,
-    seen: Mutex<HashMap<String, Entry>>,
+    seen: Mutex<State>,
     max_entries: usize,
+    max_pending_per_ip: usize,
 }
+
+#[derive(Default)]
+struct State {
+    entries: HashMap<String, Entry>,
+    /// Not-yet-passed entries per client IP key (bounds one client's share).
+    pending: HashMap<String, usize>,
+}
+
+impl State {
+    fn dec_pending(&mut self, ip: &str) {
+        if let Some(c) = self.pending.get_mut(ip) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                self.pending.remove(ip);
+            }
+        }
+    }
+}
+
+/// Unpassed triplets one client IP (or /64) may have outstanding.
+pub const DEFAULT_MAX_PENDING_PER_IP: usize = 2_000;
 
 /// Default cap on tracked triplets (bounds memory under a flood of unique
 /// senders/recipients).
@@ -51,20 +73,31 @@ impl Greylist {
             delay,
             expiry,
             clock: Box::new(Instant::now),
-            seen: Mutex::new(HashMap::new()),
+            seen: Mutex::new(State::default()),
             max_entries: DEFAULT_MAX_ENTRIES,
+            max_pending_per_ip: DEFAULT_MAX_PENDING_PER_IP,
         }
     }
 
     /// Caps the number of tracked triplets (0 -> [`DEFAULT_MAX_ENTRIES`]).
-    /// When full, unseen triplets are allowed through without being stored
-    /// (fail open) until [`Greylist::sweep`] frees space.
+    /// When full, an existing entry is evicted for each new triplet; never
+    /// fails open.
     pub fn with_max_entries(mut self, max: usize) -> Self {
         self.max_entries = if max == 0 { DEFAULT_MAX_ENTRIES } else { max };
         self
     }
 
     /// Replace the clock (tests only).
+    /// Caps unpassed triplets per client IP key (0 -> default).
+    pub fn with_max_pending_per_ip(mut self, max: usize) -> Self {
+        self.max_pending_per_ip = if max == 0 {
+            DEFAULT_MAX_PENDING_PER_IP
+        } else {
+            max
+        };
+        self
+    }
+
     pub fn with_clock(mut self, clock: Box<dyn Fn() -> Instant + Send + Sync>) -> Self {
         self.clock = clock;
         self
@@ -81,47 +114,74 @@ impl Greylist {
     pub fn allow(&self, ip: &str, from: &str, to: &str) -> bool {
         let now = (self.clock)();
         let k = Self::key(ip, from, to);
-        let mut seen = self.seen.lock().unwrap();
-        let full = seen.len() >= self.max_entries;
-        match seen.get_mut(&k) {
-            None if full => true,
-            None => {
-                seen.insert(
-                    k,
-                    Entry {
-                        first: now,
-                        last: now,
-                        passed: false,
-                    },
-                );
-                false
-            }
-            Some(e) if e.passed => {
+        let ipk = truncate(ip).to_lowercase();
+        let mut st = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = st.entries.get_mut(&k) {
+            if e.passed {
                 e.last = now;
-                true
+                return true;
             }
-            Some(e) if now.duration_since(e.first) >= self.delay => {
+            if now.duration_since(e.first) >= self.delay {
                 e.passed = true;
                 e.last = now;
-                true
+                st.dec_pending(&ipk);
+                return true;
             }
-            Some(_) => false,
+            return false;
         }
+        // New triplet. A client over its pending quota is simply deferred
+        // (fail closed: it cannot crowd others out of the table).
+        if st.pending.get(&ipk).copied().unwrap_or(0) >= self.max_pending_per_ip {
+            return false;
+        }
+        if st.entries.len() >= self.max_entries {
+            // Evict one entry (O(1) amortized) instead of failing open.
+            if let Some(victim) = st.entries.keys().next().cloned() {
+                if let Some(old) = st.entries.remove(&victim) {
+                    if !old.passed {
+                        let vip = victim.split('\0').next().unwrap_or("").to_string();
+                        st.dec_pending(&vip);
+                    }
+                }
+            }
+        }
+        st.entries.insert(
+            k,
+            Entry {
+                first: now,
+                last: now,
+                passed: false,
+            },
+        );
+        *st.pending.entry(ipk).or_insert(0) += 1;
+        false
     }
 
-    /// Drops entries that have aged out (idle longer than `expiry`).
     pub fn sweep(&self) {
         let now = (self.clock)();
-        let mut seen = self.seen.lock().unwrap();
-        seen.retain(|_, e| {
+        let mut st = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        let expiry = self.expiry;
+        let mut dropped: Vec<String> = Vec::new();
+        st.entries.retain(|k, e| {
             let reference = if e.passed { e.last } else { e.first };
-            now.duration_since(reference) <= self.expiry
+            let keep = now.duration_since(reference) <= expiry;
+            if !keep && !e.passed {
+                dropped.push(k.split('\0').next().unwrap_or("").to_string());
+            }
+            keep
         });
+        for ip in dropped {
+            st.dec_pending(&ip);
+        }
     }
 
     /// Number of tracked triplets (tests/metrics).
     pub fn len(&self) -> usize {
-        self.seen.lock().unwrap().len()
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -200,19 +260,32 @@ mod tests {
     }
 
     #[test]
-    fn bounded_entries_fail_open() {
+    fn bounded_entries_evict_never_fail_open() {
         let (_off, f) = clock();
         let g = Greylist::new(Duration::from_secs(60), Duration::from_secs(3600))
             .with_clock(f)
             .with_max_entries(2);
         assert!(!g.allow("192.0.2.1", "a@ext", "b@us"));
-        assert!(!g.allow("192.0.2.1", "a@ext", "c@us"));
-        assert!(g.allow("192.0.2.1", "a@ext", "d@us"), "full: allowed");
-        assert_eq!(g.len(), 2, "not stored when full");
+        assert!(!g.allow("192.0.2.2", "a@ext", "c@us"));
         assert!(
-            !g.allow("192.0.2.1", "a@ext", "b@us"),
-            "known still deferred"
+            !g.allow("192.0.2.3", "a@ext", "d@us"),
+            "full: still deferred"
         );
+        assert_eq!(g.len(), 2, "evicted one to make room");
+    }
+
+    #[test]
+    fn per_ip_pending_quota() {
+        let (_off, f) = clock();
+        let g = Greylist::new(Duration::from_secs(60), Duration::from_secs(3600))
+            .with_clock(f)
+            .with_max_pending_per_ip(3);
+        for i in 0..10 {
+            assert!(!g.allow("192.0.2.9", "a@ext", &format!("r{i}@us")));
+        }
+        assert_eq!(g.len(), 3, "one client cannot fill the table");
+        assert!(!g.allow("198.51.100.1", "x@ext", "y@us"));
+        assert_eq!(g.len(), 4, "other clients unaffected");
     }
 
     #[test]
@@ -222,6 +295,6 @@ mod tests {
         let long = "é".repeat(10_000);
         g.allow("192.0.2.1", &long, &long);
         let seen = g.seen.lock().unwrap();
-        assert!(seen.keys().all(|k| k.len() <= 3 * MAX_PART_LEN + 2));
+        assert!(seen.entries.keys().all(|k| k.len() <= 3 * MAX_PART_LEN + 2));
     }
 }

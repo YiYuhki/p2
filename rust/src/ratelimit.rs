@@ -59,16 +59,11 @@ impl Limiter {
         let now = (self.clock)();
         let mut buckets = self.buckets.lock().unwrap();
         if buckets.len() >= self.max_keys && !buckets.contains_key(key) {
-            // A fully refilled bucket is indistinguishable from a fresh one, so
-            // dropping those loses no state.
-            let (rps, burst) = (self.rps, self.burst);
-            buckets.retain(|_, b| {
-                b.tokens + now.duration_since(b.updated).as_secs_f64() * rps < burst
-            });
-            if buckets.len() >= self.max_keys {
-                // Still full of active clients: allow without tracking rather
-                // than growing without bound.
-                return true;
+            // Evict one bucket in O(1) amortized time rather than scanning the
+            // whole map under the lock or letting the new key through
+            // untracked. The evicted client merely regains a fresh bucket.
+            if let Some(victim) = buckets.keys().next().cloned() {
+                buckets.remove(&victim);
             }
         }
         let b = buckets.entry(key.to_string()).or_insert(Bucket {
@@ -165,10 +160,9 @@ mod tests {
         let l = Limiter::new(1.0, 1).unwrap().with_clock(f).with_max_keys(2);
         assert!(l.allow("a"));
         assert!(l.allow("b"));
-        assert!(l.allow("c"), "full: allowed untracked");
-        assert_eq!(l.len(), 2);
-        off.store(5_000_000_000, Ordering::SeqCst); // +5s: a, b refilled
-        assert!(l.allow("c"));
-        assert_eq!(l.len(), 1, "refilled buckets evicted, c tracked");
+        assert!(l.allow("c"), "new key tracked after evicting one");
+        assert_eq!(l.len(), 2, "never grows past the cap");
+        assert!(!l.allow("c"), "c is tracked: its burst is spent");
+        let _ = &off;
     }
 }

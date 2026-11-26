@@ -40,6 +40,12 @@ pub const DEFAULT_MAX_RECIPIENTS: usize = 100;
 pub const DEFAULT_MAX_LINE_LENGTH: usize = 2048;
 /// Default cap on concurrent DATA phases (messages buffered in memory).
 pub const DEFAULT_MAX_CONCURRENT_DATA: usize = 16;
+/// Limit on one DATA phase (client upload).
+pub const DEFAULT_DATA_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Concurrent DATA phases from one client IP (or IPv6 /64).
+pub const DEFAULT_MAX_DATA_PER_IP: usize = 4;
+/// Limit on processing one message (quarantine, auth, signing).
+pub const DEFAULT_PROCESS_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// How long DATA waits for a free slot before answering 451.
 const DATA_SLOT_WAIT: Duration = Duration::from_secs(30);
 /// Protocol errors tolerated before the session is dropped.
@@ -154,6 +160,12 @@ pub struct BackendOptions {
     pub max_line_length: usize,
     /// Concurrent DATA phases (0 -> [`DEFAULT_MAX_CONCURRENT_DATA`]).
     pub max_concurrent_data: usize,
+    /// Limit on one DATA upload (0 -> [`DEFAULT_DATA_TIMEOUT`]).
+    pub data_timeout: Duration,
+    /// Concurrent DATA phases per client IP (0 -> [`DEFAULT_MAX_DATA_PER_IP`]).
+    pub max_data_per_ip: usize,
+    /// Limit on processing one message (0 -> [`DEFAULT_PROCESS_TIMEOUT`]).
+    pub process_timeout: Duration,
 }
 
 /// An IP network (address + prefix length) from `allowed_clients`.
@@ -232,6 +244,24 @@ fn ip_key(ip: IpAddr) -> String {
 
 type ConnCounts = Arc<Mutex<HashMap<IpAddr, usize>>>;
 
+/// Takes one slot for `ip` (bucketed) from `counts` unless `max` are in use.
+fn take_slot(counts: &ConnCounts, max: usize, ip: IpAddr) -> Option<IpSlot> {
+    let key = ip_bucket(ip);
+    let mut m = counts.lock().unwrap_or_else(|e| e.into_inner());
+    let c = m.entry(key).or_insert(0);
+    if *c >= max {
+        if *c == 0 {
+            m.remove(&key);
+        }
+        return None;
+    }
+    *c += 1;
+    Some(IpSlot {
+        counts: counts.clone(),
+        key,
+    })
+}
+
 /// Holds one per-IP connection slot; releases it on drop.
 struct IpSlot {
     counts: ConnCounts,
@@ -258,6 +288,8 @@ struct Limits {
     session: Duration,
     max_recipients: usize,
     max_line: usize,
+    data: Duration,
+    process: Duration,
 }
 
 /// The inbound/outbound backend.
@@ -271,6 +303,8 @@ pub struct Backend {
     data_sem: Arc<Semaphore>,
     per_ip: ConnCounts,
     max_per_ip: usize,
+    data_per_ip: ConnCounts,
+    max_data_per_ip: usize,
 }
 
 fn or_default<T: PartialEq + Default>(v: T, d: T) -> T {
@@ -307,7 +341,10 @@ impl Backend {
             session: or_default(opts.session_timeout, DEFAULT_SESSION_TIMEOUT),
             max_recipients: or_default(opts.max_recipients, DEFAULT_MAX_RECIPIENTS),
             max_line: or_default(opts.max_line_length, DEFAULT_MAX_LINE_LENGTH),
+            data: or_default(opts.data_timeout, DEFAULT_DATA_TIMEOUT),
+            process: or_default(opts.process_timeout, DEFAULT_PROCESS_TIMEOUT),
         };
+        let max_data_per_ip = or_default(opts.max_data_per_ip, DEFAULT_MAX_DATA_PER_IP);
         let max_conn = or_default(opts.max_connections, DEFAULT_MAX_CONNECTIONS);
         let max_data = or_default(opts.max_concurrent_data, DEFAULT_MAX_CONCURRENT_DATA);
         let max_per_ip = or_default(opts.max_connections_per_ip, DEFAULT_MAX_CONNECTIONS_PER_IP);
@@ -320,6 +357,8 @@ impl Backend {
             data_sem: Arc::new(Semaphore::new(max_data)),
             per_ip: Arc::new(Mutex::new(HashMap::new())),
             max_per_ip,
+            data_per_ip: Arc::new(Mutex::new(HashMap::new())),
+            max_data_per_ip,
         }
     }
 
@@ -350,17 +389,7 @@ impl Backend {
     }
 
     fn ip_slot(&self, ip: IpAddr) -> Option<IpSlot> {
-        let key = ip_bucket(ip);
-        let mut m = self.per_ip.lock().unwrap_or_else(|e| e.into_inner());
-        let c = m.entry(key).or_insert(0);
-        if *c >= self.max_per_ip {
-            return None;
-        }
-        *c += 1;
-        Some(IpSlot {
-            counts: self.per_ip.clone(),
-            key,
-        })
+        take_slot(&self.per_ip, self.max_per_ip, ip)
     }
 
     /// Writes one reply and closes, bounded by the write timeout.
@@ -639,6 +668,7 @@ impl Backend {
                         Ok(()) => {
                             txn.from = addr;
                             txn.mail_ok = true;
+                            txn.open = true;
                             conn.reply(250, "2.1.0 OK").await?;
                         }
                         Err(e) => conn.upstream_err(e, &mut txn.up).await?,
@@ -669,12 +699,14 @@ impl Backend {
                         }
                     };
                     if txn.rcpt.len() >= lim.max_recipients {
+                        errors += 1;
                         conn.reply(452, "4.5.3 Too many recipients").await?;
                         continue;
                     }
                     if !self.opts.recipient_domains.is_empty()
                         && !domain_in(&addr, &self.opts.recipient_domains)
                     {
+                        errors += 1;
                         conn.reply(550, "5.7.1 Relaying denied").await?;
                         continue;
                     }
@@ -685,6 +717,7 @@ impl Backend {
                             txn.from.as_str()
                         };
                         if !gl.allow(&key, sender, &addr) {
+                            errors += 1;
                             conn.reply(451, "4.7.1 Greylisted, please retry shortly")
                                 .await?;
                             continue;
@@ -714,6 +747,15 @@ impl Backend {
                         conn.reply(503, "5.5.1 Need RCPT command").await?;
                         continue;
                     }
+                    let _data_slot = match take_slot(&self.data_per_ip, self.max_data_per_ip, ip) {
+                        Some(s) => s,
+                        None => {
+                            txn.abort().await;
+                            conn.reply(451, "4.7.0 Too many concurrent messages from your host")
+                                .await?;
+                            continue;
+                        }
+                    };
                     let _data_permit = match timeout(
                         DATA_SLOT_WAIT,
                         self.data_sem.clone().acquire_owned(),
@@ -729,7 +771,9 @@ impl Backend {
                     };
                     conn.reply(354, "Start mail input; end with <CRLF>.<CRLF>")
                         .await?;
-                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let remaining = deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(lim.data);
                     let read = timeout(
                         remaining,
                         smtpclient::read_data_timeout(
@@ -777,7 +821,13 @@ impl Backend {
                         helo: helo.clone(),
                         tls: tls_on,
                     };
-                    let outcome = self.proc.process(&env, &raw).await;
+                    let outcome = match timeout(lim.process, self.proc.process(&env, &raw)).await {
+                        Ok(o) => o,
+                        Err(_) => {
+                            eprintln!("smtp {}: message processing timed out", self.opts.name);
+                            Err(ProcessError::TempFail)
+                        }
+                    };
                     drop(raw);
                     match outcome {
                         Ok(out) => {
@@ -786,8 +836,20 @@ impl Backend {
                                 None => Err(smtpclient::Error::Transport("no upstream".into())),
                             };
                             match res {
-                                Ok(()) => conn.reply(250, "2.0.0 OK: queued").await?,
-                                Err(e) => conn.upstream_err(e, &mut txn.up).await?,
+                                Ok(()) => {
+                                    txn.open = false;
+                                    conn.reply(250, "2.0.0 OK: queued").await?
+                                }
+                                Err(e) => {
+                                    // An SMTP-level rejection leaves the upstream
+                                    // transaction open: RSET it so the session
+                                    // stays in sync.
+                                    let smtp = matches!(e, smtpclient::Error::Smtp { .. });
+                                    conn.upstream_err(e, &mut txn.up).await?;
+                                    if smtp {
+                                        txn.abort().await;
+                                    }
+                                }
                             }
                         }
                         Err(ProcessError::Held) => {
@@ -835,8 +897,10 @@ struct Txn {
     up: Option<Client>,
     from: String,
     rcpt: Vec<String>,
-    /// MAIL was accepted locally and upstream: an upstream transaction is open.
+    /// MAIL was accepted locally and upstream (RCPT/DATA allowed).
     mail_ok: bool,
+    /// An upstream transaction may be open (needs RSET before reuse).
+    open: bool,
 }
 
 impl Txn {
@@ -848,7 +912,8 @@ impl Txn {
 
     /// Clears local state and RSETs the upstream if a transaction is open there.
     async fn abort(&mut self) {
-        if self.mail_ok {
+        if self.open {
+            self.open = false;
             if let Some(c) = self.up.as_mut() {
                 if c.reset().await.is_err() {
                     // Upstream state unknown: drop it; the next MAIL redials.
@@ -1005,9 +1070,17 @@ fn valid_mailbox(addr: &str) -> bool {
     if addr.eq_ignore_ascii_case("postmaster") {
         return true;
     }
+    // SMTPUTF8 is not offered, so addresses must be ASCII; '%' and '!' are
+    // source-routing hacks some upstreams still honour (relay bypass).
+    if !addr.is_ascii() {
+        return false;
+    }
     let Some((local, domain)) = addr.rsplit_once('@') else {
         return false;
     };
+    if local.contains(['%', '!']) {
+        return false;
+    }
     if local.is_empty() || local.len() > 64 || domain.is_empty() || domain.len() > 255 {
         return false;
     }
@@ -1023,7 +1096,7 @@ fn valid_mailbox(addr: &str) -> bool {
         && !domain.contains("..")
         && domain
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b >= 0x80)
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
 }
 
 fn domain_in(addr: &str, domains: &[String]) -> bool {
@@ -1031,7 +1104,10 @@ fn domain_in(addr: &str, domains: &[String]) -> bool {
         Some(i) => i,
         None => return false,
     };
-    let domain = addr[at + 1..].to_lowercase();
+    let domain = addr[at + 1..].to_ascii_lowercase();
+    if !domain.is_ascii() {
+        return false;
+    }
     domains
         .iter()
         .any(|d| domain == *d || (d.starts_with('.') && domain.ends_with(d.as_str())))
@@ -1071,6 +1147,10 @@ mod tests {
         for bad in [
             "TO:victim@evil.com>@example.com",
             "TO:<victim@evil.com>@example.com",
+            "TO:<user%evil.com@example.com>",
+            "TO:<evil.com!user@example.com>",
+            "TO:<ceo@exampl\u{212A}.com>",
+            "TO:<u@\u{0435}xample.com>",
             "TO:victim@example.com",
             "TO:<victim@evil.com",
             "TO:<a b@example.com>",
@@ -1662,5 +1742,191 @@ mod tls_tests {
         })
         .await
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod r2_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    /// Upstream that tracks transaction state like a real MTA and rejects DATA.
+    async fn strict_upstream() -> (String, Arc<Mutex<Vec<String>>>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                let log = log2.clone();
+                tokio::spawn(async move {
+                    let (r, mut w) = tokio::io::split(s);
+                    let mut r = BufReader::new(r);
+                    let _ = w.write_all(b"220 up\r\n").await;
+                    let mut in_txn = false;
+                    loop {
+                        let mut line = String::new();
+                        if r.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            break;
+                        }
+                        let up = line.trim_end().to_uppercase();
+                        let reply: &[u8] = if up.starts_with("MAIL") {
+                            if in_txn {
+                                b"503 5.5.1 nested MAIL\r\n"
+                            } else {
+                                in_txn = true;
+                                b"250 ok\r\n"
+                            }
+                        } else if up == "DATA" {
+                            b"554 5.7.1 no DATA for you\r\n"
+                        } else if up == "RSET" {
+                            in_txn = false;
+                            b"250 ok\r\n"
+                        } else {
+                            b"250 ok\r\n"
+                        };
+                        log.lock()
+                            .unwrap()
+                            .push(format!("{up} -> {}", String::from_utf8_lossy(reply).trim()));
+                        let _ = w.write_all(reply).await;
+                    }
+                });
+            }
+        });
+        (addr, log)
+    }
+
+    struct Pass;
+    #[async_trait]
+    impl MessageProcessor for Pass {
+        async fn process(&self, _e: &Envelope, raw: &[u8]) -> Result<Vec<u8>, ProcessError> {
+            Ok(raw.to_vec())
+        }
+    }
+
+    async fn line(r: &mut BufReader<tokio::io::ReadHalf<TcpStream>>) -> String {
+        let mut all = String::new();
+        loop {
+            let mut l = String::new();
+            r.read_line(&mut l).await.unwrap();
+            all.push_str(&l);
+            if l.as_bytes().get(3) != Some(&b'-') {
+                return all;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_data_reject_keeps_session_in_sync() {
+        let (up, log) = strict_upstream().await;
+        let backend = Arc::new(Backend::new(
+            Arc::new(Pass),
+            BackendOptions {
+                recipient_domains: vec!["example.com".into()],
+                upstream: crate::smtpclient::Options {
+                    addr: up,
+                    timeout: Duration::from_secs(5),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ));
+        let gw = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = gw.local_addr().unwrap();
+        tokio::spawn(backend.serve(gw));
+        let (r, mut w) = tokio::io::split(TcpStream::connect(addr).await.unwrap());
+        let mut r = BufReader::new(r);
+        line(&mut r).await;
+        let mut send = |s: &'static str| {
+            let s = s.to_string();
+            async move { s }
+        };
+        let _ = &mut send;
+        for c in [
+            "EHLO c",
+            "MAIL FROM:<a@x.org>",
+            "RCPT TO:<u@example.com>",
+            "DATA",
+        ] {
+            w.write_all(format!("{c}\r\n").as_bytes()).await.unwrap();
+            let rep = line(&mut r).await;
+            eprintln!("{c} => {rep}");
+        }
+        w.write_all(b"Subject: x\r\n\r\nhi\r\n.\r\n").await.unwrap();
+        eprintln!("body => {}", line(&mut r).await);
+        for c in ["RSET", "MAIL FROM:<b@x.org>"] {
+            w.write_all(format!("{c}\r\n").as_bytes()).await.unwrap();
+            let rep = line(&mut r).await;
+            eprintln!("{c} => {rep}");
+            if c.starts_with("MAIL") {
+                eprintln!("upstream log: {:?}", log.lock().unwrap());
+                assert!(rep.starts_with("250"), "second MAIL failed: {rep}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn greylist_not_exhausted_by_one_session() {
+        let (up, _log) = strict_upstream().await;
+        let gl = Arc::new(
+            crate::greylist::Greylist::new(Duration::from_secs(3600), Duration::ZERO)
+                .with_max_entries(500),
+        );
+        let backend = Arc::new(Backend::new(
+            Arc::new(Pass),
+            BackendOptions {
+                recipient_domains: vec!["example.com".into()],
+                upstream: crate::smtpclient::Options {
+                    addr: up,
+                    timeout: Duration::from_secs(5),
+                    ..Default::default()
+                },
+                greylist: Some(gl.clone()),
+                ..Default::default()
+            },
+        ));
+        let gw = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = gw.local_addr().unwrap();
+        tokio::spawn(backend.serve(gw));
+        let (r, mut w) = tokio::io::split(TcpStream::connect(addr).await.unwrap());
+        let mut r = BufReader::new(r);
+        line(&mut r).await;
+        w.write_all(b"EHLO c\r\nMAIL FROM:<a@x.org>\r\n")
+            .await
+            .unwrap();
+        line(&mut r).await;
+        line(&mut r).await;
+        let mut replies = Vec::new();
+        for i in 0..600 {
+            if w.write_all(format!("RCPT TO:<u{i}@example.com>\r\n").as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+            let mut l = String::new();
+            if r.read_line(&mut l).await.unwrap_or(0) == 0 {
+                break;
+            }
+            let closing = l.starts_with("421");
+            replies.push(l);
+            if closing {
+                break;
+            }
+        }
+        assert!(
+            replies
+                .last()
+                .map(|l| l.starts_with("421"))
+                .unwrap_or(false),
+            "session cut off after repeated greylist deferrals"
+        );
+        assert!(
+            gl.len() <= 25,
+            "one session stored only a few triplets: {}",
+            gl.len()
+        );
+        // A never-seen triplet from another client is still greylisted.
+        assert!(!gl.allow("203.0.113.9", "spam@bad.example", "ceo@example.com"));
     }
 }
