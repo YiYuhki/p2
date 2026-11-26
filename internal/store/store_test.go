@@ -147,6 +147,18 @@ func holdConformance(t *testing.T, s Store) {
 	if g.Status != model.HoldReleased || g.DecidedBy != "sec@example.com" || g.DecidedAt == nil {
 		t.Fatalf("decided: %+v", g)
 	}
+	rs := s.(interface {
+		SetHoldReason(ctx context.Context, id, reason string) error
+	})
+	if err := rs.SetHoldReason(ctx, h1.ID, "relay result unknown"); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ = s.GetHold(ctx, h1.ID); g.Status != model.HoldReleased || g.Reason != "relay result unknown" {
+		t.Fatalf("reason: %+v", g)
+	}
+	if err := rs.SetHoldReason(ctx, h2.ID, "x"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("reason on a HELD hold: %v", err)
+	}
 	ev := &model.DLPEvent{ID: uuid.NewString(), MailFrom: "a@example.com", RcptTo: []string{"x@ext.org"},
 		Action: "hold", Severity: "high", Findings: json.RawMessage(`{}`), HoldID: h1.ID, At: now}
 	if err := s.RecordDLPEvent(ctx, ev); err != nil {

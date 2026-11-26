@@ -28,6 +28,12 @@ func TestClientIPTrustedProxies(t *testing.T) {
 		// Garbage stops the walk at the last address we could vouch for.
 		{"10.0.0.1:1234", []string{"198.51.100.9, junk, 10.0.0.3"}, "10.0.0.3"},
 		{"[::ffff:203.0.113.6]:1", []string{"1.2.3.4"}, "203.0.113.6"},
+		// Hops written with ports or brackets are parsed, not treated as
+		// garbage that stops the walk.
+		{"10.0.0.1:1234", []string{"6.6.6.6, 198.51.100.10:5678, 10.0.0.2:443"}, "198.51.100.10"},
+		{"10.0.0.1:1234", []string{"[2001:db8::7]:80, 10.0.0.2"}, "2001:db8::7"},
+		{"10.0.0.1:1234", []string{"[2001:db8::8]"}, "2001:db8::8"},
+		{"10.0.0.1:1234", []string{"[::ffff:198.51.100.11]:9"}, "198.51.100.11"},
 	}
 	for _, c := range cases {
 		r := httptest.NewRequest("GET", "/", nil)
@@ -45,6 +51,18 @@ func TestClientIPTrustedProxies(t *testing.T) {
 	r.Header.Set("X-Forwarded-For", "1.2.3.4")
 	if got := clientIP(r, nil); got != "10.0.0.1" {
 		t.Errorf("no trusted proxies: got %s", got)
+	}
+
+	// A proxy configured as an IPv4-mapped network matches unmapped peers.
+	mapped, err := config.ParsePrefixes([]string{"::ffff:10.0.0.0/120"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r = httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.9:1"
+	r.Header.Set("X-Forwarded-For", "198.51.100.12")
+	if got := clientIP(r, mapped); got != "198.51.100.12" {
+		t.Errorf("mapped trusted prefix: got %s", got)
 	}
 }
 

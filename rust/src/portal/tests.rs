@@ -1563,8 +1563,13 @@ async fn hold_review_decisions_are_audited() {
 
 /// Raw GET returning (status line + headers, raw body bytes).
 async fn raw_get(addr: &str, path: &str) -> (String, Vec<u8>) {
+    raw_get_ver(addr, path, "1.1").await
+}
+
+/// Raw GET over HTTP/`ver` returning (status line + headers, raw body bytes).
+async fn raw_get_ver(addr: &str, path: &str, ver: &str) -> (String, Vec<u8>) {
     let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let req = format!("GET {path} HTTP/{ver}\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
     s.write_all(req.as_bytes()).await.unwrap();
     let mut buf = Vec::new();
     let _ = s.read_to_end(&mut buf).await;
@@ -1586,32 +1591,46 @@ async fn download_streams_and_aborts_on_truncation() {
     let fs: Arc<dyn Storage> = temp_storage().await;
     let storage: Arc<dyn Storage> =
         Arc::new(crate::storage::Encrypted::new(fs.clone(), &[3u8; 32]).unwrap());
-    seed(&store, &*storage, "tok-stream-0123456789", Status::Clean, 1).await;
     let big: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let mut att = attachment("a1", "m1", "tok-stream-0123456789", Status::Clean, 1);
+    att.size = big.len() as i64;
+    let m = Message {
+        id: "m1".into(),
+        rcpt_to: vec!["a@example.com".into()],
+        ..Default::default()
+    };
+    store.create_message(&m, &[att]).await.unwrap();
     storage.put("obj/a1", &big).await.unwrap();
     let st = Portal::new(store.clone(), storage.clone(), Arc::new(Metrics::new()));
     let addr = serve_state(st).await;
 
     let (head, body) = raw_get(&addr, "/dl/tok-stream-0123456789").await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-    assert!(head
-        .to_ascii_lowercase()
-        .contains("transfer-encoding: chunked"));
-    assert!(body.ends_with(b"0\r\n\r\n"), "complete chunked body");
-    assert_eq!(dechunk(&body), big);
+    assert!(
+        head.to_ascii_lowercase()
+            .contains(&format!("content-length: {}", big.len())),
+        "{head}"
+    );
+    assert_eq!(body, big);
 
-    // Cut the stored ciphertext mid-way: headers go out, but the chunked
-    // body never gets its terminating chunk.
+    // Cut the stored ciphertext mid-way: headers go out, but the body falls
+    // short of the declared Content-Length.
     let ct = fs.get("obj/a1").await.unwrap();
     fs.put("obj/a1", &ct[..ct.len() - 100]).await.unwrap();
     // (If the error hits before hyper flushed the headers, the connection
     // is simply dropped: also an aborted transfer.)
-    let (head, body) = raw_get(&addr, "/dl/tok-stream-0123456789").await;
-    if !head.is_empty() {
-        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-        assert!(!body.ends_with(b"0\r\n\r\n"), "truncated transfer");
+    for ver in ["1.0", "1.1"] {
+        let (head, body) = raw_get_ver(&addr, "/dl/tok-stream-0123456789", ver).await;
+        if !head.is_empty() {
+            assert!(head.contains(" 200 "), "{head}");
+            assert!(
+                head.to_ascii_lowercase()
+                    .contains(&format!("content-length: {}", big.len())),
+                "HTTP/{ver}: {head}"
+            );
+        }
+        assert!(body.len() < big.len(), "HTTP/{ver}: truncated transfer");
     }
-    assert!(body.len() < big.len());
 
     // Undecryptable from the first frame: a proper error page.
     let mut bad = ct.clone();
@@ -1619,4 +1638,305 @@ async fn download_streams_and_aborts_on_truncation() {
     fs.put("obj/a1", &bad).await.unwrap();
     let (head, _) = raw_get(&addr, "/dl/tok-stream-0123456789").await;
     assert!(head.starts_with("HTTP/1.1 500"), "{head}");
+}
+
+/// Review round 2: a decrypt error in a later frame used to end the body
+/// cleanly over HTTP/1.0 (close-delimited, no Content-Length), so a truncated
+/// file looked complete. The declared Content-Length makes the short body
+/// detectable for both protocol versions.
+#[tokio::test]
+async fn r2_truncated_stream_http10_and_11() {
+    use crate::storage::Encrypted;
+    let store: Arc<Memory> = Arc::new(Memory::new());
+    let fs = temp_storage().await;
+    let enc: Arc<dyn Storage> = Arc::new(Encrypted::new(fs.clone(), &[7u8; 32]).unwrap());
+    let size = 3 * 65536 + 10;
+    let mut att = attachment("a1", "m1", "tok", Status::Clean, 1);
+    att.size = size as i64;
+    let m = Message {
+        id: "m1".into(),
+        rcpt_to: vec!["a@example.com".into()],
+        ..Default::default()
+    };
+    store.create_message(&m, &[att]).await.unwrap();
+    let plain = vec![b'A'; size];
+    enc.put("obj/a1", &plain).await.unwrap();
+    let mut ct = fs.get("obj/a1").await.unwrap();
+    // Corrupt the second frame.
+    let idx = 8 + 5 + 65536 + 16 + 5 + 100;
+    ct[idx] ^= 1;
+    fs.put("obj/a1", &ct).await.unwrap();
+    let addr = serve_state(PortalState {
+        store: store.clone(),
+        storage: enc,
+        metrics: Arc::new(Metrics::new()),
+    })
+    .await;
+    for ver in ["1.0", "1.1"] {
+        let (head, body) = raw_get_ver(&addr, "/dl/tok", ver).await;
+        // Either the headers went out (then they declare the full length and
+        // the body falls short of it) or the connection was dropped before
+        // anything was flushed; both are visibly failed transfers.
+        if !head.is_empty() {
+            assert!(head.contains(" 200 "), "HTTP/{ver}: {head}");
+            let lower = head.to_ascii_lowercase();
+            assert!(
+                lower.contains(&format!("content-length: {size}")),
+                "HTTP/{ver}: {head}"
+            );
+            assert!(!lower.contains("transfer-encoding"), "HTTP/{ver}: {head}");
+        }
+        assert!(
+            body.len() < size,
+            "HTTP/{ver}: short body must be detectable, got {} bytes",
+            body.len()
+        );
+    }
+}
+
+/// The stream is also checked against the recorded size: an object that is
+/// longer or shorter than its attachment record aborts the transfer.
+#[tokio::test]
+async fn r2_download_length_mismatch_aborts() {
+    let store = Arc::new(Memory::new());
+    let storage = temp_storage().await;
+    seed(&store, &*storage, "tok-len-0123456789", Status::Clean, 1).await; // size 5
+    let addr = serve_state(Portal::new(
+        store.clone(),
+        storage.clone(),
+        Arc::new(Metrics::new()),
+    ))
+    .await;
+    let (head, body) = raw_get(&addr, "/dl/tok-len-0123456789").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"%PDF%");
+
+    // Longer than recorded.
+    storage.put("obj/a1", &[b'x'; 200_000]).await.unwrap();
+    let (_, body) = raw_get(&addr, "/dl/tok-len-0123456789").await;
+    assert!(
+        body.len() <= 5,
+        "overlong object not served: {}",
+        body.len()
+    );
+    // Shorter than recorded.
+    storage.put("obj/a1", b"%P").await.unwrap();
+    let (_, body) = raw_get(&addr, "/dl/tok-len-0123456789").await;
+    assert!(body.len() < 5);
+
+    // The stream wrapper itself.
+    let chunks = |v: Vec<&'static [u8]>| {
+        futures_util::stream::iter(
+            v.into_iter()
+                .map(|c| Ok::<_, std::io::Error>(axum::body::Bytes::from_static(c))),
+        )
+    };
+    let out: Vec<_> = super::exact_length(chunks(vec![b"ab", b"c"]), Some(3))
+        .collect()
+        .await;
+    assert!(out.iter().all(|r| r.is_ok()) && out.len() == 2);
+    let out: Vec<_> = super::exact_length(chunks(vec![b"ab"]), Some(3))
+        .collect()
+        .await;
+    assert!(out.last().unwrap().is_err(), "short");
+    let out: Vec<_> = super::exact_length(chunks(vec![b"ab", b"cd", b"ef"]), Some(3))
+        .collect()
+        .await;
+    assert_eq!(out.len(), 2, "stops at the overlong chunk");
+    assert!(out[1].is_err());
+}
+
+/// Review round 2: every OTP submission used to drain the shared global miss
+/// budget, so a 404 flood made every user's correct code answer 429.
+#[tokio::test]
+async fn r2_global_miss_flood_blocks_legit_otp() {
+    let mut o = test_options(AuthMode::Otp);
+    o.trust_proxy_headers = true;
+    o.enum_global_rps = 1.0; // burst 2: deterministic exhaustion below
+    let store = Arc::new(Memory::new());
+    let storage = temp_storage().await;
+    let tok = "tok-auth-0123456789";
+    seed(&store, &*storage, tok, Status::Clean, 1).await;
+    let mailer = Arc::new(RecordingMailer::new());
+    let st = PortalState::new(store.clone(), storage, Arc::new(Metrics::new()))
+        .with_options(o)
+        .with_mailer(mailer.clone());
+    let addr = serve_raw(st.with_trusted_proxies(&["127.0.0.1".into()]).unwrap()).await;
+    let base = format!("/dl/{tok}");
+    let victim = [("X-Forwarded-For", "203.0.113.9")];
+    send(
+        &addr,
+        "POST",
+        &format!("{base}/auth"),
+        &victim,
+        Some("email=alice%40example.com"),
+    )
+    .await;
+    let code = mailer.last_code("alice@example.com").unwrap();
+    // Several attacker IPs flood bogus tokens until the global miss budget
+    // is exhausted.
+    for i in 0..15 {
+        for n in 1..=6 {
+            let ip = format!("198.51.100.{n}");
+            let h = [("X-Forwarded-For", ip.as_str())];
+            send(&addr, "GET", &format!("/dl/bogus{i}"), &h, None).await;
+        }
+    }
+    let h = [("X-Forwarded-For", "192.0.2.77")];
+    let r = send(&addr, "GET", "/dl/bogus-x", &h, None).await;
+    assert_eq!(r.code, 429, "global miss budget is exhausted");
+    // A wrong guess is still answered normally (per-IP budget only)...
+    let r = send(
+        &addr,
+        "POST",
+        &format!("{base}/auth"),
+        &victim,
+        Some("email=alice%40example.com&code=000000"),
+    )
+    .await;
+    assert_eq!(r.code, 200);
+    // ...and the correct code logs in.
+    let r = send(
+        &addr,
+        "POST",
+        &format!("{base}/auth"),
+        &victim,
+        Some(&format!("email=alice%40example.com&code={code}")),
+    )
+    .await;
+    assert_eq!(
+        r.code, 303,
+        "legit OTP login blocked by someone else's 404 flood"
+    );
+    assert!(r.header("set-cookie").is_some());
+}
+
+async fn otp_server(o: PortalOptions, lockout: u32) -> (String, Arc<RecordingMailer>, String) {
+    let store = Arc::new(Memory::new());
+    let storage = temp_storage().await;
+    let tok = "tok-auth-0123456789";
+    seed(&store, &*storage, tok, Status::Clean, 1).await;
+    let mailer = Arc::new(RecordingMailer::new());
+    let st = PortalState::new(store.clone(), storage, Arc::new(Metrics::new()))
+        .with_options(o)
+        .with_mailer(mailer.clone());
+    let st = st
+        .with_otp_lockout(lockout, Duration::from_secs(3600))
+        .with_trusted_proxies(&["127.0.0.1".into()])
+        .unwrap();
+    (serve_raw(st).await, mailer, format!("/dl/{tok}/auth"))
+}
+
+/// Correct codes are not charged to the per-IP budget; wrong ones are, and a
+/// client whose budget is spent is refused even with a correct code.
+#[tokio::test]
+async fn r2_otp_per_ip_budget() {
+    let mut o = test_options(AuthMode::Otp);
+    o.trust_proxy_headers = true;
+    o.enum_per_ip_burst = 3;
+    o.otp_resend_after = Duration::from_millis(1);
+    let (addr, mailer, auth) = otp_server(o, 100).await;
+    let ip = [("X-Forwarded-For", "203.0.113.20")];
+    // Five correct logins in a row: none is charged.
+    for _ in 0..5 {
+        send(&addr, "POST", &auth, &ip, Some("email=alice%40example.com")).await;
+        let code = mailer.last_code("alice@example.com").unwrap();
+        let form = format!("email=alice%40example.com&code={code}");
+        let r = send(&addr, "POST", &auth, &ip, Some(&form)).await;
+        assert_eq!(r.code, 303);
+        tokio::time::sleep(Duration::from_millis(3)).await;
+    }
+    // Three wrong guesses spend the budget; the correct code is then refused.
+    send(&addr, "POST", &auth, &ip, Some("email=alice%40example.com")).await;
+    let code = mailer.last_code("alice@example.com").unwrap();
+    for _ in 0..3 {
+        let r = send(
+            &addr,
+            "POST",
+            &auth,
+            &ip,
+            Some("email=bob%40example.com&code=1"),
+        )
+        .await;
+        assert_eq!(r.code, 200);
+    }
+    let form = format!("email=alice%40example.com&code={code}");
+    let r = send(&addr, "POST", &auth, &ip, Some(&form)).await;
+    assert_eq!(r.code, 429);
+}
+
+/// Review round 2: the per-address lockout counted failures for addresses
+/// with no pending code and was keyed on the address alone, so an attacker
+/// could lock any recipient out for the window with a handful of requests.
+#[tokio::test]
+async fn r2_otp_lockout_not_abusable() {
+    let mut o = test_options(AuthMode::Otp);
+    o.trust_proxy_headers = true;
+    o.enum_per_ip_burst = 1000;
+    o.otp_max_attempts = 100;
+    let (addr, mailer, auth) = otp_server(o, 3).await;
+    let attacker = [("X-Forwarded-For", "198.51.100.66")];
+    let victim = [("X-Forwarded-For", "203.0.113.9")];
+    let guess = Some("email=alice%40example.com&code=1");
+
+    // No code pending: wrong guesses do not count toward the lockout.
+    for _ in 0..10 {
+        let r = send(&addr, "POST", &auth, &attacker, guess).await;
+        assert_eq!(r.code, 200);
+    }
+    // The victim requests a code; the attacker guessing against it locks
+    // only itself (address, attacker network).
+    send(
+        &addr,
+        "POST",
+        &auth,
+        &victim,
+        Some("email=alice%40example.com"),
+    )
+    .await;
+    let code = mailer.last_code("alice@example.com").unwrap();
+    for _ in 0..3 {
+        let r = send(&addr, "POST", &auth, &attacker, guess).await;
+        assert_eq!(r.code, 200);
+    }
+    let r = send(&addr, "POST", &auth, &attacker, guess).await;
+    assert_eq!(r.code, 429, "attacker network locked");
+    let form = format!("email=alice%40example.com&code={code}");
+    let r = send(&addr, "POST", &auth, &victim, Some(&form)).await;
+    assert_eq!(r.code, 303, "victim's own network is not locked out");
+
+    // Distributed guessing still hits the per-address ceiling (3 * 5 = 15).
+    send(
+        &addr,
+        "POST",
+        &auth,
+        &victim,
+        Some("email=bob%40example.com"),
+    )
+    .await;
+    for i in 0..15 {
+        let xff = format!("10.1.{i}.1");
+        let h = [("X-Forwarded-For", xff.as_str())];
+        let r = send(
+            &addr,
+            "POST",
+            &auth,
+            &h,
+            Some("email=bob%40example.com&code=1"),
+        )
+        .await;
+        assert_eq!(r.code, 200, "guess {i}");
+    }
+    let r = send(
+        &addr,
+        "POST",
+        &auth,
+        &victim,
+        Some("email=bob%40example.com"),
+    )
+    .await;
+    assert_eq!(
+        r.code, 429,
+        "per-address ceiling locks the address everywhere"
+    );
 }

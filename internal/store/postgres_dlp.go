@@ -145,6 +145,20 @@ func (p *Postgres) ListDLPEvents(ctx context.Context, f EventFilter, limit int, 
 	return out, rows.Err()
 }
 
+// SetHoldReason annotates an already decided hold (e.g. a RELEASED hold
+// whose relay result is unknown). ErrConflict while it is still HELD (or
+// missing).
+func (p *Postgres) SetHoldReason(ctx context.Context, id, reason string) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE dlp_holds SET reason=$2 WHERE id=$1 AND status<>'HELD'`, id, reason)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrConflict
+	}
+	return nil
+}
+
 func (p *Postgres) ReopenHold(ctx context.Context, id string) error {
 	tag, err := p.pool.Exec(ctx, `UPDATE dlp_holds SET status='HELD', decided_by='', reason='', decided_at=NULL
 		WHERE id=$1 AND status='RELEASED'`, id)

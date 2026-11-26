@@ -16,6 +16,8 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 use super::html::esc;
+use super::limiter::GenMap;
+use super::proxy::bucket_key;
 use super::{
     fail, json_error, redirect, render_page, AuthMode, PageData, Portal, Req, MSG_TEMP_ERROR,
     MSG_TOO_MANY,
@@ -293,9 +295,10 @@ pub(crate) async fn otp_login(st: &Portal, r: &Req, g: &Guard) -> Response {
     page.base = g.base.clone();
     page.email = email.clone();
 
-    // Per-address lockout across re-sent codes. Applies to every address
+    // Per-address lockout across re-sent codes, keyed on (address, client
+    // network) plus a higher per-address ceiling. Checked for every address
     // (eligible or not) so it reveals nothing about who received the mail.
-    if st.otp_guard.locked(&email) {
+    if st.otp_guard.locked(&email, &r.ip) {
         eprintln!("portal: otp locked out user={email} resource={}", g.log_id);
         page.error = MSG_OTP_LOCKED.into();
         return render_page(st, StatusCode::TOO_MANY_REQUESTS, page);
@@ -335,31 +338,38 @@ pub(crate) async fn otp_login(st: &Portal, r: &Req, g: &Guard) -> Response {
         return render_page(st, StatusCode::OK, page);
     }
 
-    // Every code guess is charged to the client's miss (enumeration) budget,
-    // so one source cannot guess across many addresses either.
-    if !st.limiter.allow_fail(&r.ip) {
+    // A wrong guess is charged to the client's per-IP (/64) miss budget, so one
+    // source cannot guess across many addresses either. The token is reserved
+    // up front (a client whose budget is spent is refused without checking)
+    // and refunded when the code is correct. The global lookup-miss budget is
+    // never touched: someone else's 404 flood must not block a valid login.
+    let Some(charge) = st.limiter.reserve_guess(&r.ip) else {
         eprintln!("portal: otp guessing throttled ip={}", r.ip);
         page.error = MSG_TOO_MANY.into();
         let mut resp = render_page(st, StatusCode::TOO_MANY_REQUESTS, page);
         resp.headers_mut()
             .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
         return resp;
-    }
-    let valid = match st.codes.check(&email, &code, o.otp_max_attempts).await {
+    };
+    let result = match st.codes.check(&email, &code, o.otp_max_attempts).await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("portal: check otp: {e}");
-            false
+            CodeCheck::NoPending
         }
     };
-    if !valid || !ok {
-        if st.otp_guard.fail(&email) {
-            eprintln!("portal: otp lockout engaged user={email}");
+    if result != CodeCheck::Valid || !ok {
+        // Only a wrong guess against a code that was actually pending counts
+        // toward the lockout: otherwise anyone could lock any address out by
+        // posting codes for it without ever requesting one.
+        if result == CodeCheck::Wrong && st.otp_guard.fail(&email, &r.ip) {
+            eprintln!("portal: otp lockout engaged user={email} ip={}", r.ip);
         }
         page.error = "인증 코드가 올바르지 않거나 만료되었습니다.".into();
         return render_page(st, StatusCode::OK, page);
     }
-    st.otp_guard.reset(&email);
+    charge.refund();
+    st.otp_guard.reset(&email, &r.ip);
     let mut resp = redirect(&g.base);
     set_session(st, &mut resp, &email);
     resp
@@ -465,7 +475,18 @@ pub trait CodeStore: Send + Sync {
     ) -> Result<bool, String>;
     /// Consumes the code on success. After `max_attempts` wrong guesses the
     /// pending code is destroyed.
-    async fn check(&self, email: &str, code: &str, max_attempts: u32) -> Result<bool, String>;
+    async fn check(&self, email: &str, code: &str, max_attempts: u32) -> Result<CodeCheck, String>;
+}
+
+/// The outcome of [`CodeStore::check`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeCheck {
+    /// The code matched the pending one (which is now consumed).
+    Valid,
+    /// A code was pending for the address and the guess did not match.
+    Wrong,
+    /// No (unexpired) code was pending for the address.
+    NoPending,
 }
 
 struct MemCode {
@@ -477,8 +498,15 @@ struct MemCode {
 /// In-memory [`CodeStore`] (single-instance deployments and tests).
 #[derive(Default)]
 pub struct MemoryCodes {
-    inner: Mutex<(HashMap<String, MemCode>, HashMap<String, Instant>)>,
+    #[allow(clippy::type_complexity)]
+    inner: Mutex<(
+        HashMap<String, MemCode>,
+        HashMap<String, Instant>,
+        Option<Instant>,
+    )>,
 }
+
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 impl MemoryCodes {
     pub fn new() -> Self {
@@ -496,11 +524,14 @@ impl CodeStore for MemoryCodes {
         resend_after: Duration,
     ) -> Result<bool, String> {
         let mut g = self.inner.lock().unwrap();
-        let (pending, sent_at) = &mut *g;
+        let (pending, sent_at, last_sweep) = &mut *g;
         let now = Instant::now();
-        // Opportunistic cleanup.
-        pending.retain(|_, p| p.exp > now);
-        sent_at.retain(|_, t| now.duration_since(*t) < resend_after.max(ttl));
+        // Periodic cleanup (at most once a minute, never a scan per request).
+        if last_sweep.map_or(true, |t| now.duration_since(t) >= SWEEP_EVERY) {
+            *last_sweep = Some(now);
+            pending.retain(|_, p| p.exp > now);
+            sent_at.retain(|_, t| now.duration_since(*t) < resend_after.max(ttl));
+        }
         if let Some(t) = sent_at.get(email) {
             if now.duration_since(*t) < resend_after {
                 return Ok(false);
@@ -518,25 +549,25 @@ impl CodeStore for MemoryCodes {
         Ok(true)
     }
 
-    async fn check(&self, email: &str, code: &str, max_attempts: u32) -> Result<bool, String> {
+    async fn check(&self, email: &str, code: &str, max_attempts: u32) -> Result<CodeCheck, String> {
         let mut g = self.inner.lock().unwrap();
         let pending = &mut g.0;
         let Some(p) = pending.get_mut(email) else {
-            return Ok(false);
+            return Ok(CodeCheck::NoPending);
         };
         if Instant::now() > p.exp {
             pending.remove(email);
-            return Ok(false);
+            return Ok(CodeCheck::NoPending);
         }
         if ct_eq(p.hash.as_bytes(), hash_key(&[email, code]).as_bytes()) {
             pending.remove(email);
-            return Ok(true);
+            return Ok(CodeCheck::Valid);
         }
         p.attempts += 1;
         if p.attempts >= max_attempts {
             pending.remove(email);
         }
-        Ok(false)
+        Ok(CodeCheck::Wrong)
     }
 }
 
@@ -549,30 +580,55 @@ pub(crate) const OTP_LOCKOUT_WINDOW: Duration = Duration::from_secs(3600);
 
 const MSG_OTP_LOCKED: &str = "인증 시도가 너무 많아 잠시 잠겼습니다. 나중에 다시 시도하세요.";
 
-/// Counts wrong OTP codes per address across code re-sends. Once
-/// `max_failures` are reached within `window` (fixed window from the first
-/// failure) the address is locked until the window ends: no code is accepted
-/// and no new code is sent.
+/// The per-address ceiling (across all client networks) is this multiple of
+/// the per-(address, network) budget: it only stops distributed guessing and
+/// is deliberately far above what one legitimate user produces.
+const OTP_GLOBAL_FACTOR: u32 = 5;
+/// Per-generation cap on tracked lockout counters (see `GenMap`).
+const OTP_GUARD_MAX_KEYS: usize = 50_000;
+
+/// Counts wrong OTP codes (only guesses against a code that was actually
+/// pending) across code re-sends, keyed on (address, client /64 or IPv4).
+/// Once `max_failures` are reached within `window` (fixed window from the
+/// first failure) that address is locked for that client network until the
+/// window ends; an attacker therefore cannot lock the real user out from the
+/// user's own network. A separate per-address ceiling of
+/// `max_failures * OTP_GLOBAL_FACTOR` caps guessing spread over many networks.
+/// While locked no code is accepted and no new code is sent.
 pub(crate) struct OtpGuard {
     max_failures: u32,
+    global_max: u32,
     window: Duration,
-    failures: Mutex<HashMap<String, (Instant, u32)>>,
+    failures: Mutex<GuardMaps>,
+}
+
+struct GuardMaps {
+    per_client: GenMap<(Instant, u32)>,
+    per_address: GenMap<(Instant, u32)>,
 }
 
 impl OtpGuard {
     pub(crate) fn new(max_failures: u32, window: Duration) -> Self {
+        let max_failures = max_failures.max(1);
         OtpGuard {
-            max_failures: max_failures.max(1),
+            max_failures,
+            global_max: max_failures.saturating_mul(OTP_GLOBAL_FACTOR),
             window,
-            failures: Mutex::new(HashMap::new()),
+            failures: Mutex::new(GuardMaps {
+                per_client: GenMap::new(window, OTP_GUARD_MAX_KEYS),
+                per_address: GenMap::new(window, OTP_GUARD_MAX_KEYS),
+            }),
         }
     }
 
-    fn current(&self, m: &mut HashMap<String, (Instant, u32)>, email: &str) -> u32 {
-        let now = Instant::now();
-        match m.get(email) {
+    fn client_key(email: &str, ip: &str) -> String {
+        format!("{email}\0{}", bucket_key(ip))
+    }
+
+    fn current(&self, m: &mut GenMap<(Instant, u32)>, key: &str, now: Instant) -> u32 {
+        match m.get_mut(key, now) {
             Some((start, _)) if now.duration_since(*start) >= self.window => {
-                m.remove(email);
+                m.remove(key);
                 0
             }
             Some((_, n)) => *n,
@@ -580,28 +636,36 @@ impl OtpGuard {
         }
     }
 
-    pub(crate) fn locked(&self, email: &str) -> bool {
-        let mut m = self.failures.lock().unwrap();
-        self.current(&mut m, email) >= self.max_failures
-    }
-
-    /// Records a wrong code; returns true when this failure locks the address.
-    pub(crate) fn fail(&self, email: &str) -> bool {
-        let mut m = self.failures.lock().unwrap();
+    pub(crate) fn locked(&self, email: &str, ip: &str) -> bool {
         let now = Instant::now();
-        if m.len() > 100_000 {
-            let w = self.window;
-            m.retain(|_, (t, _)| now.duration_since(*t) < w);
-        }
-        let n = self.current(&mut m, email);
-        let e = m.entry(email.to_string()).or_insert((now, 0));
-        e.1 = n + 1;
-        e.1 == self.max_failures
+        let mut g = self.failures.lock().unwrap();
+        let ck = Self::client_key(email, ip);
+        self.current(&mut g.per_client, &ck, now) >= self.max_failures
+            || self.current(&mut g.per_address, email, now) >= self.global_max
     }
 
-    /// Clears the counter after a successful login.
-    pub(crate) fn reset(&self, email: &str) {
-        self.failures.lock().unwrap().remove(email);
+    fn bump(&self, m: &mut GenMap<(Instant, u32)>, key: &str, now: Instant) -> u32 {
+        let n = self.current(m, key, now);
+        let e = m.entry(key, now, || (now, 0));
+        e.1 = n + 1;
+        e.1
+    }
+
+    /// Records a wrong code; returns true when this failure engages a lock.
+    pub(crate) fn fail(&self, email: &str, ip: &str) -> bool {
+        let now = Instant::now();
+        let mut g = self.failures.lock().unwrap();
+        let ck = Self::client_key(email, ip);
+        let c = self.bump(&mut g.per_client, &ck, now);
+        let a = self.bump(&mut g.per_address, email, now);
+        c == self.max_failures || a == self.global_max
+    }
+
+    /// Clears the client's counter after a successful login (the per-address
+    /// ceiling keeps counting so distributed guessing stays capped).
+    pub(crate) fn reset(&self, email: &str, ip: &str) {
+        let mut g = self.failures.lock().unwrap();
+        g.per_client.remove(&Self::client_key(email, ip));
     }
 }
 
@@ -650,25 +714,32 @@ mod tests {
 
     #[tokio::test]
     async fn memory_codes_single_use_resend_and_attempts() {
+        use CodeCheck::*;
         let c = MemoryCodes::new();
         let ttl = Duration::from_secs(600);
         let ra = Duration::from_secs(60);
+        assert_eq!(c.check("a@x.y", "000000", 3).await.unwrap(), NoPending);
         assert!(c.put("a@x.y", "123456", ttl, ra).await.unwrap());
         assert!(
             !c.put("a@x.y", "654321", ttl, ra).await.unwrap(),
             "throttled"
         );
-        assert!(!c.check("a@x.y", "000000", 3).await.unwrap());
-        assert!(c.check("a@x.y", "123456", 3).await.unwrap());
-        assert!(!c.check("a@x.y", "123456", 3).await.unwrap(), "single use");
+        assert_eq!(c.check("a@x.y", "000000", 3).await.unwrap(), Wrong);
+        assert_eq!(c.check("a@x.y", "123456", 3).await.unwrap(), Valid);
+        assert_eq!(
+            c.check("a@x.y", "123456", 3).await.unwrap(),
+            NoPending,
+            "single use"
+        );
 
         let c = MemoryCodes::new();
         c.put("b@x.y", "111111", ttl, ra).await.unwrap();
         for _ in 0..3 {
-            assert!(!c.check("b@x.y", "999999", 3).await.unwrap());
+            assert_eq!(c.check("b@x.y", "999999", 3).await.unwrap(), Wrong);
         }
-        assert!(
-            !c.check("b@x.y", "111111", 3).await.unwrap(),
+        assert_eq!(
+            c.check("b@x.y", "111111", 3).await.unwrap(),
+            NoPending,
             "destroyed after max attempts"
         );
 
@@ -677,23 +748,46 @@ mod tests {
             .await
             .unwrap();
         std::thread::sleep(Duration::from_millis(2));
-        assert!(!c.check("c@x.y", "222222", 3).await.unwrap(), "expired");
+        assert_eq!(
+            c.check("c@x.y", "222222", 3).await.unwrap(),
+            NoPending,
+            "expired"
+        );
     }
 
     #[test]
     fn otp_guard_locks_for_window() {
+        let ip = "192.0.2.1";
         let g = OtpGuard::new(3, Duration::from_millis(50));
-        assert!(!g.fail("a@x.y"));
-        assert!(!g.fail("a@x.y"));
-        assert!(!g.locked("a@x.y"));
-        assert!(g.fail("a@x.y"), "third failure locks");
-        assert!(g.locked("a@x.y"));
-        assert!(!g.locked("b@x.y"), "per address");
+        assert!(!g.fail("a@x.y", ip));
+        assert!(!g.fail("a@x.y", ip));
+        assert!(!g.locked("a@x.y", ip));
+        assert!(g.fail("a@x.y", ip), "third failure locks");
+        assert!(g.locked("a@x.y", ip));
+        assert!(!g.locked("b@x.y", ip), "per address");
+        assert!(!g.locked("a@x.y", "198.51.100.7"), "per client network");
         std::thread::sleep(Duration::from_millis(60));
-        assert!(!g.locked("a@x.y"), "window over");
-        g.fail("b@x.y");
-        g.reset("b@x.y");
-        assert!(!g.fail("b@x.y") && !g.locked("b@x.y"));
+        assert!(!g.locked("a@x.y", ip), "window over");
+        g.fail("b@x.y", ip);
+        g.reset("b@x.y", ip);
+        assert!(!g.fail("b@x.y", ip) && !g.locked("b@x.y", ip));
+    }
+
+    #[test]
+    fn otp_guard_v6_64_and_global_ceiling() {
+        let g = OtpGuard::new(2, Duration::from_secs(3600));
+        g.fail("a@x.y", "2001:db8:1:1::1");
+        g.fail("a@x.y", "2001:db8:1:1::2");
+        assert!(g.locked("a@x.y", "2001:db8:1:1::3"), "same /64");
+        assert!(!g.locked("a@x.y", "2001:db8:1:2::1"), "other /64");
+        // 2 * OTP_GLOBAL_FACTOR = 10 failures in total across networks lock
+        // the address everywhere.
+        for i in 0..8 {
+            assert!(!g.locked("a@x.y", "192.0.2.200"));
+            g.fail("a@x.y", &format!("10.0.{i}.1"));
+        }
+        assert!(g.locked("a@x.y", "192.0.2.200"), "per-address ceiling");
+        assert!(!g.locked("b@x.y", "192.0.2.200"));
     }
 
     #[test]
