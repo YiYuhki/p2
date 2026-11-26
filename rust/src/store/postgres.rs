@@ -41,6 +41,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "migrations/004_admin_actions.sql",
         include_str!("../../migrations/004_admin_actions.sql"),
     ),
+    (
+        "migrations/005_query_indexes.sql",
+        include_str!("../../migrations/005_query_indexes.sql"),
+    ),
 ];
 
 /// Advisory lock id serialising migrations (matches the Go service).
@@ -203,6 +207,15 @@ async fn apply_migrations(client: &mut deadpool_postgres::Client) -> Result<()> 
         tx.commit().await.map_err(other)?;
     }
     Ok(())
+}
+
+/// Maps a unique-key violation on insert to `Conflict` (duplicate id).
+fn insert_err(e: tokio_postgres::Error) -> StoreError {
+    if e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
+        StoreError::Conflict
+    } else {
+        other(e)
+    }
 }
 
 fn other(e: impl std::fmt::Display) -> StoreError {
@@ -383,7 +396,7 @@ impl Store for Postgres {
             ],
         )
         .await
-        .map_err(other)?;
+        .map_err(insert_err)?;
         for a in atts {
             tx.execute(
                 "INSERT INTO attachments
@@ -415,7 +428,7 @@ impl Store for Postgres {
                 ],
             )
             .await
-            .map_err(other)?;
+            .map_err(insert_err)?;
         }
         tx.commit().await.map_err(other)
     }
@@ -513,8 +526,11 @@ impl Store for Postgres {
                 &[&id, &at],
             )
             .await?;
-        if n == 0 && !self.exists("attachments", id).await? {
-            return Err(StoreError::NotFound);
+        if n == 0 {
+            if !self.exists("attachments", id).await? {
+                return Err(StoreError::NotFound);
+            }
+            return Err(StoreError::Conflict);
         }
         Ok(())
     }
@@ -667,7 +683,8 @@ impl Store for Postgres {
         let n = self
             .execute(
                 "UPDATE dlp_holds SET status = $2, decided_by = $3, reason = $4, decided_at = $5
-                 WHERE id = $1::text::uuid AND status = 'HELD'",
+                 WHERE id = $1::text::uuid AND status = 'HELD'
+                   AND ($2 <> 'RELEASED' OR expires_at > $5)",
                 &[&id, &status.as_str(), &by, &reason, &at],
             )
             .await?;
@@ -690,6 +707,25 @@ impl Store for Postgres {
                  SET status = 'HELD', decided_by = '', reason = '', decided_at = NULL
                  WHERE id = $1::text::uuid AND status = 'RELEASED'",
                 &[&id],
+            )
+            .await?;
+        if n == 0 {
+            if !self.exists("dlp_holds", id).await? {
+                return Err(StoreError::NotFound);
+            }
+            return Err(StoreError::Conflict);
+        }
+        Ok(())
+    }
+
+    async fn set_hold_reason(&self, id: &str, reason: &str) -> Result<()> {
+        if !valid_uuid(id) {
+            return Err(StoreError::NotFound);
+        }
+        let n = self
+            .execute(
+                "UPDATE dlp_holds SET reason = $2 WHERE id = $1::text::uuid AND status <> 'HELD'",
+                &[&id, &reason],
             )
             .await?;
         if n == 0 {
@@ -905,7 +941,7 @@ mod tests {
             findings: Some(json!([{"detector": "iban"}])),
             status: HoldStatus::Held,
             created_at,
-            expires_at: created_at + Duration::hours(1),
+            expires_at: created_at + Duration::hours(3),
             decided_at: None,
             decided_by: String::new(),
             reason: String::new(),
@@ -942,6 +978,21 @@ mod tests {
         .await
         .unwrap();
 
+        // Duplicate ids are a conflict (and the transaction inserts nothing).
+        let other_att = id();
+        assert_eq!(
+            s.create_message(
+                &message(&mid),
+                &[att(&other_att, &mid, "x", Status::Pending)]
+            )
+            .await,
+            Err(StoreError::Conflict)
+        );
+        assert_eq!(
+            s.get_attachment(&other_att).await.err(),
+            Some(StoreError::NotFound)
+        );
+
         let m = s.get_message(&mid).await.unwrap();
         assert_eq!(m.rcpt_to, vec!["b@y".to_string(), "c@y".to_string()]);
         assert_eq!(m.attachment_count, 1);
@@ -976,6 +1027,12 @@ mod tests {
         let a = s.get_attachment(&aid).await.unwrap();
         assert_eq!(a.status, Status::Clean);
         assert_eq!(a.verdict_detail, Some(detail));
+        // A verdict landed: requeue is a conflict and leaves attempts alone.
+        assert_eq!(
+            s.mark_requeued(&aid, Utc::now()).await,
+            Err(StoreError::Conflict)
+        );
+        assert_eq!(s.get_attachment(&aid).await.unwrap().attempts, 2);
         assert!(a.analyzed_at.is_some());
 
         // second verdict conflicts (not pending any more)
@@ -1170,6 +1227,25 @@ mod tests {
                 .await,
             Err(StoreError::NotFound)
         );
+        s.set_hold_reason(&ids[1], "updated").await.unwrap();
+        assert_eq!(
+            s.set_hold_reason(&ids[2], "x").await,
+            Err(StoreError::Conflict),
+            "still HELD"
+        );
+        // An overdue hold cannot be released (but can be rejected).
+        let late = id();
+        let mut lh = hold(&late, Utc::now() - Duration::hours(5));
+        lh.expires_at = Utc::now() - Duration::seconds(1);
+        s.create_hold(&lh).await.unwrap();
+        assert_eq!(
+            s.decide_hold(&late, HoldStatus::Released, "x", "", Utc::now())
+                .await,
+            Err(StoreError::Conflict)
+        );
+        s.decide_hold(&late, HoldStatus::Rejected, "x", "", Utc::now())
+            .await
+            .unwrap();
         let h1 = s.get_hold(&ids[1]).await.unwrap();
         assert_eq!(h1.status, HoldStatus::Rejected);
         assert_eq!(h1.decided_by, "sec");
@@ -1180,7 +1256,7 @@ mod tests {
             .list_holds(Some(HoldStatus::Rejected), 50, Page::default())
             .await
             .unwrap();
-        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected.len(), 2); // ids[1] and the overdue hold
         assert_eq!(
             s.list_holds(Some(HoldStatus::Held), 50, Page::default())
                 .await
@@ -1225,7 +1301,7 @@ mod tests {
 
         // expired sweep: only HELD holds past expiry
         let exp = s
-            .list_expired_holds(Utc::now() + Duration::hours(1), 10)
+            .list_expired_holds(Utc::now() + Duration::hours(2), 10)
             .await
             .unwrap();
         assert_eq!(exp.len(), 3);

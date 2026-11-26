@@ -36,6 +36,7 @@ use axum::{
     Router,
 };
 use chrono::{DateTime, FixedOffset, Utc};
+use futures_util::StreamExt;
 
 use crate::metrics::Metrics;
 use crate::model::{Attachment, Status};
@@ -47,6 +48,7 @@ mod auth;
 mod dlp;
 mod html;
 mod limiter;
+mod proxy;
 #[cfg(test)]
 mod tests;
 
@@ -55,9 +57,11 @@ pub use auth::{
     code_message, normalize_email, sign_session, valid_email, verify_session, CodeStore, Mailer,
     MemoryCodes, NoopMailer, RecordingMailer, SESSION_COOKIE,
 };
-pub use dlp::{HoldReviewer, StoreHoldReviewer};
+pub use dlp::{truncate, HoldReviewer, StoreHoldReviewer};
 pub use html::html_escape;
+pub use proxy::{bucket_key, parse_nets, Net};
 
+use auth::OtpGuard;
 use auth::{authorize, Guard, Who};
 use html::{esc, fill, Html};
 use limiter::IpLimiter;
@@ -124,7 +128,8 @@ pub struct PortalOptions {
     /// Enumeration (failed lookup) budget; non-positive -> defaults (10, 20/s).
     pub enum_per_ip_burst: i64,
     pub enum_global_rps: f64,
-    /// Take the client IP from X-Forwarded-For (behind a trusted proxy).
+    /// Take the client IP from X-Forwarded-For. Only honoured for requests
+    /// whose TCP peer is a trusted proxy (see [`Portal::with_trusted_proxies`]).
     pub trust_proxy_headers: bool,
 }
 
@@ -220,6 +225,9 @@ pub struct Portal {
     pub holds: Option<Arc<dyn HoldReviewer>>,
     options: Arc<PortalOptions>,
     limiter: Arc<IpLimiter>,
+    /// Reverse proxies whose X-Forwarded-For / identity header is trusted.
+    trusted_proxies: Arc<Vec<Net>>,
+    otp_guard: Arc<OtpGuard>,
 }
 
 impl Portal {
@@ -235,7 +243,29 @@ impl Portal {
             holds: None,
             limiter: Arc::new(limiter_for(&options)),
             options: Arc::new(options),
+            trusted_proxies: Arc::new(Vec::new()),
+            otp_guard: Arc::new(OtpGuard::new(
+                auth::OTP_LOCKOUT_FAILURES,
+                auth::OTP_LOCKOUT_WINDOW,
+            )),
         }
+    }
+
+    /// Sets the reverse proxies (IP addresses or CIDR networks) allowed to
+    /// supply `X-Forwarded-For` (with `trust_proxy_headers`) and the identity
+    /// header (header auth mode). Requests from any other peer have those
+    /// headers ignored. Errors on an unparsable entry.
+    pub fn with_trusted_proxies(mut self, proxies: &[String]) -> Result<Self, String> {
+        self.trusted_proxies = Arc::new(parse_nets(proxies)?);
+        Ok(self)
+    }
+
+    /// Per-address OTP lockout: after `max_failures` wrong codes within
+    /// `window` (across re-sent codes) the address is locked for the rest of
+    /// the window; no code is accepted or sent meanwhile. Defaults: 10 / 1h.
+    pub fn with_otp_lockout(mut self, max_failures: u32, window: Duration) -> Self {
+        self.otp_guard = Arc::new(OtpGuard::new(max_failures, window));
+        self
     }
 
     /// Replaces the options (and rebuilds the rate limiter from them).
@@ -420,12 +450,19 @@ pub(crate) struct Req {
     pub query: HashMap<String, String>,
     pub form: HashMap<String, String>,
     pub ip: String,
+    /// The TCP peer is a configured trusted proxy (identity header honoured).
+    pub peer_trusted: bool,
 }
 
 impl Req {
     pub(crate) async fn read(st: &Portal, req: Request) -> Req {
         let (parts, body) = req.into_parts();
-        let ip = client_ip(st, &parts.headers, &parts.extensions);
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ConnectInfo(a)| a.ip());
+        let ip = client_ip(st, &parts.headers, peer);
+        let peer_trusted = proxy::is_trusted(peer, &st.trusted_proxies);
         let query = parse_urlencoded(parts.uri.query().unwrap_or(""));
         let form = if parts.method == Method::POST {
             match axum::body::to_bytes(body, 64 * 1024).await {
@@ -441,6 +478,7 @@ impl Req {
             query,
             form,
             ip,
+            peer_trusted,
         }
     }
 
@@ -461,17 +499,21 @@ impl Req {
     }
 }
 
-fn client_ip(st: &Portal, h: &HeaderMap, ext: &axum::http::Extensions) -> String {
-    if st.options.trust_proxy_headers {
-        if let Some(xff) = h.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            let first = xff.split(',').next().unwrap_or("").trim();
-            if !first.is_empty() {
-                return first.to_string();
-            }
-        }
-    }
-    match ext.get::<ConnectInfo<SocketAddr>>() {
-        Some(ConnectInfo(a)) => a.ip().to_string(),
+/// The client address: the TCP peer, or (behind a trusted proxy with
+/// `trust_proxy_headers`) the rightmost untrusted X-Forwarded-For hop.
+fn client_ip(st: &Portal, h: &HeaderMap, peer: Option<std::net::IpAddr>) -> String {
+    let xff: Vec<&str> = h
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    match proxy::client_ip(
+        peer,
+        &xff,
+        st.options.trust_proxy_headers,
+        &st.trusted_proxies,
+    ) {
+        Some(ip) => ip.to_string(),
         None => "unknown".into(),
     }
 }
@@ -916,8 +958,19 @@ async fn download(State(st): State<Portal>, Path(token): Path<String>, req: Requ
         return render_page(&st, code, d);
     }
 
-    let data = match st.storage.get(&a.storage_key).await {
-        Ok(d) => d,
+    // Stream the object (never buffered whole). The first chunk is read
+    // before answering so an unreadable / undecryptable object still gets a
+    // proper error page; a failure later aborts the response mid-body (the
+    // client sees a truncated transfer, never a "complete" corrupt file).
+    let opened = match st.storage.get_stream(&a.storage_key).await {
+        Ok(mut s) => match s.next().await {
+            Some(Err(e)) => Err(e.to_string()),
+            first => Ok((first, s)),
+        },
+        Err(e) => Err(e.to_string()),
+    };
+    let (first, rest) = match opened {
+        Ok(x) => x,
         Err(e) => {
             st.metrics
                 .portal_requests
@@ -948,7 +1001,14 @@ async fn download(State(st): State<Portal>, Path(token): Path<String>, req: Requ
     }
     st.metrics.portal_requests.with_label_values(&["ok"]).inc();
 
-    let mut resp = Response::new(Body::from(data));
+    let attachment_id = a.id.clone();
+    let rest = rest.inspect(move |c| {
+        if let Err(e) = c {
+            eprintln!("portal: download aborted attachment={attachment_id}: {e}");
+        }
+    });
+    let body = futures_util::stream::iter(first).chain(rest);
+    let mut resp = Response::new(Body::from_stream(body));
     let h = resp.headers_mut();
     h.insert(
         header::CONTENT_TYPE,

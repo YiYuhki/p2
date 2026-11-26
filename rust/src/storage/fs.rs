@@ -3,7 +3,11 @@
 
 use async_trait::async_trait;
 
-use super::{Result, Storage, StorageError};
+use axum::body::Bytes;
+use futures_util::stream;
+use tokio::io::AsyncReadExt;
+
+use super::{ByteStream, Result, Storage, StorageError, STREAM_CHUNK};
 
 /// Filesystem-backed object store rooted at `dir`.
 pub struct Fs {
@@ -61,6 +65,35 @@ impl Storage for Fs {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(StorageError::NotFound),
             Err(e) => Err(StorageError::Io(e.to_string())),
         }
+    }
+
+    async fn get_stream(&self, key: &str) -> Result<ByteStream> {
+        let p = self.path(key)?;
+        let f = match tokio::fs::File::open(&p).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::NotFound)
+            }
+            Err(e) => return Err(StorageError::Io(e.to_string())),
+        };
+        Ok(Box::pin(stream::unfold(Some(f), |f| async move {
+            let mut f = f?;
+            let mut buf = vec![0u8; STREAM_CHUNK];
+            let mut n = 0;
+            // Fill the chunk (short reads are legal) so chunks stay ~64 KiB.
+            while n < buf.len() {
+                match f.read(&mut buf[n..]).await {
+                    Ok(0) => break,
+                    Ok(k) => n += k,
+                    Err(e) => return Some((Err(e), None)),
+                }
+            }
+            if n == 0 {
+                return None;
+            }
+            buf.truncate(n);
+            Some((Ok(Bytes::from(buf)), Some(f)))
+        })))
     }
 
     async fn delete(&self, key: &str) -> Result<()> {

@@ -41,6 +41,7 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// AES-256-GCM object encryptor.
+#[derive(Clone)]
 pub struct Encryptor {
     cipher: Aes256Gcm,
 }
@@ -167,6 +168,108 @@ impl Encryptor {
     }
 }
 
+/// Incremental decryptor for the framed wire format: feed ciphertext with
+/// [`StreamDecryptor::push`] and take plaintext frames with
+/// [`StreamDecryptor::next_frame`]. At most one frame (64 KiB) plus the unread
+/// input is buffered, so an object is never held in memory whole.
+pub struct StreamDecryptor {
+    cipher: Aes256Gcm,
+    buf: Vec<u8>,
+    prefix: Option<[u8; 8]>,
+    counter: u32,
+    done: bool,
+}
+
+impl StreamDecryptor {
+    /// Appends ciphertext read from the underlying object.
+    pub fn push(&mut self, data: &[u8]) {
+        if !self.done {
+            self.buf.extend_from_slice(data);
+        }
+    }
+
+    /// Reports whether the final frame has been decrypted.
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
+    /// Decrypts the next complete frame. `Ok(None)` means more input is needed
+    /// (or the stream is done); errors are fatal.
+    pub fn next_frame(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        if self.done {
+            return Ok(None);
+        }
+        let mut pos = 0;
+        let prefix = match self.prefix {
+            Some(p) => p,
+            None => {
+                if self.buf.len() < 8 {
+                    return Ok(None);
+                }
+                let mut p = [0u8; 8];
+                p.copy_from_slice(&self.buf[..8]);
+                self.prefix = Some(p);
+                pos = 8;
+                p
+            }
+        };
+        if self.buf.len() < pos + 5 {
+            self.buf.drain(..pos);
+            return Ok(None);
+        }
+        let b = &self.buf[pos..];
+        let fb = b[0];
+        let ctlen = u32::from_be_bytes([b[1], b[2], b[3], b[4]]) as usize;
+        if ctlen > ENC_CHUNK + TAG_OVERHEAD {
+            return Err(Error::OversizedFrame);
+        }
+        if b.len() < 5 + ctlen {
+            self.buf.drain(..pos);
+            return Ok(None);
+        }
+        let nonce = Encryptor::nonce(&prefix, self.counter);
+        self.counter += 1;
+        let pt = self
+            .cipher
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &b[5..5 + ctlen],
+                    aad: &[fb],
+                },
+            )
+            .map_err(|_| Error::Auth)?;
+        self.buf.drain(..pos + 5 + ctlen);
+        if fb == 1 {
+            self.done = true;
+            self.buf = Vec::new();
+        }
+        Ok(Some(pt))
+    }
+
+    /// Called at end of input: errors unless the final frame was seen.
+    pub fn finish(&self) -> Result<(), Error> {
+        if self.done {
+            Ok(())
+        } else {
+            Err(Error::Truncated)
+        }
+    }
+}
+
+impl Encryptor {
+    /// Starts an incremental decryption.
+    pub fn stream_decryptor(&self) -> StreamDecryptor {
+        StreamDecryptor {
+            cipher: self.cipher.clone(),
+            buf: Vec::new(),
+            prefix: None,
+            counter: 0,
+            done: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +336,49 @@ mod tests {
             e.decrypt(truncated),
             Err(Error::Truncated | Error::Auth)
         ));
+    }
+
+    /// Feeds ciphertext in odd-sized pieces through the incremental decryptor.
+    fn stream_decrypt(e: &Encryptor, ct: &[u8], piece: usize) -> Result<Vec<u8>, Error> {
+        let mut d = e.stream_decryptor();
+        let mut out = Vec::new();
+        for c in ct.chunks(piece.max(1)) {
+            d.push(c);
+            while let Some(pt) = d.next_frame()? {
+                out.extend_from_slice(&pt);
+            }
+        }
+        d.finish()?;
+        Ok(out)
+    }
+
+    #[test]
+    fn stream_decryptor_matches_decrypt() {
+        let e = Encryptor::new(&key()).unwrap();
+        for size in [0usize, 5, ENC_CHUNK, ENC_CHUNK + 7, 3 * ENC_CHUNK] {
+            let plain: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let ct = e.encrypt(&plain);
+            for piece in [1usize, 7, 4096, 1 << 20] {
+                if piece == 1 && size > ENC_CHUNK {
+                    continue; // slow; covered by 7
+                }
+                assert_eq!(
+                    stream_decrypt(&e, &ct, piece).unwrap(),
+                    plain,
+                    "{size}/{piece}"
+                );
+            }
+            // Any truncation is detected.
+            if !ct.is_empty() {
+                let cut = &ct[..ct.len() - 1];
+                assert!(stream_decrypt(&e, cut, 4096).is_err(), "truncated {size}");
+            }
+        }
+        let other = Encryptor::new(&[9u8; 32]).unwrap();
+        assert_eq!(
+            stream_decrypt(&other, &e.encrypt(b"x"), 64),
+            Err(Error::Auth)
+        );
     }
 
     #[test]

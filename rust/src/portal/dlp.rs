@@ -277,7 +277,7 @@ pub(crate) async fn hold_logout(State(st): State<Portal>, Path(token): Path<Stri
 }
 
 /// Truncates to at most `max` bytes on a char boundary.
-pub(crate) fn truncate(s: &str, max: usize) -> String {
+pub fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
@@ -306,12 +306,23 @@ async fn hold_decide(st: Portal, token: String, req: Request, release: bool) -> 
     } else {
         user.clone()
     };
+    let (action, reason) = if release {
+        ("release", String::new())
+    } else {
+        ("reject", truncate(r.form_value("reason").trim(), 300))
+    };
     let res = if release {
         reviewer.release(&h.id, &by).await
     } else {
-        let reason = truncate(r.form_value("reason").trim(), 300);
         reviewer.reject(&h.id, &by, &reason).await
     };
+    let result = match &res {
+        Ok(()) => "ok",
+        Err(StoreError::NotFound) => "notfound",
+        Err(StoreError::Conflict) => "conflict",
+        Err(_) => "error",
+    };
+    super::admin::record_admin(&st, &by, action, &h.id, &reason, result).await;
     if let Ok(fresh) = st.store.get_hold(&h.id).await {
         h = fresh;
     }

@@ -176,6 +176,19 @@ async fn temp_storage() -> Arc<dyn Storage> {
 }
 
 async fn serve_state(st: impl Into<Portal>) -> String {
+    let st: Portal = st.into();
+    // Header-mode fixtures stand in for the authenticating proxy: the test
+    // client connects from loopback, so trust it unless a test chose otherwise.
+    let st = if st.options().auth_mode == AuthMode::Header && st.trusted_proxies.is_empty() {
+        st.with_trusted_proxies(&["127.0.0.1".into()]).unwrap()
+    } else {
+        st
+    };
+    serve_raw(st).await
+}
+
+/// Serves exactly the given portal (no implicit trusted proxy).
+async fn serve_raw(st: Portal) -> String {
     let app = router(st);
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap().to_string();
@@ -1320,4 +1333,290 @@ async fn time_formatting_uses_configured_zone() {
         ..Default::default()
     });
     assert_eq!(st.fmt_time(t, true), "2026-05-01 10:30 -05:00");
+}
+
+// ---------- review regressions ----------
+
+/// Regression: with `trust_proxy_headers` the leftmost (client-controlled)
+/// X-Forwarded-For entry used to be the limiter key, so rotating it bypassed
+/// the per-IP enumeration budget. Without a trusted proxy the header is now
+/// ignored entirely.
+#[tokio::test]
+async fn review_xff_spoof_bypasses_enumeration_limit() {
+    let store = Arc::new(Memory::new());
+    let storage = temp_storage().await;
+    let mut o = test_options(AuthMode::None);
+    o.trust_proxy_headers = true;
+    o.enum_per_ip_burst = 2;
+    o.enum_global_rps = 1000.0;
+    let st = Portal::new(store, storage, Arc::new(Metrics::new())).with_options(o);
+    let addr = serve_state(st).await;
+    let mut n404 = 0;
+    for i in 0..30 {
+        let xff = format!("10.9.{}.{}", i / 250, i % 250);
+        let r = send(
+            &addr,
+            "GET",
+            &format!("/dl/guess{i}"),
+            &[("X-Forwarded-For", &xff)],
+            None,
+        )
+        .await;
+        if r.code == 404 {
+            n404 += 1;
+        }
+    }
+    assert_eq!(n404, 2, "per-IP enumeration budget must hold");
+}
+
+/// Behind a trusted proxy the rightmost untrusted hop is the client; spoofed
+/// entries to its left do not create new buckets.
+#[tokio::test]
+async fn xff_from_trusted_proxy_uses_rightmost_untrusted_hop() {
+    let store = Arc::new(Memory::new());
+    let storage = temp_storage().await;
+    let mut o = test_options(AuthMode::None);
+    o.trust_proxy_headers = true;
+    o.enum_per_ip_burst = 2;
+    o.enum_global_rps = 1000.0;
+    let st = Portal::new(store, storage, Arc::new(Metrics::new()))
+        .with_options(o)
+        .with_trusted_proxies(&["127.0.0.1".into(), "10.0.0.0/8".into()])
+        .unwrap();
+    let addr = serve_raw(st).await;
+    let mut codes = Vec::new();
+    for i in 0..6 {
+        let xff = format!("6.6.6.{i}, 198.51.100.7, 10.0.0.2");
+        codes.push(
+            send(
+                &addr,
+                "GET",
+                &format!("/dl/guess{i}"),
+                &[("X-Forwarded-For", &xff)],
+                None,
+            )
+            .await
+            .code,
+        );
+    }
+    assert_eq!(codes, [404, 404, 429, 429, 429, 429]);
+    // A different real client (rightmost untrusted hop) has its own budget.
+    let r = send(
+        &addr,
+        "GET",
+        "/dl/guess-other",
+        &[("X-Forwarded-For", "198.51.100.8")],
+        None,
+    )
+    .await;
+    assert_eq!(r.code, 404);
+}
+
+/// The identity header is ignored unless the TCP peer is a trusted proxy.
+#[tokio::test]
+async fn header_mode_ignores_identity_from_untrusted_peer() {
+    let store = Arc::new(Memory::new());
+    let storage = temp_storage().await;
+    seed(&store, &*storage, "tok-hdr-0123456789", Status::Clean, 1).await;
+    let mk = || {
+        Portal::new(store.clone(), storage.clone(), Arc::new(Metrics::new()))
+            .with_options(test_options(AuthMode::Header))
+    };
+    let h = [("X-Auth-Request-Email", "bob@example.com")];
+    // No trusted proxies configured.
+    let addr = serve_raw(mk()).await;
+    let r = send(&addr, "GET", "/dl/tok-hdr-0123456789", &h, None).await;
+    assert_eq!(r.code, 401);
+    // Trusted proxies configured, but not this peer.
+    let addr = serve_raw(mk().with_trusted_proxies(&["192.0.2.1".into()]).unwrap()).await;
+    let r = send(&addr, "GET", "/dl/tok-hdr-0123456789", &h, None).await;
+    assert_eq!(r.code, 401);
+    // From the trusted proxy: honoured.
+    let addr = serve_raw(mk().with_trusted_proxies(&["127.0.0.0/8".into()]).unwrap()).await;
+    let r = send(&addr, "GET", "/dl/tok-hdr-0123456789", &h, None).await;
+    assert_eq!(r.code, 200);
+    assert!(
+        Portal::new(store.clone(), storage.clone(), Arc::new(Metrics::new()))
+            .with_trusted_proxies(&["not-an-ip".into()])
+            .is_err()
+    );
+}
+
+/// Regression: re-requesting a code used to reset the attempt counter, giving
+/// unlimited guesses over time. Failures now count per address across codes
+/// and lock the address (no code accepted or sent) for the window.
+#[tokio::test]
+async fn review_otp_attempts_reset_by_resend() {
+    let mut o = test_options(AuthMode::Otp);
+    o.otp_resend_after = Duration::from_millis(1);
+    o.enum_per_ip_burst = 1000; // isolate the per-address lockout
+    let f = auth_fixture(o).await;
+    let mut c = Browser::new(&f.addr);
+    let mut wrong = 0;
+    // Rounds of: fresh code, 3 wrong guesses (the per-code limit).
+    for _ in 0..4 {
+        c.post(&format!("{}/auth", f.base), "email=bob%40example.com")
+            .await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        for _ in 0..3 {
+            let r = c
+                .post(
+                    &format!("{}/auth", f.base),
+                    "email=bob%40example.com&code=999999",
+                )
+                .await;
+            if r.code == 200 {
+                wrong += 1;
+            } else {
+                assert_eq!(r.code, 429);
+                assert!(r.body.contains("잠시 잠겼습니다"));
+            }
+        }
+    }
+    assert_eq!(wrong, 10, "10 wrong guesses per address per window");
+    let sent = f.mailer.sent().len();
+    assert_eq!(sent, 4);
+    // Locked: no new code is mailed...
+    let r = c
+        .post(&format!("{}/auth", f.base), "email=bob%40example.com")
+        .await;
+    assert_eq!(r.code, 429);
+    assert_eq!(f.mailer.sent().len(), sent, "no code sent while locked");
+    // ...and even the correct code is refused.
+    let code = f.mailer.last_code("bob@example.com").unwrap();
+    let r = c
+        .post(
+            &format!("{}/auth", f.base),
+            &format!("email=bob%40example.com&code={code}"),
+        )
+        .await;
+    assert_eq!(r.code, 429);
+    assert!(r.header("set-cookie").is_none());
+    // Other addresses are unaffected.
+    c.post(&format!("{}/auth", f.base), "email=alice%40example.com")
+        .await;
+    let code = f.mailer.last_code("alice@example.com").unwrap();
+    let r = c
+        .post(
+            &format!("{}/auth", f.base),
+            &format!("email=alice%40example.com&code={code}"),
+        )
+        .await;
+    assert_eq!(r.code, 303);
+}
+
+/// OTP guesses are charged to the client's per-IP miss budget, so one source
+/// cannot spread guesses over many addresses.
+#[tokio::test]
+async fn otp_guesses_charge_ip_miss_budget() {
+    let mut o = test_options(AuthMode::Otp);
+    o.enum_per_ip_burst = 3;
+    o.enum_global_rps = 1000.0;
+    let f = auth_fixture(o).await;
+    let mut c = Browser::new(&f.addr);
+    let mut codes = Vec::new();
+    for who in ["alice", "bob", "x1", "x2", "x3"] {
+        codes.push(
+            c.post(
+                &format!("{}/auth", f.base),
+                &format!("email={who}%40example.com&code=123456"),
+            )
+            .await
+            .code,
+        );
+    }
+    assert_eq!(codes, [200, 200, 200, 429, 429]);
+}
+
+/// /dlp/{token} release and reject are written to the admin audit log.
+#[tokio::test]
+async fn hold_review_decisions_are_audited() {
+    let f = hold_fixture(admin_options(AuthMode::None), 2).await;
+    let mut c = Browser::new(&f.addr);
+    let base = format!("/dlp/{HOLD_TOKEN}");
+    let r = c
+        .post(&format!("{base}/reject"), &format!("reason={}", enc("pii")))
+        .await;
+    assert_eq!(r.code, 200);
+    let r = c.post(&format!("{base}/release"), "").await;
+    assert_eq!(r.code, 409);
+    let acts = f
+        .store
+        .list_admin_actions(10, crate::store::Page::default())
+        .await
+        .unwrap();
+    assert_eq!(acts.len(), 2, "{acts:?}");
+    let reject = acts.iter().find(|a| a.action == "reject").unwrap();
+    assert_eq!(
+        (
+            reject.target.as_str(),
+            reject.detail.as_str(),
+            reject.result.as_str()
+        ),
+        (f.ids[0].as_str(), "pii", "ok")
+    );
+    assert_eq!(reject.source, "portal");
+    assert!(reject.actor.starts_with("review-link ("));
+    let release = acts.iter().find(|a| a.action == "release").unwrap();
+    assert_eq!(release.result, "conflict");
+}
+
+/// Raw GET returning (status line + headers, raw body bytes).
+async fn raw_get(addr: &str, path: &str) -> (String, Vec<u8>) {
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf).await;
+    // A response aborted before its headers were flushed reads as empty.
+    let Some(split) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return (String::new(), buf);
+    };
+    (
+        String::from_utf8_lossy(&buf[..split]).into_owned(),
+        buf[split + 4..].to_vec(),
+    )
+}
+
+/// Downloads stream from (encrypted) storage; a truncated object aborts the
+/// transfer instead of completing it, and an undecryptable one is a 500.
+#[tokio::test]
+async fn download_streams_and_aborts_on_truncation() {
+    let store = Arc::new(Memory::new());
+    let fs: Arc<dyn Storage> = temp_storage().await;
+    let storage: Arc<dyn Storage> =
+        Arc::new(crate::storage::Encrypted::new(fs.clone(), &[3u8; 32]).unwrap());
+    seed(&store, &*storage, "tok-stream-0123456789", Status::Clean, 1).await;
+    let big: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    storage.put("obj/a1", &big).await.unwrap();
+    let st = Portal::new(store.clone(), storage.clone(), Arc::new(Metrics::new()));
+    let addr = serve_state(st).await;
+
+    let (head, body) = raw_get(&addr, "/dl/tok-stream-0123456789").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked"));
+    assert!(body.ends_with(b"0\r\n\r\n"), "complete chunked body");
+    assert_eq!(dechunk(&body), big);
+
+    // Cut the stored ciphertext mid-way: headers go out, but the chunked
+    // body never gets its terminating chunk.
+    let ct = fs.get("obj/a1").await.unwrap();
+    fs.put("obj/a1", &ct[..ct.len() - 100]).await.unwrap();
+    // (If the error hits before hyper flushed the headers, the connection
+    // is simply dropped: also an aborted transfer.)
+    let (head, body) = raw_get(&addr, "/dl/tok-stream-0123456789").await;
+    if !head.is_empty() {
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(!body.ends_with(b"0\r\n\r\n"), "truncated transfer");
+    }
+    assert!(body.len() < big.len());
+
+    // Undecryptable from the first frame: a proper error page.
+    let mut bad = ct.clone();
+    bad[20] ^= 1;
+    fs.put("obj/a1", &bad).await.unwrap();
+    let (head, _) = raw_get(&addr, "/dl/tok-stream-0123456789").await;
+    assert!(head.starts_with("HTTP/1.1 500"), "{head}");
 }

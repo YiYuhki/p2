@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use super::html::esc;
 use super::{
     fail, json_error, redirect, render_page, AuthMode, PageData, Portal, Req, MSG_TEMP_ERROR,
+    MSG_TOO_MANY,
 };
 
 /// Name of the session cookie.
@@ -122,7 +123,9 @@ pub(crate) fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
 pub(crate) fn current_user(st: &Portal, r: &Req) -> String {
     let o = st.options();
     match o.auth_mode {
-        AuthMode::Header => {
+        // The identity header is only meaningful when set by the trusted
+        // authenticating proxy; from any other peer it is client-controlled.
+        AuthMode::Header if r.peer_trusted => {
             let u = r
                 .headers
                 .get(o.trusted_header.as_str())
@@ -142,7 +145,7 @@ pub(crate) fn current_user(st: &Portal, r: &Req) -> String {
                 }
             }
         }
-        AuthMode::None => {}
+        AuthMode::Header | AuthMode::None => {}
     }
     String::new()
 }
@@ -290,6 +293,14 @@ pub(crate) async fn otp_login(st: &Portal, r: &Req, g: &Guard) -> Response {
     page.base = g.base.clone();
     page.email = email.clone();
 
+    // Per-address lockout across re-sent codes. Applies to every address
+    // (eligible or not) so it reveals nothing about who received the mail.
+    if st.otp_guard.locked(&email) {
+        eprintln!("portal: otp locked out user={email} resource={}", g.log_id);
+        page.error = MSG_OTP_LOCKED.into();
+        return render_page(st, StatusCode::TOO_MANY_REQUESTS, page);
+    }
+
     if code.is_empty() {
         // Same answer whether or not the address is eligible, so the page does
         // not reveal who received the mail.
@@ -324,6 +335,16 @@ pub(crate) async fn otp_login(st: &Portal, r: &Req, g: &Guard) -> Response {
         return render_page(st, StatusCode::OK, page);
     }
 
+    // Every code guess is charged to the client's miss (enumeration) budget,
+    // so one source cannot guess across many addresses either.
+    if !st.limiter.allow_fail(&r.ip) {
+        eprintln!("portal: otp guessing throttled ip={}", r.ip);
+        page.error = MSG_TOO_MANY.into();
+        let mut resp = render_page(st, StatusCode::TOO_MANY_REQUESTS, page);
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
+        return resp;
+    }
     let valid = match st.codes.check(&email, &code, o.otp_max_attempts).await {
         Ok(v) => v,
         Err(e) => {
@@ -332,9 +353,13 @@ pub(crate) async fn otp_login(st: &Portal, r: &Req, g: &Guard) -> Response {
         }
     };
     if !valid || !ok {
+        if st.otp_guard.fail(&email) {
+            eprintln!("portal: otp lockout engaged user={email}");
+        }
         page.error = "인증 코드가 올바르지 않거나 만료되었습니다.".into();
         return render_page(st, StatusCode::OK, page);
     }
+    st.otp_guard.reset(&email);
     let mut resp = redirect(&g.base);
     set_session(st, &mut resp, &email);
     resp
@@ -515,6 +540,71 @@ impl CodeStore for MemoryCodes {
     }
 }
 
+// ---- per-address OTP lockout ----
+
+/// Default wrong-code budget per address per window.
+pub(crate) const OTP_LOCKOUT_FAILURES: u32 = 10;
+/// Default lockout window.
+pub(crate) const OTP_LOCKOUT_WINDOW: Duration = Duration::from_secs(3600);
+
+const MSG_OTP_LOCKED: &str = "인증 시도가 너무 많아 잠시 잠겼습니다. 나중에 다시 시도하세요.";
+
+/// Counts wrong OTP codes per address across code re-sends. Once
+/// `max_failures` are reached within `window` (fixed window from the first
+/// failure) the address is locked until the window ends: no code is accepted
+/// and no new code is sent.
+pub(crate) struct OtpGuard {
+    max_failures: u32,
+    window: Duration,
+    failures: Mutex<HashMap<String, (Instant, u32)>>,
+}
+
+impl OtpGuard {
+    pub(crate) fn new(max_failures: u32, window: Duration) -> Self {
+        OtpGuard {
+            max_failures: max_failures.max(1),
+            window,
+            failures: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn current(&self, m: &mut HashMap<String, (Instant, u32)>, email: &str) -> u32 {
+        let now = Instant::now();
+        match m.get(email) {
+            Some((start, _)) if now.duration_since(*start) >= self.window => {
+                m.remove(email);
+                0
+            }
+            Some((_, n)) => *n,
+            None => 0,
+        }
+    }
+
+    pub(crate) fn locked(&self, email: &str) -> bool {
+        let mut m = self.failures.lock().unwrap();
+        self.current(&mut m, email) >= self.max_failures
+    }
+
+    /// Records a wrong code; returns true when this failure locks the address.
+    pub(crate) fn fail(&self, email: &str) -> bool {
+        let mut m = self.failures.lock().unwrap();
+        let now = Instant::now();
+        if m.len() > 100_000 {
+            let w = self.window;
+            m.retain(|_, (t, _)| now.duration_since(*t) < w);
+        }
+        let n = self.current(&mut m, email);
+        let e = m.entry(email.to_string()).or_insert((now, 0));
+        e.1 = n + 1;
+        e.1 == self.max_failures
+    }
+
+    /// Clears the counter after a successful login.
+    pub(crate) fn reset(&self, email: &str) {
+        self.failures.lock().unwrap().remove(email);
+    }
+}
+
 /// Escaped `<strong>` helper used by the page renderer.
 pub(crate) fn strong(s: &str) -> String {
     format!("<strong>{}</strong>", esc(s).into_string())
@@ -588,6 +678,22 @@ mod tests {
             .unwrap();
         std::thread::sleep(Duration::from_millis(2));
         assert!(!c.check("c@x.y", "222222", 3).await.unwrap(), "expired");
+    }
+
+    #[test]
+    fn otp_guard_locks_for_window() {
+        let g = OtpGuard::new(3, Duration::from_millis(50));
+        assert!(!g.fail("a@x.y"));
+        assert!(!g.fail("a@x.y"));
+        assert!(!g.locked("a@x.y"));
+        assert!(g.fail("a@x.y"), "third failure locks");
+        assert!(g.locked("a@x.y"));
+        assert!(!g.locked("b@x.y"), "per address");
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(!g.locked("a@x.y"), "window over");
+        g.fail("b@x.y");
+        g.reset("b@x.y");
+        assert!(!g.fail("b@x.y") && !g.locked("b@x.y"));
     }
 
     #[test]

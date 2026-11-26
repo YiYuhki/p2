@@ -48,6 +48,14 @@ impl Store for Memory {
 
     async fn create_message(&self, m: &Message, atts: &[Attachment]) -> Result<()> {
         let mut g = self.inner.lock().unwrap();
+        let mut ids = std::collections::HashSet::new();
+        if g.messages.contains_key(&m.id)
+            || atts
+                .iter()
+                .any(|a| g.atts.contains_key(&a.id) || !ids.insert(a.id.as_str()))
+        {
+            return Err(StoreError::Conflict);
+        }
         g.messages.insert(m.id.clone(), m.clone());
         for a in atts {
             g.by_token.insert(a.token_hash.clone(), a.id.clone());
@@ -134,6 +142,9 @@ impl Store for Memory {
     async fn mark_requeued(&self, id: &str, at: DateTime<Utc>) -> Result<()> {
         let mut g = self.inner.lock().unwrap();
         let a = g.atts.get_mut(id).ok_or(StoreError::NotFound)?;
+        if a.status != Status::Pending {
+            return Err(StoreError::Conflict);
+        }
         a.attempts += 1;
         a.queued_at = at;
         a.updated_at = at;
@@ -158,16 +169,22 @@ impl Store for Memory {
         limit: usize,
     ) -> Result<Vec<Attachment>> {
         let g = self.inner.lock().unwrap();
-        Ok(att_list(&g, limit, |a| {
-            a.status == Status::Pending && a.queued_at < older_than
-        }))
+        Ok(att_list(
+            &g,
+            limit,
+            |a| a.status == Status::Pending && a.queued_at < older_than,
+            |a| a.queued_at,
+        ))
     }
 
     async fn list_expired(&self, now: DateTime<Utc>, limit: usize) -> Result<Vec<Attachment>> {
         let g = self.inner.lock().unwrap();
-        Ok(att_list(&g, limit, |a| {
-            a.status != Status::Expired && a.expires_at < now
-        }))
+        Ok(att_list(
+            &g,
+            limit,
+            |a| a.status != Status::Expired && a.expires_at < now,
+            |a| a.expires_at,
+        ))
     }
 
     async fn mark_expired(&self, id: &str, at: DateTime<Utc>) -> Result<()> {
@@ -229,7 +246,7 @@ impl Store for Memory {
     ) -> Result<()> {
         let mut g = self.inner.lock().unwrap();
         let h = g.holds.get_mut(id).ok_or(StoreError::NotFound)?;
-        if h.status != HoldStatus::Held {
+        if h.status != HoldStatus::Held || (status == HoldStatus::Released && h.expires_at <= at) {
             return Err(StoreError::Conflict);
         }
         h.status = status;
@@ -252,11 +269,28 @@ impl Store for Memory {
         Ok(())
     }
 
+    async fn set_hold_reason(&self, id: &str, reason: &str) -> Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        let h = g.holds.get_mut(id).ok_or(StoreError::NotFound)?;
+        if h.status == HoldStatus::Held {
+            return Err(StoreError::Conflict);
+        }
+        h.reason = reason.to_string();
+        Ok(())
+    }
+
     async fn list_expired_holds(&self, now: DateTime<Utc>, limit: usize) -> Result<Vec<Hold>> {
         let g = self.inner.lock().unwrap();
-        Ok(hold_list(&g, limit, |h| {
-            h.status == HoldStatus::Held && h.expires_at < now
-        }))
+        // Same order as Postgres: oldest expiry first.
+        let mut out: Vec<Hold> = g
+            .holds
+            .values()
+            .filter(|h| h.status == HoldStatus::Held && h.expires_at < now)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.expires_at.cmp(&b.expires_at).then(a.id.cmp(&b.id)));
+        out.truncate(limit);
+        Ok(out)
     }
 
     async fn record_dlp_event(&self, ev: &DlpEvent) -> Result<()> {
@@ -314,9 +348,16 @@ impl Store for Memory {
     }
 }
 
-fn att_list(g: &Inner, limit: usize, keep: impl Fn(&Attachment) -> bool) -> Vec<Attachment> {
+/// Filters attachments and orders them ascending by `key` (ties by id), the
+/// same order the Postgres queries use.
+fn att_list(
+    g: &Inner,
+    limit: usize,
+    keep: impl Fn(&Attachment) -> bool,
+    key: impl Fn(&Attachment) -> DateTime<Utc>,
+) -> Vec<Attachment> {
     let mut out: Vec<Attachment> = g.atts.values().filter(|a| keep(a)).cloned().collect();
-    out.sort_by_key(|a| a.created_at);
+    out.sort_by(|a, b| key(a).cmp(&key(b)).then_with(|| a.id.cmp(&b.id)));
     out.truncate(limit);
     out
 }
@@ -392,6 +433,106 @@ mod tests {
             s.get_attachment("missing").await.err(),
             Some(StoreError::NotFound)
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_ids_requeue_conflict_and_orderings() {
+        let s = Memory::new();
+        let m = Message {
+            id: "m1".into(),
+            ..Default::default()
+        };
+        s.create_message(&m, &[att("a1", Status::Pending)])
+            .await
+            .unwrap();
+        // Duplicate message id: error, and the new attachment is not inserted.
+        assert_eq!(
+            s.create_message(&m, &[att("a2", Status::Pending)]).await,
+            Err(StoreError::Conflict)
+        );
+        assert_eq!(
+            s.get_attachment("a2").await.err(),
+            Some(StoreError::NotFound)
+        );
+        // Duplicate attachment id under a new message.
+        let m2 = Message {
+            id: "m2".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            s.create_message(&m2, &[att("a1", Status::Pending)]).await,
+            Err(StoreError::Conflict)
+        );
+        // mark_requeued only touches PENDING rows.
+        s.mark_requeued("a1", Utc::now()).await.unwrap();
+        s.set_verdict("a1", Status::Clean, "", None, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            s.mark_requeued("a1", Utc::now()).await,
+            Err(StoreError::Conflict)
+        );
+        assert_eq!(s.get_attachment("a1").await.unwrap().attempts, 1);
+
+        // list_stale_pending orders by queued_at, list_expired by expires_at
+        // (not created_at).
+        let now = Utc::now();
+        let mut x = att("x", Status::Pending);
+        let mut y = att("y", Status::Pending);
+        x.created_at = now - Duration::hours(1);
+        y.created_at = now - Duration::hours(2);
+        x.queued_at = now - Duration::hours(3);
+        y.queued_at = now - Duration::hours(2);
+        x.expires_at = now - Duration::hours(3);
+        y.expires_at = now - Duration::hours(2);
+        let m3 = Message {
+            id: "m3".into(),
+            ..Default::default()
+        };
+        s.create_message(&m3, &[y, x]).await.unwrap();
+        let stale = s.list_stale_pending(now, 10).await.unwrap();
+        assert_eq!(
+            stale.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["x", "y"]
+        );
+        let exp = s.list_expired(now, 10).await.unwrap();
+        assert_eq!(
+            exp.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["x", "y"]
+        );
+    }
+
+    #[tokio::test]
+    async fn release_after_expiry_conflicts() {
+        let s = Memory::new();
+        let now = Utc::now();
+        let h = Hold {
+            id: "h".into(),
+            token_hash: "t".into(),
+            mail_from: "a@x".into(),
+            rcpt_to: vec![],
+            subject: "s".into(),
+            storage_key: "k".into(),
+            size: 1,
+            findings: None,
+            status: HoldStatus::Held,
+            created_at: now - Duration::hours(2),
+            expires_at: now - Duration::seconds(1),
+            decided_at: None,
+            decided_by: String::new(),
+            reason: String::new(),
+        };
+        s.create_hold(&h).await.unwrap();
+        assert_eq!(
+            s.decide_hold("h", HoldStatus::Released, "x", "", now).await,
+            Err(StoreError::Conflict)
+        );
+        // Rejecting / expiring an overdue hold is still allowed.
+        s.decide_hold("h", HoldStatus::Rejected, "x", "late", now)
+            .await
+            .unwrap();
+        s.set_hold_reason("h", "changed").await.unwrap();
+        assert_eq!(s.get_hold("h").await.unwrap().reason, "changed");
     }
 
     #[tokio::test]

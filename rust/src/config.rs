@@ -203,8 +203,12 @@ pub struct Portal {
     pub tls_cert_file: String,
     pub tls_key_file: String,
     pub auth: PortalAuth,
-    /// Take the client IP from X-Forwarded-For (behind a trusted proxy).
+    /// Take the client IP from X-Forwarded-For. Honoured only for requests
+    /// arriving from one of `trusted_proxies`; requires that list.
     pub trust_proxy_headers: bool,
+    /// Reverse proxies (IP addresses or CIDR networks) allowed to set
+    /// X-Forwarded-For and, in header auth mode, the identity header.
+    pub trusted_proxies: Vec<String>,
     pub enum_per_ip_burst: i64,
     pub enum_global_rps: f64,
 }
@@ -225,6 +229,11 @@ pub struct PortalAuth {
     pub otp_resend_after: Duration,
     /// Let any user of an accepted domain open attachment links.
     pub allow_domain_users: bool,
+    /// Wrong OTP codes allowed per address within `otp_lockout_window`
+    /// (counted across re-sent codes) before the address is locked.
+    pub otp_lockout_failures: u32,
+    #[serde(deserialize_with = "dur::de_opt")]
+    pub otp_lockout_window: Duration,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -493,6 +502,7 @@ impl Default for Portal {
             tls_key_file: String::new(),
             auth: PortalAuth::default(),
             trust_proxy_headers: false,
+            trusted_proxies: Vec::new(),
             enum_per_ip_burst: 0,
             enum_global_rps: 0.0,
         }
@@ -511,6 +521,8 @@ impl Default for PortalAuth {
             otp_max_attempts: 5,
             otp_resend_after: Duration::from_secs(60),
             allow_domain_users: false,
+            otp_lockout_failures: 10,
+            otp_lockout_window: Duration::from_secs(3600),
         }
     }
 }
@@ -703,8 +715,28 @@ impl Config {
                 if self.portal.auth.trusted_header.is_empty() {
                     errs.push("portal.auth.trusted_header is required in header mode".into());
                 }
+                // The identity header is only trusted from these peers;
+                // without them every client could claim any address.
+                if self.portal.trusted_proxies.is_empty() {
+                    errs.push(
+                        "portal.trusted_proxies is required in header mode (the authenticating proxy)"
+                            .into(),
+                    );
+                }
             }
             v => errs.push(format!("portal.auth.mode: unknown value {v:?}")),
+        }
+        if self.portal.auth.mode == AUTH_OTP && self.portal.auth.otp_lockout_failures == 0 {
+            errs.push("portal.auth.otp_lockout_failures must be at least 1".into());
+        }
+        if self.portal.trust_proxy_headers && self.portal.trusted_proxies.is_empty() {
+            errs.push(
+                "portal.trust_proxy_headers requires portal.trusted_proxies (X-Forwarded-For is client-controlled otherwise)"
+                    .into(),
+            );
+        }
+        if let Err(e) = crate::portal::parse_nets(&self.portal.trusted_proxies) {
+            errs.push(format!("portal.trusted_proxies: {e}"));
         }
 
         if self.outbound.enabled {
@@ -855,7 +887,10 @@ mod tests {
             ("open relay", "upstream: {addr: 'mx:25'}\ninternal_api: {listen: ''}\n".to_string()),
             ("short secret", format!("{base}portal: {{auth: {{mode: otp, session_secret: short, otp_from: a@b.c}}}}\n")),
             ("otp without from", format!("{base}portal: {{auth: {{mode: otp, session_secret: {secret}}}}}\n")),
-            ("header without name", format!("{base}portal: {{auth: {{mode: header}}}}\n")),
+            ("header without name", format!("{base}portal: {{auth: {{mode: header}}, trusted_proxies: [10.0.0.1]}}\n")),
+            ("header without proxies", format!("{base}portal: {{auth: {{mode: header, trusted_header: X-Email}}}}\n")),
+            ("xff without proxies", format!("{base}portal: {{trust_proxy_headers: true}}\n")),
+            ("bad proxy", format!("{base}portal: {{trusted_proxies: ['10.0.0.0/40']}}\n")),
             ("unknown auth mode", format!("{base}portal: {{auth: {{mode: magic}}}}\n")),
             ("weak api token", "upstream: {addr: 'mx:25'}\nsmtp: {accepted_domains: [a.com]}\ninternal_api: {listen: ':8081', token: x}\n".to_string()),
             ("require_tls without starttls", "upstream: {addr: 'mx:25', require_tls: true}\nsmtp: {accepted_domains: [a.com]}\ninternal_api: {listen: ''}\n".to_string()),
@@ -869,5 +904,10 @@ mod tests {
         }
         // require_tls with verified starttls is valid.
         load_str("upstream: {addr: 'mx:25', starttls: true, require_tls: true}\nsmtp: {accepted_domains: [a.com]}\ninternal_api: {listen: ''}\n").expect("require_tls+starttls valid");
+        // Header mode / XFF behind configured proxies is valid.
+        let cfg = load_str(&format!("{base}portal: {{trust_proxy_headers: true, trusted_proxies: [10.0.0.0/8, '::1'], auth: {{mode: header, trusted_header: X-Email}}}}\n"))
+            .expect("header mode behind trusted proxies");
+        assert_eq!(cfg.portal.trusted_proxies.len(), 2);
+        assert_eq!(cfg.portal.auth.otp_lockout_failures, 10);
     }
 }

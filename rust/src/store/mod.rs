@@ -61,6 +61,8 @@ impl Page {
 pub trait Store: Send + Sync {
     async fn ping(&self) -> Result<()>;
 
+    /// Inserts a message and its attachments atomically. A duplicate message
+    /// or attachment id is a `Conflict` and inserts nothing.
     async fn create_message(&self, m: &Message, atts: &[Attachment]) -> Result<()>;
     async fn get_message(&self, id: &str) -> Result<Message>;
     async fn get_attachment(&self, id: &str) -> Result<Attachment>;
@@ -75,13 +77,17 @@ pub trait Store: Send + Sync {
     ) -> Result<()>;
     async fn find_reusable_verdict(&self, sha256: &str, since: DateTime<Utc>)
         -> Result<Attachment>;
+    /// Bumps attempts/queued_at of a still-PENDING attachment. `Conflict` when
+    /// a verdict landed meanwhile (the caller must not enqueue it again).
     async fn mark_requeued(&self, id: &str, at: DateTime<Utc>) -> Result<()>;
     async fn record_download(&self, ev: DownloadEvent) -> Result<()>;
+    /// PENDING attachments queued before `older_than`, oldest `queued_at` first.
     async fn list_stale_pending(
         &self,
         older_than: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<Attachment>>;
+    /// Non-EXPIRED attachments past `expires_at`, oldest `expires_at` first.
     async fn list_expired(&self, now: DateTime<Utc>, limit: usize) -> Result<Vec<Attachment>>;
     async fn mark_expired(&self, id: &str, at: DateTime<Utc>) -> Result<()>;
 
@@ -94,6 +100,8 @@ pub trait Store: Send + Sync {
         limit: usize,
         page: Page,
     ) -> Result<Vec<Hold>>;
+    /// Moves a HELD hold to `status`. `Conflict` when it is no longer HELD, or
+    /// (for RELEASED) when it is already past `expires_at`.
     async fn decide_hold(
         &self,
         id: &str,
@@ -103,6 +111,9 @@ pub trait Store: Send + Sync {
         at: DateTime<Utc>,
     ) -> Result<()>;
     async fn reopen_hold(&self, id: &str) -> Result<()>;
+    /// Overwrites the decision reason of an already-decided hold (e.g. to flag
+    /// a release whose relay outcome is unknown).
+    async fn set_hold_reason(&self, id: &str, reason: &str) -> Result<()>;
     async fn list_expired_holds(&self, now: DateTime<Utc>, limit: usize) -> Result<Vec<Hold>>;
 
     async fn record_dlp_event(&self, ev: &DlpEvent) -> Result<()>;
