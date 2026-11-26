@@ -985,6 +985,12 @@ pub(crate) fn split_uuencode(data: &[u8], max: usize) -> (Vec<u8>, Vec<UuBlock>,
     let mut done = false; // data lines ended (zero-length line seen)
     let mut off = 0;
     let lines: Vec<&[u8]> = data.split_inclusive(|&b| b == b'\n').collect();
+    // end_after[i]: an "end" line exists at or after line i (one O(n) pass,
+    // so the short-mode check below stays linear).
+    let mut end_after = vec![false; lines.len() + 1];
+    for i in (0..lines.len()).rev() {
+        end_after[i] = end_after[i + 1] || trim_eol(lines[i]).trim_ascii() == b"end";
+    }
     for (li, &line) in lines.iter().enumerate() {
         let start = off;
         off += line.len();
@@ -996,10 +1002,11 @@ pub(crate) fn split_uuencode(data: &[u8], max: usize) -> (Vec<u8>, Vec<UuBlock>,
                 // "begin 1 month later" is left alone.
                 let begin = uu_begin(t).filter(|_| {
                     uu_mode_len(t) >= 3
-                        || lines
+                        || (lines
                             .get(li + 1)
                             .map(|n| uu_data_line(trim_eol(n)))
                             .unwrap_or(false)
+                            && end_after[li + 1])
                 });
                 if let Some(name) = begin {
                     if blocks.len() >= max {
@@ -2843,6 +2850,31 @@ mod r3_tests {
         let mut p = parse(raw);
         let r = extract(&mut p, &Options::default()).unwrap();
         assert_eq!(r.attachments.len(), 1);
+    }
+
+    #[test]
+    fn short_mode_begin_flood_is_linear() {
+        let mut body = String::new();
+        for _ in 0..200_000 {
+            body.push_str("begin 1 a\r\n#35H*\r\n");
+        }
+        let raw = format!("From: a@b.c\r\nContent-Type: text/plain\r\n\r\n{body}");
+        let t = std::time::Instant::now();
+        let mut p = parse(raw.as_bytes());
+        let _ = extract(&mut p, &Options::default()).unwrap();
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn begin_list_in_prose_is_not_uuencode() {
+        let raw = b"From: a@b.c\r\nContent-Type: text/plain\r\n\r\nbegin 3 tasks:\r\n1. DRAFT\r\n- ITEM A\r\nthanks\r\n";
+        let mut p = parse(raw);
+        let r = extract(&mut p, &Options::default()).unwrap();
+        assert!(r.attachments.is_empty());
     }
 
     #[test]

@@ -15,15 +15,21 @@ use super::detectors::{
 /// Words marking non-personal registration numbers with the RRN's 6-7 shape.
 static RRN_NEGATIVE: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
     [
+        // Compact forms (whitespace/punctuation removed before matching).
         "사업자등록",
         "사업자번호",
         "법인등록",
         "법인번호",
+        "법인명",
+        "공급자",
+        "공급받는자",
         "차량등록",
         "차량번호",
-        "business reg",
-        "corporate reg",
-        "company reg",
+        "businessreg",
+        "corporatereg",
+        "corporationreg",
+        "corpreg",
+        "companyreg",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -35,11 +41,11 @@ static RRN_POSITIVE: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new
         "주민",
         "외국인",
         "rrn",
-        "resident reg",
-        "resident no",
-        "resident id",
-        "alien reg",
-        "alien no",
+        "residentreg",
+        "residentno",
+        "residentid",
+        "alienreg",
+        "alienno",
         "jumin",
     ]
     .iter()
@@ -317,8 +323,8 @@ impl Scanner {
                         // the 6-7 shape: near those words (and no RRN keyword)
                         // only a checksum-valid number counts.
                         if d.id == "kr_rrn"
-                            && has_context_chars(src_lower, abs_start, abs_end, &RRN_NEGATIVE, 30)
-                            && !has_context_chars(
+                            && has_compact_context(src_lower, abs_start, abs_end, &RRN_NEGATIVE, 30)
+                            && !has_compact_context(
                                 src_lower,
                                 abs_start,
                                 abs_end,
@@ -1071,6 +1077,35 @@ fn has_context(lower: &str, start: usize, end: usize, kws: &[String]) -> bool {
 }
 
 /// Whether one of `kws` occurs within `chars` characters of [start,end).
+/// Like [`has_context_chars`] but ignores whitespace and punctuation on both
+/// sides, so "법인 등록번호", "법인(등록)번호" and "Corp. Reg." match the
+/// compact keywords "법인등록", "corpreg".
+fn has_compact_context(
+    lower: &str,
+    start: usize,
+    end: usize,
+    kws: &[String],
+    chars: usize,
+) -> bool {
+    let lo = lower[..start]
+        .char_indices()
+        .rev()
+        .take(chars)
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(start);
+    let hi = lower[end..]
+        .char_indices()
+        .nth(chars)
+        .map(|(i, _)| end + i)
+        .unwrap_or(lower.len());
+    let win: String = lower[lo..hi]
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect();
+    kws.iter().any(|k| win.contains(k.as_str()))
+}
+
 fn has_context_chars(lower: &str, start: usize, end: usize, kws: &[String], chars: usize) -> bool {
     let lo = lower[..start]
         .char_indices()
@@ -1484,6 +1519,25 @@ mod r2_tests {
             assert!(
                 d.len() != 13 || super::super::detectors::valid_rrn(&d),
                 "{h}"
+            );
+        }
+        // Spaced / punctuated corporate-number labels suppress unchecked
+        // 6-7 numbers too.
+        for label in [
+            "법인 등록번호",
+            "법인(등록)번호",
+            "Corp. Reg. No.",
+            "법인명 (주)가나 등록번호",
+            "공급자 등록번호",
+        ] {
+            assert!(
+                !sc.scan_text(
+                    "x",
+                    &normalize_text(&format!("{label} 110111-4138561"), false)
+                )
+                .iter()
+                .any(|f| f.detector == "kr_rrn"),
+                "{label}"
             );
         }
         // "방법인" is not "법인": a dashed post-2020 RRN (no checksum) counts.
