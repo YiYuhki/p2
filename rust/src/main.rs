@@ -449,7 +449,12 @@ async fn run(cfg_path: &str) -> Result<(), String> {
                 enum_per_ip_burst: cfg.portal.enum_per_ip_burst,
                 enum_global_rps: cfg.portal.enum_global_rps,
                 trust_proxy_headers: cfg.portal.trust_proxy_headers,
-            });
+            })
+            .with_trusted_proxies(&cfg.portal.trusted_proxies)?
+            .with_otp_lockout(
+                cfg.portal.auth.otp_lockout_failures,
+                cfg.portal.auth.otp_lockout_window,
+            );
     if !cfg.portal.auth.otp_from.is_empty() {
         portal = portal.with_mailer(Arc::new(secmail::janitor::SmtpMailer::new(
             upstream.clone(),
@@ -491,13 +496,20 @@ async fn run(cfg_path: &str) -> Result<(), String> {
         metrics: metrics.clone(),
     });
     if !cfg.internal_api.token.is_empty() {
-        app = app.merge(secmail::internalapi::router(
-            secmail::internalapi::ApiState {
-                store: store.clone(),
-                token: cfg.internal_api.token.clone(),
-                admin_token: cfg.internal_api.admin_token.clone(),
-            },
-        ));
+        let mut api = secmail::internalapi::ApiState {
+            store: store.clone(),
+            token: cfg.internal_api.token.clone(),
+            admin_token: cfg.internal_api.admin_token.clone(),
+        }
+        .with_verdicts(verdicts.clone());
+        if cfg.outbound.enabled {
+            api = api.with_holds(Arc::new(secmail::janitor::RelayHoldReviewer::new(
+                store.clone(),
+                storage.clone(),
+                next_hop.clone(),
+            )));
+        }
+        app = app.merge(secmail::internalapi::router(api));
         eprintln!("internal API mounted (/internal/v1/...)");
     }
     eprintln!("ops HTTP (/metrics, /healthz) listening on {ops_listen}");
