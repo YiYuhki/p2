@@ -273,9 +273,14 @@ impl Janitor {
                     }
                     continue;
                 }
-                if let Err(e) = self.store.mark_requeued(&a.id, now).await {
-                    eprintln!("janitor: requeue {}: {e}", a.id);
-                    continue;
+                match self.store.mark_requeued(&a.id, now).await {
+                    Ok(()) => {}
+                    // A verdict landed since the listing: nothing to re-queue.
+                    Err(StoreError::Conflict) => continue,
+                    Err(e) => {
+                        eprintln!("janitor: requeue {}: {e}", a.id);
+                        continue;
+                    }
                 }
                 a.attempts += 1;
                 match self
@@ -339,6 +344,50 @@ impl Janitor {
     }
 }
 
+/// Reason recorded on a RELEASED hold whose relay may or may not have landed.
+pub const RELAY_UNKNOWN: &str = "relay result unknown";
+
+/// Outcome of relaying one message.
+#[derive(Debug)]
+pub enum RelayOutcome {
+    Delivered,
+    /// Failed before the next hop could have accepted the message.
+    NotSent(String),
+    /// Failed during or after DATA without a definite SMTP rejection: the
+    /// next hop may have accepted (and will deliver) the message.
+    Unknown(String),
+}
+
+/// Relays a message, classifying failures by whether the message may have
+/// been accepted. QUIT errors are ignored (the message was already accepted).
+pub async fn relay(opts: &SmtpOptions, from: &str, to: &[String], msg: &[u8]) -> RelayOutcome {
+    use crate::smtpclient::{Client, Error};
+    let mut c = match Client::dial(opts).await {
+        Ok(c) => c,
+        Err(e) => return RelayOutcome::NotSent(e.to_string()),
+    };
+    if let Err(e) = c.mail(from).await {
+        return RelayOutcome::NotSent(e.to_string());
+    }
+    for t in to {
+        if let Err(e) = c.rcpt(t).await {
+            return RelayOutcome::NotSent(e.to_string());
+        }
+    }
+    match c.data(msg).await {
+        Ok(()) => {
+            let _ = c.quit().await;
+            RelayOutcome::Delivered
+        }
+        // An SMTP reply code (DATA refused, or the final reply after the
+        // message was a 4xx/5xx) is a definite "not accepted".
+        Err(e @ Error::Smtp { .. }) => RelayOutcome::NotSent(e.to_string()),
+        // A transport error mid-DATA (or while waiting for the final reply)
+        // leaves the outcome unknown.
+        Err(e @ Error::Transport(_)) => RelayOutcome::Unknown(e.to_string()),
+    }
+}
+
 /// DLP review decisions that relay a released hold to the outbound next hop.
 pub struct RelayHoldReviewer {
     store: Arc<dyn Store>,
@@ -372,14 +421,24 @@ impl crate::portal::HoldReviewer for RelayHoldReviewer {
         self.store
             .decide_hold(id, HoldStatus::Released, by, "", Utc::now())
             .await?;
-        if let Err(e) =
-            crate::smtpclient::send(&self.next_hop, &h.mail_from, &h.rcpt_to, &raw).await
-        {
-            let _ = self.store.reopen_hold(id).await;
-            return Err(StoreError::Other(format!("relay released message: {e}")));
+        match relay(&self.next_hop, &h.mail_from, &h.rcpt_to, &raw).await {
+            RelayOutcome::Delivered => {
+                let _ = self.storage.delete(&h.storage_key).await;
+                Ok(())
+            }
+            RelayOutcome::NotSent(e) => {
+                let _ = self.store.reopen_hold(id).await;
+                Err(StoreError::Other(format!("relay released message: {e}")))
+            }
+            RelayOutcome::Unknown(e) => {
+                // The message may already have been accepted: never reopen
+                // (a second release would duplicate it). Keep RELEASED, flag
+                // it, and keep the stored copy for manual follow-up.
+                eprintln!("janitor: relay result unknown for hold {id}: {e}");
+                let _ = self.store.set_hold_reason(id, RELAY_UNKNOWN).await;
+                Err(StoreError::Other(format!("{RELAY_UNKNOWN}: {e}")))
+            }
         }
-        let _ = self.storage.delete(&h.storage_key).await;
-        Ok(())
     }
 
     async fn reject(&self, id: &str, by: &str, reason: &str) -> Result<(), StoreError> {
@@ -628,6 +687,121 @@ mod tests {
             store.get_hold("h2").await.unwrap().status,
             HoldStatus::Rejected
         );
+    }
+
+    /// SMTP sink whose behaviour after the message body is scripted:
+    /// `after_data` is the reply to the end of DATA (None: drop the
+    /// connection without replying); QUIT is never answered.
+    async fn scripted_sink(after_data: Option<&'static str>) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (s, _) = l.accept().await.unwrap();
+            let mut c = BufReader::new(s);
+            c.write_all(b"220 sink\r\n").await.unwrap();
+            loop {
+                let mut line = String::new();
+                if c.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let up = line.to_ascii_uppercase();
+                if up.starts_with("DATA") {
+                    c.write_all(b"354 go\r\n").await.unwrap();
+                    crate::smtpclient::read_data(&mut c, 0).await.unwrap();
+                    match after_data {
+                        Some(r) => c.write_all(r.as_bytes()).await.unwrap(),
+                        None => return, // accepted? nobody knows
+                    }
+                } else if up.starts_with("QUIT") {
+                    return; // drop without 221
+                } else {
+                    c.write_all(b"250 ok\r\n").await.unwrap();
+                }
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn release_outcomes_after_data() {
+        let (store, storage, _q) = deps().await;
+        let reviewer = |addr: String| {
+            RelayHoldReviewer::new(
+                store.clone(),
+                storage.clone(),
+                SmtpOptions {
+                    addr,
+                    timeout: Duration::from_secs(5),
+                    ..Default::default()
+                },
+            )
+        };
+        // QUIT error after an accepted message: success.
+        store.create_hold(&hold("q1")).await.unwrap();
+        storage.put("holds/q1", b"x\r\n").await.unwrap();
+        reviewer(scripted_sink(Some("250 queued\r\n")).await)
+            .release("q1", "admin")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_hold("q1").await.unwrap().status,
+            HoldStatus::Released
+        );
+        assert!(storage.get("holds/q1").await.is_err(), "copy deleted");
+
+        // Definite rejection of the message: reopened.
+        store.create_hold(&hold("q2")).await.unwrap();
+        storage.put("holds/q2", b"x\r\n").await.unwrap();
+        assert!(reviewer(scripted_sink(Some("554 no\r\n")).await)
+            .release("q2", "admin")
+            .await
+            .is_err());
+        assert_eq!(store.get_hold("q2").await.unwrap().status, HoldStatus::Held);
+
+        // Connection lost after the body: maybe sent -> stays RELEASED.
+        store.create_hold(&hold("q3")).await.unwrap();
+        storage.put("holds/q3", b"x\r\n").await.unwrap();
+        assert!(reviewer(scripted_sink(None).await)
+            .release("q3", "admin")
+            .await
+            .is_err());
+        let h = store.get_hold("q3").await.unwrap();
+        assert_eq!(h.status, HoldStatus::Released);
+        assert_eq!(h.reason, RELAY_UNKNOWN);
+        assert!(storage.get("holds/q3").await.is_ok(), "copy kept");
+    }
+
+    #[tokio::test]
+    async fn sweep_skips_requeue_when_verdict_landed() {
+        let (store, storage, queue) = deps().await;
+        let now = Utc::now();
+        let old = now - chrono::Duration::hours(1);
+        store
+            .create_message(
+                &msg(),
+                &[att("r1", old, 1, now + chrono::Duration::days(1))],
+            )
+            .await
+            .unwrap();
+        store
+            .set_verdict("r1", Status::Clean, "", None, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.mark_requeued("r1", now).await,
+            Err(StoreError::Conflict)
+        );
+        let j = Janitor {
+            store: store.clone(),
+            storage,
+            queue: queue.clone(),
+            analysis_timeout: Duration::from_secs(600),
+            max_attempts: 3,
+            audit_retention: None,
+        };
+        let st = j.sweep_once(now).await;
+        assert_eq!(st.requeued, 0);
+        assert!(queue.snapshot().is_empty());
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use super::proxy::bucket_key;
 use crate::ratelimit::Limiter;
 
 /// Idle per-IP buckets are evicted after this long.
@@ -79,7 +80,7 @@ impl IpLimiter {
     pub(crate) fn allow(&self, ip: &str) -> bool {
         self.maybe_sweep();
         match &self.general {
-            Some(l) => l.allow(ip),
+            Some(l) => l.allow(&bucket_key(ip)),
             None => true,
         }
     }
@@ -87,7 +88,7 @@ impl IpLimiter {
     /// Charged when a lookup misses. Returns false once the per-IP or global
     /// miss allowance is exhausted (the caller then answers 429, not 404).
     pub(crate) fn allow_fail(&self, ip: &str) -> bool {
-        let per_ip = self.fails.allow(ip);
+        let per_ip = self.fails.allow(&bucket_key(ip));
         // Always consume from the global budget so a spread-out attack is
         // capped even when no single IP exceeds its own allowance.
         let glob = self.global.allow("");
@@ -114,6 +115,16 @@ mod tests {
             .filter(|i| l.allow_fail(&format!("172.16.0.{i}")))
             .count();
         assert_eq!(ok, 5, "distributed guessing must be capped");
+    }
+
+    #[test]
+    fn ipv6_shares_a_64_bucket() {
+        let l = IpLimiter::new(1000.0, 1000, 3, 1000.0, 2000);
+        let ok = (0..10)
+            .filter(|i| l.allow_fail(&format!("2001:db8:0:1::{i:x}")))
+            .count();
+        assert_eq!(ok, 3, "addresses in one /64 share the miss budget");
+        assert!(l.allow_fail("2001:db8:0:2::1"), "other /64");
     }
 
     #[test]

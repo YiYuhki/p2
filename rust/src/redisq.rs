@@ -84,6 +84,70 @@ impl RedisQueue {
         format!("{}:results:dead", self.prefix)
     }
 
+    /// Verdicts taken by a consumer but not yet fully handled. A verdict is
+    /// moved here atomically (BLMOVE) and removed once applied or
+    /// dead-lettered, so a crash mid-handling does not lose it.
+    pub fn processing_key(&self) -> String {
+        format!("{}:results:processing", self.prefix)
+    }
+
+    /// Moves verdicts left in the processing list (by a consumer that died
+    /// mid-handling) back to the consuming end of the results list, oldest
+    /// first. Applying a verdict twice is harmless (duplicates are ignored).
+    pub async fn recover_results(&self) -> redis::RedisResult<usize> {
+        let mut conn = self.cmd_conn();
+        let (src, dst) = (self.processing_key(), self.results_key());
+        let mut n = 0;
+        loop {
+            let moved: Option<String> = redis::cmd("LMOVE")
+                .arg(&src)
+                .arg(&dst)
+                .arg("LEFT")
+                .arg("RIGHT")
+                .query_async(&mut conn)
+                .await?;
+            if moved.is_none() {
+                return Ok(n);
+            }
+            n += 1;
+        }
+    }
+
+    /// Removes a handled verdict from the processing list.
+    async fn ack_result(&self, payload: &str) {
+        let mut conn = self.cmd_conn();
+        if let Err(e) = conn
+            .lrem::<_, _, ()>(self.processing_key(), 1, payload)
+            .await
+        {
+            eprintln!("redisq: results: ack failed (will be re-applied on restart): {e}");
+        }
+    }
+
+    /// BLMOVE results -> processing on the dedicated blocking connection.
+    async fn take_result(
+        &self,
+        blocking: &mut Option<MultiplexedConnection>,
+    ) -> redis::RedisResult<Option<String>> {
+        if blocking.is_none() {
+            *blocking = Some(self.client.get_multiplexed_async_connection().await?);
+        }
+        let conn = blocking.as_mut().expect("blocking connection set");
+        let res = conn
+            .blmove(
+                self.results_key(),
+                self.processing_key(),
+                redis::Direction::Right,
+                redis::Direction::Left,
+                BRPOP_TIMEOUT_SECS,
+            )
+            .await;
+        if res.is_err() {
+            *blocking = None;
+        }
+        res
+    }
+
     fn cmd_conn(&self) -> MultiplexedConnection {
         self.conn.lock().unwrap().clone()
     }
@@ -135,54 +199,65 @@ impl RedisQueue {
 
     /// Consumes verdicts until `shutdown` turns true (or its sender drops),
     /// applying each with retry; undecodable and permanently-failed verdicts
-    /// are pushed to `<prefix>:results:dead`.
+    /// are pushed to `<prefix>:results:dead`. Each verdict is moved to
+    /// `<prefix>:results:processing` while it is handled and removed after,
+    /// and verdicts found there at startup are re-queued first.
     pub async fn consume_results<H: ResultHandler>(
         &self,
         handler: &H,
         mut shutdown: watch::Receiver<bool>,
     ) {
-        let keys = [self.results_key()];
+        match self.recover_results().await {
+            Ok(0) => {}
+            Ok(n) => eprintln!("redisq: results: recovered {n} unacknowledged verdict(s)"),
+            Err(e) => eprintln!("redisq: results: recovery failed: {e}"),
+        }
         let mut blocking = None;
         while !stopping(&shutdown) {
-            let payload = match self.brpop(&mut blocking, &keys).await {
-                Ok(Some([_, payload])) => payload,
+            let payload = match self.take_result(&mut blocking).await {
+                Ok(Some(payload)) => payload,
                 Ok(None) => continue,
                 Err(e) => {
-                    eprintln!("redisq: results: brpop failed: {e}");
+                    eprintln!("redisq: results: blmove failed: {e}");
                     backoff(&mut shutdown).await;
                     continue;
                 }
             };
-            let v: Verdict = match serde_json::from_str::<Verdict>(&payload) {
-                Ok(v) if !v.attachment_id.is_empty() => v,
-                Ok(_) => {
-                    eprintln!("redisq: results: verdict without attachment_id, moved to dead list");
-                    self.dead_letter(&payload).await;
-                    continue;
-                }
-                Err(e) => {
-                    eprintln!("redisq: results: undecodable verdict, moved to dead list: {e}");
-                    self.dead_letter(&payload).await;
-                    continue;
-                }
-            };
-            // deliver_with_retry's dead-letter hook is synchronous: record the
-            // decision and do the async push afterwards.
-            let dead = AtomicBool::new(false);
-            deliver_with_retry(
-                handler,
-                &v,
-                || dead.store(true, Ordering::SeqCst),
-                tokio::time::sleep,
-            )
-            .await;
-            if dead.load(Ordering::SeqCst) {
-                eprintln!(
-                    "redisq: results: permanent verdict error, dead-lettering attachment {}",
-                    v.attachment_id
-                );
-                self.dead_letter(&payload).await;
+            self.handle_result(handler, &payload).await;
+            self.ack_result(&payload).await;
+        }
+    }
+
+    async fn handle_result<H: ResultHandler>(&self, handler: &H, payload: &str) {
+        let v: Verdict = match serde_json::from_str::<Verdict>(payload) {
+            Ok(v) if !v.attachment_id.is_empty() => v,
+            Ok(_) => {
+                eprintln!("redisq: results: verdict without attachment_id, moved to dead list");
+                self.dead_letter(payload).await;
+                return;
             }
+            Err(e) => {
+                eprintln!("redisq: results: undecodable verdict, moved to dead list: {e}");
+                self.dead_letter(payload).await;
+                return;
+            }
+        };
+        // deliver_with_retry's dead-letter hook is synchronous: record the
+        // decision and do the async push afterwards.
+        let dead = AtomicBool::new(false);
+        deliver_with_retry(
+            handler,
+            &v,
+            || dead.store(true, Ordering::SeqCst),
+            tokio::time::sleep,
+        )
+        .await;
+        if dead.load(Ordering::SeqCst) {
+            eprintln!(
+                "redisq: results: permanent verdict error, dead-lettering attachment {}",
+                v.attachment_id
+            );
+            self.dead_letter(payload).await;
         }
     }
 
@@ -269,6 +344,7 @@ mod tests {
             q.jobs_key(Priority::Normal),
             q.results_key(),
             q.dead_key(),
+            q.processing_key(),
         ];
         let _: () = c.del(&keys).await.unwrap();
     }
@@ -461,6 +537,47 @@ mod tests {
             ]
         );
         assert!(lrange(&q, &rk).await.is_empty());
+        assert!(
+            lrange(&q, &q.processing_key()).await.is_empty(),
+            "handled verdicts are acknowledged"
+        );
+        cleanup(&q).await;
+    }
+
+    #[tokio::test]
+    async fn unacknowledged_verdicts_are_recovered_on_startup() {
+        let Some(q) = setup().await else { return };
+        let mut c = q.cmd_conn();
+        // A previous consumer took v1 then v2 (BLMOVE pushes to the head)
+        // and died before acknowledging; v3 is still queued.
+        let (v1, v2, v3) = (
+            serde_json::to_string(&verdict("r1")).unwrap(),
+            serde_json::to_string(&verdict("r2")).unwrap(),
+            serde_json::to_string(&verdict("r3")).unwrap(),
+        );
+        let _: () = c.lpush(q.processing_key(), &v1).await.unwrap();
+        let _: () = c.lpush(q.processing_key(), &v2).await.unwrap();
+        let _: () = c.lpush(q.results_key(), &v3).await.unwrap();
+
+        let (tx, rx) = watch::channel(false);
+        let h = Results {
+            seen: Mutex::new(Vec::new()),
+            stop_after: 3,
+            tx,
+        };
+        tokio::time::timeout(Duration::from_secs(10), q.consume_results(&h, rx))
+            .await
+            .expect("stops");
+        let ids: Vec<String> = h
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(i, _)| i.clone())
+            .collect();
+        assert_eq!(ids, ["r1", "r2", "r3"], "recovered first, oldest first");
+        assert!(lrange(&q, &q.processing_key()).await.is_empty());
+        assert!(lrange(&q, &q.results_key()).await.is_empty());
         cleanup(&q).await;
     }
 

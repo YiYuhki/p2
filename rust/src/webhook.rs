@@ -2,6 +2,12 @@
 //! endpoint (SIEM/chat-ops) as JSON, with HMAC-SHA256 signing, bounded retries
 //! and a dead-letter sink. Port of the Go `internal/webhook`.
 //!
+//! Signing: when a secret is configured each attempt carries
+//! `X-Secmail-Timestamp: <unix seconds>` and
+//! `X-Secmail-Signature: sha256=<hex HMAC-SHA256 of "<timestamp>.<body>">`, so a
+//! receiver can reject stale or replayed deliveries (check the timestamp is
+//! within a few minutes, then verify the MAC over `timestamp + "." + body`).
+//!
 //! The HTTP transport is behind the [`Transport`] trait so the retry/backoff/DLQ
 //! logic is testable without a network; the real reqwest-backed transport lands
 //! with the async I/O layer.
@@ -53,10 +59,25 @@ pub enum PostOutcome {
     Terminal(String),
 }
 
+/// Header carrying the signing timestamp (unix seconds).
+pub const TIMESTAMP_HEADER: &str = "X-Secmail-Timestamp";
+/// Header carrying the HMAC signature.
+pub const SIGNATURE_HEADER: &str = "X-Secmail-Signature";
+
+/// The signing headers of one delivery attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Signature {
+    /// Value of [`TIMESTAMP_HEADER`].
+    pub timestamp: String,
+    /// Value of [`SIGNATURE_HEADER`] (`sha256=<hex>`).
+    pub signature: String,
+}
+
 /// HTTP transport for a single POST attempt.
 pub trait Transport: Send + Sync {
-    /// Posts `body` to `url`, with the optional `X-Secmail-Signature` header.
-    fn post(&self, url: &str, body: &[u8], signature: Option<&str>) -> PostOutcome;
+    /// Posts `body` to `url`. With `signature`, sends its timestamp and
+    /// signature as the [`TIMESTAMP_HEADER`] / [`SIGNATURE_HEADER`] headers.
+    fn post(&self, url: &str, body: &[u8], signature: Option<&Signature>) -> PostOutcome;
 }
 
 /// Receives an event that could not be delivered after every attempt.
@@ -136,12 +157,6 @@ impl Notifier {
             Ok(b) => b,
             Err(_) => return,
         };
-        let sig = if self.secret.is_empty() {
-            None
-        } else {
-            Some(sign(&self.secret, &body))
-        };
-
         let mut delay = self.backoff;
         let mut last_err = String::new();
         for attempt in 0..=self.retries {
@@ -149,7 +164,17 @@ impl Notifier {
                 (self.sleep)(delay);
                 delay *= 2;
             }
-            match self.transport.post(&self.url, &body, sig.as_deref()) {
+            // Signed per attempt so a retry carries a fresh timestamp.
+            let sig = if self.secret.is_empty() {
+                None
+            } else {
+                let ts = Utc::now().timestamp();
+                Some(Signature {
+                    timestamp: ts.to_string(),
+                    signature: sign(&self.secret, ts, &body),
+                })
+            };
+            match self.transport.post(&self.url, &body, sig.as_ref()) {
                 PostOutcome::Ok => return,
                 PostOutcome::Terminal(e) => {
                     last_err = e;
@@ -166,9 +191,11 @@ impl Notifier {
     }
 }
 
-/// Computes the `sha256=<hex>` HMAC signature over `body`.
-pub fn sign(secret: &[u8], body: &[u8]) -> String {
+/// Computes the `sha256=<hex>` HMAC signature over `"<timestamp>.<body>"`.
+pub fn sign(secret: &[u8], timestamp: i64, body: &[u8]) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac key");
+    mac.update(timestamp.to_string().as_bytes());
+    mac.update(b".");
     mac.update(body);
     let tag = mac.finalize().into_bytes();
     let mut hex = String::with_capacity(7 + tag.len() * 2);
@@ -238,7 +265,7 @@ mod tests {
         hits: Arc<AtomicU32>,
     }
     impl Transport for Seq {
-        fn post(&self, _url: &str, _body: &[u8], _sig: Option<&str>) -> PostOutcome {
+        fn post(&self, _url: &str, _body: &[u8], _sig: Option<&Signature>) -> PostOutcome {
             let i = self.hits.fetch_add(1, Ordering::SeqCst) as usize;
             let code = *self
                 .outcomes
@@ -348,19 +375,60 @@ mod tests {
     }
 
     #[test]
-    fn signature_is_hmac() {
-        let s = sign(b"s3cr3t", b"{\"type\":\"t\"}");
+    fn signature_is_hmac_over_timestamp_and_body() {
+        let body = b"{\"type\":\"t\"}";
+        let s = sign(b"s3cr3t", 1_700_000_000, body);
         assert!(s.starts_with("sha256="));
-        // stable known value check via recompute
-        let s2 = sign(b"s3cr3t", b"{\"type\":\"t\"}");
-        assert_eq!(s, s2);
+        assert_eq!(s, sign(b"s3cr3t", 1_700_000_000, body));
+        // Known value: HMAC-SHA256("s3cr3t", "1700000000." + body).
+        let mut m = Hmac::<Sha256>::new_from_slice(b"s3cr3t").unwrap();
+        m.update(b"1700000000.{\"type\":\"t\"}");
+        let want: String = m
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(s, format!("sha256={want}"));
+        // A different timestamp (replay with a new time) changes the MAC.
+        assert_ne!(s, sign(b"s3cr3t", 1_700_000_001, body));
+    }
+
+    #[test]
+    fn deliveries_carry_timestamp_and_signature() {
+        struct Cap(std::sync::Mutex<Vec<(Vec<u8>, Option<Signature>)>>);
+        impl Transport for Arc<Cap> {
+            fn post(&self, _u: &str, b: &[u8], s: Option<&Signature>) -> PostOutcome {
+                self.0.lock().unwrap().push((b.to_vec(), s.cloned()));
+                PostOutcome::Ok
+            }
+        }
+        let cap = Arc::new(Cap(Default::default()));
+        let n =
+            Notifier::new("http://x", "k3y", Box::new(cap.clone()), Options::default()).unwrap();
+        n.deliver(Event {
+            kind: "t".into(),
+            ..Default::default()
+        });
+        let got = cap.0.lock().unwrap();
+        let (body, sig) = &got[0];
+        let sig = sig.as_ref().expect("signed");
+        let ts: i64 = sig.timestamp.parse().unwrap();
+        assert!((Utc::now().timestamp() - ts).abs() < 60);
+        assert_eq!(sig.signature, sign(b"k3y", ts, body));
+        // Unsigned without a secret.
+        let cap2 = Arc::new(Cap(Default::default()));
+        Notifier::new("http://x", "", Box::new(cap2.clone()), Options::default())
+            .unwrap()
+            .deliver(Event::default());
+        assert!(cap2.0.lock().unwrap()[0].1.is_none());
     }
 
     #[test]
     fn disabled_without_url() {
         struct Nop;
         impl Transport for Nop {
-            fn post(&self, _u: &str, _b: &[u8], _s: Option<&str>) -> PostOutcome {
+            fn post(&self, _u: &str, _b: &[u8], _s: Option<&Signature>) -> PostOutcome {
                 PostOutcome::Ok
             }
         }
