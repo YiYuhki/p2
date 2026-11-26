@@ -606,15 +606,22 @@ impl Part {
                     }
                 }
                 // RFC 2231: `name` together with `name*` / `name*N[*]` is
-                // ambiguous (clients prefer the starred form; this parser and
-                // mailparse may use the plain one).
-                let plain: Vec<&str> = seen.iter().copied().filter(|k| !k.contains('*')).collect();
-                if seen.iter().any(|k| {
-                    k.split_once('*')
-                        .map(|(base, _)| plain.contains(&base))
-                        .unwrap_or(false)
-                }) {
-                    return true;
+                // ambiguous when the two decode to different extensions
+                // (clients prefer the starred form; this parser and mailparse
+                // may use the plain one). Same-name pairs, which some mailers
+                // send for non-ASCII names, are fine.
+                if let Some(raw) = self
+                    .fields
+                    .iter()
+                    .find(|f| f.name == name)
+                    .map(Field::value)
+                {
+                    if rfc2231_pairs(&raw)
+                        .iter()
+                        .any(|(plain, starred)| name_ext(plain) != name_ext(starred))
+                    {
+                        return true;
+                    }
                 }
             }
         }
@@ -684,6 +691,24 @@ impl Part {
     /// show and save under), without empty or repeated ones.
     pub fn names(&self) -> Vec<String> {
         let mut out = vec![self.filename()];
+        // Both forms of an RFC 2231 plain+starred pair (clients show the
+        // starred one).
+        for name in ["content-disposition", "content-type"] {
+            if let Some(raw) = self
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .map(Field::value)
+            {
+                for (p, st) in rfc2231_pairs(&raw) {
+                    for n in [p, st] {
+                        if !n.is_empty() && !out.contains(&n) {
+                            out.push(n);
+                        }
+                    }
+                }
+            }
+        }
         if self.disposition().1.contains_key("filename") {
             if let Some(n) = self.media_type().1.remove("name") {
                 let n = crate::mimeproc::decode_header(tail_str(&n, MAX_RAW_NAME));
@@ -814,6 +839,107 @@ impl Part {
 }
 
 /// The last `max` bytes of `s` (snapped to a char boundary).
+/// Lowercased extension of a sanitized file name ("" when none).
+fn name_ext(n: &str) -> String {
+    let n = crate::mimeproc::sanitize_filename(n).to_lowercase();
+    n.rsplit_once('.')
+        .map(|(_, e)| e.to_string())
+        .unwrap_or_default()
+}
+
+/// For each parameter given both plain (`x=`) and in RFC 2231 form (`x*=` or
+/// `x*N[*]=`), the (decoded plain, decoded starred) values. Parsed from the
+/// raw header value (case and quotes preserved).
+fn rfc2231_pairs(raw: &str) -> Vec<(String, String)> {
+    let raw = tail_str(raw, MAX_RAW_NAME * 4);
+    // Quote-aware split on ';'.
+    let mut params: Vec<(String, String)> = Vec::new();
+    let mut cur = String::new();
+    let mut inq = false;
+    let mut esc = false;
+    let mut segs: Vec<String> = Vec::new();
+    for c in raw.chars() {
+        if esc {
+            cur.push(c);
+            esc = false;
+            continue;
+        }
+        match c {
+            '\\' if inq => esc = true,
+            '"' => inq = !inq,
+            ';' if !inq => segs.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+        if segs.len() > MAX_PARAMS + 1 {
+            return Vec::new();
+        }
+    }
+    segs.push(cur);
+    for seg in segs.into_iter().skip(1) {
+        if let Some((k, v)) = seg.split_once('=') {
+            params.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+        }
+    }
+    let mut out = Vec::new();
+    for (k, plain) in params.iter().filter(|(k, _)| !k.contains('*')) {
+        let prefix = format!("{k}*");
+        let mut parts: Vec<(u32, bool, &str)> = params
+            .iter()
+            .filter_map(|(pk, pv)| {
+                let rest = pk.strip_prefix(&prefix)?;
+                if rest.is_empty() {
+                    return Some((0, true, pv.as_str()));
+                }
+                let (num, enc) = match rest.strip_suffix('*') {
+                    Some(n) => (n, true),
+                    None => (rest, false),
+                };
+                num.parse::<u32>().ok().map(|n| (n, enc, pv.as_str()))
+            })
+            .collect();
+        if parts.is_empty() {
+            continue;
+        }
+        parts.sort_by_key(|p| p.0);
+        let mut charset = String::from("us-ascii");
+        let mut bytes: Vec<u8> = Vec::new();
+        for (i, (_, enc, v)) in parts.iter().enumerate() {
+            if *enc {
+                let mut v = *v;
+                if i == 0 {
+                    // charset'language'value
+                    let mut it = v.splitn(3, '\'');
+                    if let (Some(cs), Some(_), Some(rest)) = (it.next(), it.next(), it.next()) {
+                        if !cs.is_empty() {
+                            charset = cs.to_string();
+                        }
+                        v = rest;
+                    }
+                }
+                let b = v.as_bytes();
+                let mut j = 0;
+                while j < b.len() {
+                    if b[j] == b'%' && j + 2 < b.len() {
+                        let h = std::str::from_utf8(&b[j + 1..j + 3]).ok();
+                        if let Some(x) = h.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                            bytes.push(x);
+                            j += 3;
+                            continue;
+                        }
+                    }
+                    bytes.push(b[j]);
+                    j += 1;
+                }
+            } else {
+                bytes.extend_from_slice(v.as_bytes());
+            }
+        }
+        let starred = crate::mimeproc::decode_charset(&charset, &bytes);
+        out.push((crate::mimeproc::decode_header(plain), starred));
+    }
+    out
+}
+
 fn tail_str(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
@@ -858,13 +984,24 @@ pub(crate) fn split_uuencode(data: &[u8], max: usize) -> (Vec<u8>, Vec<UuBlock>,
     let mut cur: Option<UuBlock> = None;
     let mut done = false; // data lines ended (zero-length line seen)
     let mut off = 0;
-    for line in data.split_inclusive(|&b| b == b'\n') {
+    let lines: Vec<&[u8]> = data.split_inclusive(|&b| b == b'\n').collect();
+    for (li, &line) in lines.iter().enumerate() {
         let start = off;
         off += line.len();
         let t = trim_eol(line);
         match cur.as_mut() {
             None => {
-                if let Some(name) = uu_begin(t) {
+                // A short (1-2 digit) mode is only a uuencode header when a
+                // well-formed data line follows, so prose such as
+                // "begin 1 month later" is left alone.
+                let begin = uu_begin(t).filter(|_| {
+                    uu_mode_len(t) >= 3
+                        || lines
+                            .get(li + 1)
+                            .map(|n| uu_data_line(trim_eol(n)))
+                            .unwrap_or(false)
+                });
+                if let Some(name) = begin {
                     if blocks.len() >= max {
                         return (rest, blocks, Some(data[start..].to_vec()));
                     }
@@ -890,6 +1027,32 @@ pub(crate) fn split_uuencode(data: &[u8], max: usize) -> (Vec<u8>, Vec<UuBlock>,
         blocks.push(b);
     }
     (rest, blocks, None)
+}
+
+/// Digits in the mode field of a "begin" line (0 if not one).
+fn uu_mode_len(t: &[u8]) -> usize {
+    t.trim_ascii_start()
+        .strip_prefix(b"begin ")
+        .map(|r| {
+            r.trim_ascii_start()
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// A uuencoded data line: its length character matches its length.
+fn uu_data_line(t: &[u8]) -> bool {
+    let Some(&first) = t.first() else {
+        return false;
+    };
+    let n = (first.wrapping_sub(b' ') & 63) as usize;
+    if n == 0 || n > 45 {
+        return false;
+    }
+    let want = 1 + n.div_ceil(3) * 4;
+    (want..=want + 2).contains(&t.len()) && t.iter().all(|&b| (b' '..=b'`').contains(&b))
 }
 
 fn trim_eol(l: &[u8]) -> &[u8] {
@@ -2672,6 +2835,15 @@ mod r3_tests {
     }
 
     #[test]
+    fn begin_in_prose_is_not_uuencode() {
+        let raw = b"From: a@b.c\r\nContent-Type: text/plain\r\n\r\nbegin 1 month later we ship.\r\nThanks, Kim\r\n";
+        let mut p = parse(raw);
+        let r = extract(&mut p, &Options::default()).unwrap();
+        assert!(r.attachments.is_empty());
+        assert_eq!(p.to_bytes(), raw);
+    }
+
+    #[test]
     fn short_mode_uuencode_and_yenc_binhex_extracted() {
         let opts = Options::default();
         for body in [
@@ -2696,6 +2868,9 @@ mod r3_tests {
         assert_eq!(parse(img).opaque(), Some(Opaque::Ambiguous));
         let cd = b"Content-Type: application/pgp-signature\r\nContent-Disposition: inline; filename=s.asc; filename*0*=utf-8''run.bat\r\n\r\nx\r\n";
         assert_eq!(parse(cd).opaque(), Some(Opaque::Ambiguous));
+        // The same name in both forms (non-ASCII names) is fine.
+        let same = b"Content-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"=?UTF-8?B?67O06rOg7IScLnBkZg==?=\"; filename*=UTF-8''%EB%B3%B4%EA%B3%A0%EC%84%9C.pdf\r\n\r\nx\r\n";
+        assert_eq!(parse(same).opaque(), None);
         // Continuations alone are fine.
         let ok = b"Content-Type: application/pdf; name*0=a; name*1=b.pdf\r\n\r\nx\r\n";
         assert_eq!(parse(ok).opaque(), None);

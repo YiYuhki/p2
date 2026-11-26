@@ -555,8 +555,15 @@ pub async fn read_data_timeout<R: AsyncBufRead + Unpin>(
         cur_len += n;
         total += n;
         r.consume(n);
+        // Rate floor with a 64 KiB burst allowance for stalls; never applied
+        // to the chunk that completes the terminator (a finished message is
+        // not refused).
+        let finishing = done && bol && cur_len == 3 && cur == b".\r\n";
         let elapsed = started.elapsed();
-        if elapsed > MIN_RATE_GRACE && (total as f64) / elapsed.as_secs_f64() < MIN_DATA_RATE {
+        if !finishing
+            && elapsed > MIN_RATE_GRACE
+            && (total as f64) + 65_536.0 < MIN_DATA_RATE * elapsed.as_secs_f64()
+        {
             return Err(DataError::Abort(
                 "4.4.2 Transfer too slow, closing connection",
             ));

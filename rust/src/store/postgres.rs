@@ -72,9 +72,17 @@ impl Postgres {
     /// Builds a pool of at most `max_conns` connections (0 keeps the pool
     /// default), checks connectivity and applies pending migrations.
     pub async fn connect(dsn: &str, max_conns: usize) -> std::result::Result<Self, String> {
-        let cfg: tokio_postgres::Config = dsn
+        let mut cfg: tokio_postgres::Config = dsn
             .parse()
             .map_err(|e| format!("postgres: parse dsn: {e}"))?;
+        // A hung database must fail calls, not stall mail processing: bound
+        // connecting and every statement unless the DSN says otherwise.
+        if cfg.get_connect_timeout().is_none() {
+            cfg.connect_timeout(std::time::Duration::from_secs(10));
+        }
+        if cfg.get_options().is_none() {
+            cfg.options("-c statement_timeout=30000");
+        }
         let mgr = Manager::from_config(
             cfg,
             NoTls,
@@ -82,7 +90,10 @@ impl Postgres {
                 recycling_method: RecyclingMethod::Fast,
             },
         );
-        let mut builder = Pool::builder(mgr);
+        let mut builder = Pool::builder(mgr)
+            .runtime(deadpool_postgres::Runtime::Tokio1)
+            .wait_timeout(Some(std::time::Duration::from_secs(15)))
+            .create_timeout(Some(std::time::Duration::from_secs(15)));
         if max_conns > 0 {
             builder = builder.max_size(max_conns);
         }

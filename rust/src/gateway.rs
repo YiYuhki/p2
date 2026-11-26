@@ -834,7 +834,13 @@ impl Backend {
                     // the task finishes on its own.
                     let proc = self.proc.clone();
                     let env2 = env.clone();
-                    let task = tokio::spawn(async move { proc.process(&env2, &raw).await });
+                    // The DATA slot and permit move into the task: if it
+                    // outlives the wait it still counts against capacity.
+                    let guards = (_data_slot, _data_permit);
+                    let task = tokio::spawn(async move {
+                        let _guards = guards;
+                        proc.process(&env2, &raw).await
+                    });
                     let outcome = match timeout(PROCESS_WAIT, task).await {
                         Ok(Ok(o)) => o,
                         Ok(Err(_)) => Err(ProcessError::TempFail),

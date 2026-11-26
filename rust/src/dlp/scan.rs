@@ -12,6 +12,28 @@ use super::detectors::{
     builtin, mask_middle, Detector, Severity, CATEGORY_PII, CONTEXT_WINDOW, SEP_CONTEXT_CHARS,
 };
 
+/// Words marking non-personal registration numbers with the RRN's 6-7 shape.
+static RRN_NEGATIVE: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    [
+        "사업자",
+        "법인",
+        "차량",
+        "business reg",
+        "corporate reg",
+        "company reg",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+});
+/// Words that clearly mean a personal RRN / alien registration number.
+static RRN_POSITIVE: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    ["주민", "외국인", "rrn", "resident", "alien", "jumin"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+});
+
 /// Byte ranges of a text.
 type Ranges = Vec<(usize, usize)>;
 
@@ -278,6 +300,22 @@ impl Scanner {
                         // Not in its canonical dashed form: a non-dash
                         // separator, or only seen once separators were
                         // collapsed — require a keyword close by.
+                        // Business/corporate/vehicle registration numbers share
+                        // the 6-7 shape: near those words (and no RRN keyword)
+                        // only a checksum-valid number counts.
+                        if d.id == "kr_rrn"
+                            && has_context_chars(src_lower, abs_start, abs_end, &RRN_NEGATIVE, 30)
+                            && !has_context_chars(
+                                src_lower,
+                                abs_start,
+                                abs_end,
+                                &RRN_POSITIVE,
+                                SEP_CONTEXT_CHARS,
+                            )
+                            && !super::detectors::valid_rrn(&super::detectors::digits(v))
+                        {
+                            continue;
+                        }
                         if needs_kw && !kw {
                             if pending.len() < 10_000 && pending_keys.insert(key.clone()) {
                                 pending.push((key, (d.mask)(v)));
@@ -1385,6 +1423,69 @@ mod r2_tests {
     /// only a literal dash between the groups is accepted without the
     /// checksum, and any other separator needs the checksum plus an RRN
     /// keyword nearby.
+    #[test]
+    fn tax_invoice_corpus_no_rrn() {
+        let sc = s();
+        let mut rng = Rng(0xbeef);
+        let mut hits = Vec::new();
+        for i in 0..2000 {
+            let date = format!(
+                "{:02}{:02}{:02}",
+                20 + rng.r(6),
+                1 + rng.r(12),
+                1 + rng.r(28)
+            );
+            let amt = 1_000_000 + rng.r(9_000_000);
+            let corp = format!("1{:05}", rng.r(100_000));
+            let t = match i % 3 {
+                0 => format!("사업자등록번호: 123-45-67890\n{date} {amt}원"),
+                1 => format!("법인등록번호 {corp} {}", 1_000_000 + rng.r(9_000_000)),
+                _ => format!("법인등록번호 {corp}-{}", 1_000_000 + rng.r(9_000_000)),
+            };
+            if sc
+                .scan_text("x", &normalize_text(&t, false))
+                .iter()
+                .any(|f| f.detector == "kr_rrn")
+            {
+                hits.push(t);
+            }
+        }
+        // A checksum-valid corporate number can still collide (~10%); the
+        // shape/date-only acceptance must not fire.
+        let rate = hits.len() as f64 / 2000.0;
+        eprintln!("tax-invoice RRN FP: {}/2000", hits.len());
+        assert!(
+            rate < 0.12,
+            "tax-invoice RRN FP rate {rate}: {:?}",
+            &hits[..hits.len().min(3)]
+        );
+        // Each hit must be a checksum-valid 13-digit number.
+        for h in &hits {
+            let d: String = h
+                .rsplit(|c: char| !c.is_ascii_digit() && c != ' ' && c != '-')
+                .next()
+                .unwrap_or("")
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect();
+            assert!(
+                d.len() != 13 || super::super::detectors::valid_rrn(&d),
+                "{h}"
+            );
+        }
+        // A real RRN next to a business number is still found.
+        assert!(sc
+            .scan_text(
+                "x",
+                &normalize_text(
+                    "사업자등록번호 123-45-67890 대표자 주민등록번호 900101-1234568",
+                    false
+                )
+            )
+            .iter()
+            .any(|f| f.detector == "kr_rrn"));
+    }
+
     #[test]
     fn rrn_keywords_tables_and_post_2020() {
         fn with_checksum(first12: &str) -> String {

@@ -383,7 +383,6 @@ pub fn builtin() -> Vec<Detector> {
                 "주민",
                 "생년월일",
                 "외국인",
-                "등록번호",
                 "rrn",
                 "resident registration",
                 "resident no",

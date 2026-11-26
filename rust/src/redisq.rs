@@ -325,7 +325,7 @@ impl RedisQueue {
     async fn lpush(&self, key: &str, value: &str) -> redis::RedisResult<()> {
         let mut conn = self.cmd_conn();
         match conn.lpush::<_, _, ()>(key, value).await {
-            Err(e) if e.is_connection_dropped() || e.is_unrecoverable_error() => {
+            Err(e) if e.is_connection_dropped() || e.is_unrecoverable_error() || e.is_timeout() => {
                 self.reconnect_cmd().await;
                 let mut conn = self.cmd_conn();
                 conn.lpush::<_, _, ()>(key, value).await
