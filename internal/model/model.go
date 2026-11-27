@@ -152,3 +152,17 @@ type DLPEvent struct {
 	HoldID   string
 	At       time.Time
 }
+
+// AdminAction is an append-only audit record of a privileged action taken
+// through the admin dashboard or admin API, so hold releases/rejections and
+// exports are attributable after the fact.
+type AdminAction struct {
+	ID     string
+	At     time.Time
+	Actor  string // authenticated admin identity (email) or "admin-api"
+	Action string // release | reject | export | login
+	Target string // hold id for release/reject; kind for export; "" otherwise
+	Detail string // reject reason, export kind, etc. (truncated)
+	Source string // portal | api
+	Result string // ok | conflict | notfound | error
+}

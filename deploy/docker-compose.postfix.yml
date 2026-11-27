@@ -1,0 +1,155 @@
+# One-shot stack WITH a real backend mail server (Postfix + Dovecot/IMAP)
+# behind the gateway. Pass the domain and accounts as environment variables and
+# it comes up ready to serve that domain:
+#
+#   MAIL_DOMAIN=acme.co.kr \
+#   MAIL_USERS="ceo:s3cret staff:p4ss security:adminpw" \
+#   PORTAL_BASE_URL=https://sec-mail.acme.co.kr \
+#   docker compose -f deploy/docker-compose.postfix.yml up --build
+#
+# or put the same variables in a file and use it:
+#   cp deploy/postfix.env.example deploy/postfix.env   # then edit
+#   docker compose --env-file deploy/postfix.env -f deploy/docker-compose.postfix.yml up --build
+#
+# TLS is a single env toggle (see postfix.env.example):
+#   TLS_ENABLED=true TLS_MODE=selfsigned ...   # local / internal testing
+#   TLS_ENABLED=true TLS_MODE=certbot CERTBOT_EMAIL=you@acme.co.kr ...   # real certs
+# When TLS is on, a "certs" service puts tls.crt/tls.key in a shared volume and
+# every endpoint uses it: secmail SMTP STARTTLS + portal HTTPS, Dovecot IMAPS
+# (:993), Postfix submission STARTTLS (:587) and implicit-TLS smtps (:465).
+#
+# Flow:
+#   inbound : send to :25 (rcpt @${MAIL_DOMAIN}) -> secmail scans -> Postfix -> mailbox
+#   IMAP    : :143 (STARTTLS) / :993 (IMAPS)   user = <localpart>@${MAIL_DOMAIN}
+#   submit  : :587 (STARTTLS) / :465 (smtps), authenticated -> secmail DLP -> onward
+#   portal  : ${PORTAL_BASE_URL}  (HTTP :8080, HTTPS :443 when TLS on)
+#   mailpit : http://localhost:8025  (Internet stand-in; swap for a real smart host)
+name: secmail-postfix
+
+services:
+  secmail:
+    build: ..
+    # Wire the shared cert into secmail only when TLS is on (empty => plaintext).
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        if [ "$$TLS_ENABLED" = "true" ]; then
+          export SECMAIL_TLS_CERT=/certs/tls.crt SECMAIL_TLS_KEY=/certs/tls.key
+        fi
+        exec /usr/local/bin/secmail -config /etc/secmail/config.yaml
+    environment:
+      MAIL_DOMAIN: ${MAIL_DOMAIN:-example.com}
+      MAIL_TIMEZONE: ${MAIL_TIMEZONE:-Asia/Seoul}
+      PORTAL_BASE_URL: ${PORTAL_BASE_URL:-http://localhost:8080}
+      TLS_ENABLED: ${TLS_ENABLED:-false}
+      SECMAIL_INTERNAL_TOKEN: ${SECMAIL_INTERNAL_TOKEN:-demo-internal-token-change-me}
+      SECMAIL_ADMIN_TOKEN: ${SECMAIL_ADMIN_TOKEN:-demo-admin-token-change-me}
+      SECMAIL_SESSION_SECRET: ${SECMAIL_SESSION_SECRET:-demo-session-secret-change-me-0123456789}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-secmail}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-secmail-s3-secret}
+    volumes:
+      - ./config.postfix.yaml:/etc/secmail/config.yaml:ro
+      - certs:/certs:ro
+    ports:
+      - "25:25"       # SMTP in (from the Internet)
+      - "10025:10025" # SMTP out (from Postfix, DLP-inspected)
+      - "8080:8080"   # download portal (HTTP, or HTTPS when TLS on)
+      - "443:8080"    # portal over HTTPS when TLS on (host 443 -> container 8080)
+      - "127.0.0.1:8081:8081"  # internal/admin API — demo only; keep private in production
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_started}
+      s3: {condition: service_started}
+      mail: {condition: service_started}
+      mailpit: {condition: service_started}
+      certs: {condition: service_healthy}
+    restart: unless-stopped
+
+  # The real backend mail server: Postfix (receive + DLP re-injection) and
+  # Dovecot (IMAP + LMTP local delivery). Mailboxes are created from MAIL_USERS.
+  mail:
+    build: ./postfix
+    environment:
+      MAIL_DOMAIN: ${MAIL_DOMAIN:-example.com}
+      MAIL_USERS: "${MAIL_USERS:-alice:alicepass bob:bobpass security:securitypass}"
+      TLS_ENABLED: ${TLS_ENABLED:-false}
+    volumes:
+      - certs:/certs:ro
+    ports:
+      - "143:143"     # IMAP + STARTTLS
+      - "993:993"     # IMAPS (when TLS on)
+      - "587:587"     # submission + STARTTLS
+      - "465:465"     # smtps implicit TLS (when TLS on)
+    depends_on:
+      mailpit: {condition: service_started}
+      certs: {condition: service_healthy}
+    restart: unless-stopped
+
+  # Certificate manager. Idle no-op unless TLS_ENABLED=true; then it writes
+  # tls.crt/tls.key into the shared "certs" volume (self-signed or certbot) and
+  # stays up to auto-renew. Publishes :80 for certbot's HTTP-01 challenge.
+  certs:
+    build: ./certs
+    environment:
+      TLS_ENABLED: ${TLS_ENABLED:-false}
+      TLS_MODE: ${TLS_MODE:-selfsigned}
+      MAIL_DOMAIN: ${MAIL_DOMAIN:-example.com}
+      TLS_HOSTNAMES: ${TLS_HOSTNAMES:-}
+      CERTBOT_EMAIL: ${CERTBOT_EMAIL:-}
+      CERTBOT_STAGING: ${CERTBOT_STAGING:-false}
+    volumes:
+      - certs:/certs
+      - letsencrypt:/etc/letsencrypt
+    ports:
+      - "80:80"       # certbot HTTP-01 challenge (TLS_MODE=certbot)
+    healthcheck:
+      test: ["CMD-SHELL", "[ \"$$TLS_ENABLED\" != \"true\" ] || [ -f /certs/tls.crt ]"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+    restart: unless-stopped
+
+  # Marks attachments clean so downloads are unblocked. Replace with the real
+  # analyzer via -f deploy/docker-compose.analyzer.yml.
+  mock-analyzer:
+    build: ..
+    entrypoint: ["/usr/local/bin/mock-analyzer", "-redis", "redis:6379"]
+    environment:
+      SECMAIL_INTERNAL_TOKEN: ${SECMAIL_INTERNAL_TOKEN:-demo-internal-token-change-me}
+    depends_on: [redis, secmail]
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: secmail
+      POSTGRES_PASSWORD: secmail
+      POSTGRES_DB: secmail
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U secmail"]
+      interval: 2s
+      retries: 30
+    volumes: [pgdata:/var/lib/postgresql/data]
+
+  redis:
+    image: redis:7-alpine
+
+  s3:
+    image: rustfs/rustfs:latest
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:-secmail}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:-secmail-s3-secret}
+    volumes: [s3data:/data]
+
+  # Internet stand-in: receives DLP-cleared outbound mail re-injected by Postfix.
+  # In production, point Postfix's "out" transport at a real smart host instead.
+  mailpit:
+    image: axllent/mailpit:latest
+    ports: ["8025:8025"]   # web UI
+
+volumes:
+  pgdata:
+  s3data:
+  certs:
+  letsencrypt:

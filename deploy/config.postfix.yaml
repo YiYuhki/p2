@@ -1,0 +1,77 @@
+# Configuration for deploy/docker-compose.postfix.yml.
+# Domain-derived fields are taken from ${MAIL_DOMAIN} (expanded from the
+# container environment at load time), so the same compose stack serves any
+# domain passed in via env. upstream/next_hop point at the Postfix backend
+# ("mail" service). OTP codes and DLP notices are sent via upstream, so they
+# land in the user's real mailbox and can be read over IMAP.
+timezone: ${MAIL_TIMEZONE}
+smtp:
+  listen: ":25"
+  hostname: secmail.${MAIL_DOMAIN}
+  accepted_domains: ["${MAIL_DOMAIN}"]
+  tls_cert_file: ${SECMAIL_TLS_CERT}   # empty => inbound STARTTLS off
+  tls_key_file: ${SECMAIL_TLS_KEY}
+upstream:
+  addr: mail:25               # the real mail server (Postfix backend)
+  helo_name: secmail.${MAIL_DOMAIN}
+  timeout: 30s
+dkim:
+  verify_inbound: false
+  sign: false
+portal:
+  listen: ":8080"
+  public_base_url: ${PORTAL_BASE_URL}
+  trust_proxy_headers: true
+  tls_cert_file: ${SECMAIL_TLS_CERT}   # empty => portal serves plain HTTP
+  tls_key_file: ${SECMAIL_TLS_KEY}
+  auth:
+    mode: otp                  # recipients prove ownership with a mailed code
+    session_secret: ${SECMAIL_SESSION_SECRET}
+    otp_from: no-reply@${MAIL_DOMAIN}
+internal_api:
+  listen: ":8081"
+  token: ${SECMAIL_INTERNAL_TOKEN}
+  admin_token: ${SECMAIL_ADMIN_TOKEN}
+  advertise_url: http://secmail:8081
+storage:
+  type: s3
+  s3:
+    endpoint: s3:9000
+    region: us-east-1
+    bucket: secmail-attachments
+    access_key: ${S3_ACCESS_KEY}
+    secret_key: ${S3_SECRET_KEY}
+    use_ssl: false
+database:
+  type: postgres
+  dsn: postgres://secmail:secmail@postgres:5432/secmail?sslmode=disable
+redis:
+  addr: redis:6379
+queue:
+  type: redis
+analysis:
+  timeout: 1m
+  janitor_interval: 10s
+
+# Outgoing mail inspection (DLP). Mail submitted by an internal user to the
+# Postfix submission port (:587) is forced through secmail :10025, scanned, and
+# (if cleared) relayed back to Postfix :10026, which sends it onward.
+outbound:
+  enabled: true
+  listen: ":10025"
+  allowed_clients: ["127.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "10.0.0.0/8"]
+  next_hop:
+    addr: mail:10026
+dlp:
+  scan_attachments: true
+  actions:
+    high: hold          # resident numbers, cards, API keys, private keys
+    medium: notify      # passports, licences, bulk phone lists, JWTs, passwords
+    low: allow
+    uninspectable: notify
+  notify_sender: true
+  admins: ["security@${MAIL_DOMAIN}"]   # this mailbox must exist (include it in MAIL_USERS)
+  notify_from: dlp-noreply@${MAIL_DOMAIN}
+  hold_ttl: 72h
+  ocr:
+    enabled: true   # tesseract + Korean data ship in the image

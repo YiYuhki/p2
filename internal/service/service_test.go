@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -196,5 +197,130 @@ func TestResultHandlerClassification(t *testing.T) {
 	err = h(ctx, model.Verdict{AttachmentID: "00000000-0000-0000-0000-0000000000ff", Status: model.StatusClean})
 	if !errors.As(err, &perm) {
 		t.Fatalf("unknown attachment should be permanent, got %v", err)
+	}
+}
+
+func TestAuditRetentionPrune(t *testing.T) {
+	s, st, _, _, c := newSvc(t)
+	s.opts.AuditRetention = 24 * time.Hour
+	ctx := context.Background()
+	old := c.t.Add(-48 * time.Hour)
+	recent := c.t.Add(-1 * time.Hour)
+	// Two DLP events and two download events, one old + one recent each.
+	st.RecordDLPEvent(ctx, &model.DLPEvent{ID: "old-dlp", MailFrom: "a@x", RcptTo: []string{"b@y"}, Action: "notify", Severity: "low", At: old})
+	st.RecordDLPEvent(ctx, &model.DLPEvent{ID: "new-dlp", MailFrom: "a@x", RcptTo: []string{"b@y"}, Action: "notify", Severity: "low", At: recent})
+	l := quarantine(t, s, "dl")
+	st.RecordDownload(ctx, model.DownloadEvent{AttachmentID: l.AttachmentID, User: "u", At: old})
+	st.RecordDownload(ctx, model.DownloadEvent{AttachmentID: l.AttachmentID, User: "u", At: recent})
+
+	s.SweepOnce(ctx)
+
+	evs, _ := st.ListDLPEvents(ctx, store.EventFilter{}, 100, store.Page{})
+	if len(evs) != 1 || evs[0].ID != "new-dlp" {
+		t.Fatalf("stale dlp event not pruned: %+v", evs)
+	}
+	if len(st.Downloads) != 1 || !st.Downloads[0].At.Equal(recent) {
+		t.Fatalf("stale download event not pruned: %+v", st.Downloads)
+	}
+}
+
+func TestBlockedExtensionQuarantine(t *testing.T) {
+	s, st, q, _, _ := newSvc(t)
+	s.SetBlockedExtensions([]string{"exe", "js"})
+	ctx := context.Background()
+	links, err := s.Quarantine(ctx, &model.Message{}, []*mimeproc.Extracted{
+		{Filename: "invoice.pdf.exe", ContentType: "application/octet-stream", Data: []byte("MZ...")},
+		{Filename: "report.pdf", ContentType: "application/pdf", Data: []byte("%PDF-1.4")},
+	})
+	if err != nil || len(links) != 2 {
+		t.Fatalf("quarantine: %v %d", err, len(links))
+	}
+	// The .exe is blocked immediately (MALICIOUS), the pdf stays PENDING.
+	if links[0].Status != model.StatusMalicious {
+		t.Fatalf("blocked attachment status = %v, want MALICIOUS", links[0].Status)
+	}
+	if links[1].Status != model.StatusPending {
+		t.Fatalf("pdf status = %v, want PENDING", links[1].Status)
+	}
+	a0, _ := st.GetAttachment(ctx, links[0].AttachmentID)
+	if a0.ThreatName == "" || a0.AnalyzedAt == nil {
+		t.Fatalf("blocked attachment not finalized: %+v", a0)
+	}
+	// Only the pdf is queued for analysis; the blocked file is not.
+	jobs := q.Snapshot()
+	if len(jobs) != 1 || jobs[0].Filename != "report.pdf" {
+		t.Fatalf("only the pdf should be queued, got %+v", jobs)
+	}
+}
+
+// A trailing dot (or trailing whitespace) must not let a blocked extension slip
+// past the up-front gate: Windows saves/executes "evil.exe." as "evil.exe".
+func TestBlockedExtensionTrailingDot(t *testing.T) {
+	s, _, q, _, _ := newSvc(t)
+	s.SetBlockedExtensions([]string{"exe"})
+	ctx := context.Background()
+	links, err := s.Quarantine(ctx, &model.Message{}, []*mimeproc.Extracted{
+		{Filename: "payload.exe.", ContentType: "application/octet-stream", Data: []byte("MZ")},
+		{Filename: "payload2.exe ", ContentType: "application/octet-stream", Data: []byte("MZ")},
+	})
+	if err != nil || len(links) != 2 {
+		t.Fatalf("quarantine: %v %d", err, len(links))
+	}
+	for i, l := range links {
+		if l.Status != model.StatusMalicious {
+			t.Fatalf("link[%d] status = %v, want MALICIOUS (trailing-dot bypass)", i, l.Status)
+		}
+	}
+	if jobs := q.Snapshot(); len(jobs) != 0 {
+		t.Fatalf("blocked files must not be queued, got %+v", jobs)
+	}
+}
+
+type capSender struct {
+	mu   sync.Mutex
+	sent []string // joined "to -> body-contains" records (raw msg)
+}
+
+func (c *capSender) Send(_ context.Context, _ string, to []string, msg []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sent = append(c.sent, strings.Join(to, ",")+"|"+string(msg))
+	return nil
+}
+func (c *capSender) wait(t *testing.T) []string {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		c.mu.Lock()
+		n := len(c.sent)
+		c.mu.Unlock()
+		if n > 0 {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			return append([]string(nil), c.sent...)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("no notification sent")
+	return nil
+}
+
+func TestRecipientVerdictNotification(t *testing.T) {
+	s, _, _, _, _ := newSvc(t)
+	cs := &capSender{}
+	s.opts.NotifyRecipients = true
+	s.opts.Notifier = cs
+	s.opts.NotifyFrom = "secmail@example.com"
+	ctx := context.Background()
+	links, err := s.Quarantine(ctx, &model.Message{RcptTo: []string{"user@corp.example"}, Subject: "청구서"},
+		[]*mimeproc.Extracted{{Filename: "invoice.pdf", ContentType: "application/pdf", Data: []byte("%PDF")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ApplyVerdict(ctx, model.Verdict{AttachmentID: links[0].AttachmentID, Status: model.StatusClean}); err != nil {
+		t.Fatal(err)
+	}
+	got := cs.wait(t)
+	if len(got) != 1 || !strings.Contains(got[0], "user@corp.example") {
+		t.Fatalf("recipient not notified: %v", got)
 	}
 }

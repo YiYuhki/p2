@@ -111,3 +111,23 @@ func TestDMARCTempErrorFromUnderlying(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+func TestEvaluateResultPolicy(t *testing.T) {
+	txt := map[string][]string{"_dmarc.example.com": {"v=DMARC1; p=reject; aspf=s"}}
+	e := New(fakeResolver{txt: txt}, 0)
+	// Unaligned SPF + strict → fail, policy reject.
+	r := e.EvaluateResult(context.Background(), "example.com", "pass", "mail.example.com", nil)
+	if r.Verdict != "fail" || r.Policy != "reject" {
+		t.Fatalf("got verdict=%s policy=%s", r.Verdict, r.Policy)
+	}
+	// Aligned → pass, policy still reported.
+	r = e.EvaluateResult(context.Background(), "example.com", "pass", "example.com", nil)
+	if r.Verdict != "pass" || r.Policy != "reject" {
+		t.Fatalf("pass case: verdict=%s policy=%s", r.Verdict, r.Policy)
+	}
+	// No record → none, empty policy.
+	r = New(fakeResolver{txt: map[string][]string{}}, 0).EvaluateResult(context.Background(), "example.com", "pass", "example.com", nil)
+	if r.Verdict != "none" || r.Policy != "" {
+		t.Fatalf("none case: verdict=%s policy=%q", r.Verdict, r.Policy)
+	}
+}

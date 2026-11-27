@@ -79,7 +79,20 @@ var (
 		Name: "secmail_inbound_auth_total",
 		Help: "Inbound authentication results, by method (spf/dkim) and result (pass/fail/none/...).",
 	}, []string{"method", "result"})
+
+	// TLSCertExpiry is the Unix expiry time of each loaded serving certificate,
+	// by component (smtp/portal/api). Alert when it is close to now() so an
+	// expiring cert is caught before it breaks STARTTLS / HTTPS.
+	TLSCertExpiry = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "secmail_tls_cert_expiry_timestamp_seconds",
+		Help: "Serving-certificate NotAfter as a Unix timestamp, by component.",
+	}, []string{"component"})
 )
+
+// SetCertExpiry records a component's serving-certificate expiry.
+func SetCertExpiry(component string, notAfter time.Time) {
+	TLSCertExpiry.WithLabelValues(component).Set(float64(notAfter.Unix()))
+}
 
 func init() {
 	reg.MustRegister(
@@ -87,6 +100,7 @@ func init() {
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		InboundMessages, Attachments, Verdicts, OutboundMessages,
 		DLPFindings, DLPScanSeconds, ExternalToolSeconds, Holds, PortalRequests, InboundAuth,
+		TLSCertExpiry,
 	)
 }
 

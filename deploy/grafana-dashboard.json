@@ -1,0 +1,102 @@
+{
+  "__comment": "secmail overview dashboard. Import into Grafana (Dashboards > Import). Expects a Prometheus datasource scraping <secmail-internal>:8081/metrics.",
+  "title": "secmail — Secure Mail Gateway",
+  "schemaVersion": 39,
+  "editable": true,
+  "tags": ["secmail", "mail", "dlp"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {}
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
+  "panels": [
+    {
+      "title": "Inbound messages/s by result",
+      "type": "timeseries",
+      "datasource": "${datasource}",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "sum by (result) (rate(secmail_inbound_messages_total[5m]))", "legendFormat": "{{result}}" }
+      ]
+    },
+    {
+      "title": "Analyzer verdicts/s",
+      "type": "timeseries",
+      "datasource": "${datasource}",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "sum by (status) (rate(secmail_verdicts_total[5m]))", "legendFormat": "{{status}}" }
+      ]
+    },
+    {
+      "title": "Outbound DLP actions/s",
+      "type": "timeseries",
+      "datasource": "${datasource}",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "sum by (action) (rate(secmail_outbound_messages_total[5m]))", "legendFormat": "{{action}}" }
+      ]
+    },
+    {
+      "title": "DLP findings/s by severity",
+      "type": "timeseries",
+      "datasource": "${datasource}",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "sum by (severity) (rate(secmail_dlp_findings_total[5m]))", "legendFormat": "{{severity}}" }
+      ]
+    },
+    {
+      "title": "Holds pending (created − resolved)",
+      "type": "stat",
+      "datasource": "${datasource}",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 16 },
+      "targets": [
+        { "expr": "sum(secmail_holds_total{event=\"created\"}) - sum(secmail_holds_total{event=~\"released|rejected|expired\"})" }
+      ]
+    },
+    {
+      "title": "Inbound auth results/s",
+      "type": "timeseries",
+      "datasource": "${datasource}",
+      "gridPos": { "h": 6, "w": 9, "x": 6, "y": 16 },
+      "targets": [
+        { "expr": "sum by (method,result) (rate(secmail_inbound_auth_total[5m]))", "legendFormat": "{{method}}={{result}}" }
+      ]
+    },
+    {
+      "title": "Portal lookups/s by outcome",
+      "type": "timeseries",
+      "datasource": "${datasource}",
+      "gridPos": { "h": 6, "w": 9, "x": 15, "y": 16 },
+      "targets": [
+        { "expr": "sum by (outcome) (rate(secmail_portal_requests_total[5m]))", "legendFormat": "{{outcome}}" }
+      ]
+    },
+    {
+      "title": "DLP scan p95 (s)",
+      "type": "timeseries",
+      "datasource": "${datasource}",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 22 },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(secmail_dlp_scan_seconds_bucket[10m])) by (le))", "legendFormat": "p95" }
+      ]
+    },
+    {
+      "title": "External tool p95 (s) by tool",
+      "type": "timeseries",
+      "datasource": "${datasource}",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 22 },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(secmail_external_tool_seconds_bucket[10m])) by (le, tool))", "legendFormat": "{{tool}}" }
+      ]
+    }
+  ]
+}

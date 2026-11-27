@@ -350,6 +350,41 @@ func (s *Scanner) ScanMessage(ctx context.Context, raw []byte) *Report {
 	return rep
 }
 
+// TestRule compiles a candidate dlp.rules pattern and reports what it would
+// match in sample text, masked, to help an operator tune a custom rule. It
+// enforces the same one-capture-group limit as the rules engine and returns at
+// most max (default 50) distinct masked matches.
+func TestRule(pattern, text string, max int) ([]string, error) {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+	if re.NumSubexp() > 1 {
+		return nil, fmt.Errorf("at most one capture group allowed")
+	}
+	if max <= 0 {
+		max = 50
+	}
+	mask := maskMiddle(2, 2)
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range re.FindAllStringSubmatch(text, -1) {
+		v := m[0]
+		if len(m) > 1 && m[1] != "" {
+			v = m[1]
+		}
+		mv := mask(v)
+		if seen[mv] {
+			continue
+		}
+		seen[mv] = true
+		if out = append(out, mv); len(out) >= max {
+			break
+		}
+	}
+	return out, nil
+}
+
 // identityDetectors are PII types that on their own identify a person; a
 // location combining several of these (or a bulk list of one) is an
 // identity-revealing dataset and is escalated to high severity.

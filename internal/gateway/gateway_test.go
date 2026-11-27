@@ -19,6 +19,7 @@ import (
 	"github.com/emersion/go-msgauth/dkim"
 	"github.com/emersion/go-smtp"
 
+	"github.com/yiyuhki/p2/internal/arc"
 	"github.com/yiyuhki/p2/internal/dkimutil"
 	"github.com/yiyuhki/p2/internal/dmarc"
 	"github.com/yiyuhki/p2/internal/mimeproc"
@@ -452,6 +453,163 @@ func TestFromHeaderDomain(t *testing.T) {
 	for in, want := range cases {
 		if got := fromHeaderDomain(in); got != want {
 			t.Errorf("fromHeaderDomain(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestDMARCEnforceRejects(t *testing.T) {
+	res := spfResolver{txt: map[string][]string{
+		"ext.org":        {"v=spf1 ip4:198.51.100.0/24 -all"}, // sender IP not listed → SPF fail
+		"_dmarc.ext.org": {"v=DMARC1; p=reject"},
+	}}
+	proc := NewProcessor(stubQ{}, ProcessorOptions{
+		Hostname: "gw.example.com", GatewayID: "test-gw", LinkTTL: time.Hour,
+		VerifySPF: true, VerifyDMARC: true, EnforceDMARC: true,
+		SPF:   spfutil.New(res, 0),
+		DMARC: dmarc.New(res, 0),
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	raw := "From: sender@ext.org\r\nTo: user@example.com\r\nSubject: hi\r\n\r\nbody\r\n"
+	_, err := proc.Process(context.Background(), Envelope{
+		MailFrom: "sender@ext.org", RcptTo: []string{"user@example.com"}, RemoteAddr: "203.0.113.9:2500", Helo: "mail.ext.org",
+	}, []byte(raw))
+	var se *smtp.SMTPError
+	if !errors.As(err, &se) || se.Code != 550 {
+		t.Fatalf("DMARC fail under p=reject should 550, got %v", err)
+	}
+}
+
+func TestDMARCEnforceOffRelays(t *testing.T) {
+	res := spfResolver{txt: map[string][]string{
+		"ext.org":        {"v=spf1 ip4:198.51.100.0/24 -all"},
+		"_dmarc.ext.org": {"v=DMARC1; p=reject"},
+	}}
+	proc := NewProcessor(stubQ{}, ProcessorOptions{
+		Hostname: "gw.example.com", GatewayID: "test-gw", LinkTTL: time.Hour,
+		VerifySPF: true, VerifyDMARC: true, EnforceDMARC: false,
+		SPF:   spfutil.New(res, 0),
+		DMARC: dmarc.New(res, 0),
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	raw := "From: sender@ext.org\r\nTo: user@example.com\r\nSubject: hi\r\n\r\nbody\r\n"
+	out, err := proc.Process(context.Background(), Envelope{
+		MailFrom: "sender@ext.org", RcptTo: []string{"user@example.com"}, RemoteAddr: "203.0.113.9:2500", Helo: "mail.ext.org",
+	}, []byte(raw))
+	if err != nil {
+		t.Fatalf("evaluate-only must not reject: %v", err)
+	}
+	if parsed, _ := mimeproc.Parse(out); !strings.Contains(parsed.Header.Get("Authentication-Results"), "dmarc=fail") {
+		t.Fatal("A-R should record dmarc=fail")
+	}
+}
+
+// deferAlways / allowAlways implement Greylister for the greylist gate test.
+type deferAlways struct{}
+
+func (deferAlways) Allow(_, _, _ string) bool { return false }
+
+type allowAlways struct{}
+
+func (allowAlways) Allow(_, _, _ string) bool { return true }
+
+func greylistHarness(t *testing.T, gl Greylister) string {
+	t.Helper()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	up := &upstream{}
+	upAddr := serve(t, up)
+	be := NewBackend(passthroughProc{}, BackendOptions{
+		RecipientDomains: []string{"example.com"},
+		Upstream:         UpstreamOptions{Addr: upAddr, Timeout: 5 * time.Second},
+		Greylist:         gl,
+	}, log)
+	return serve(t, be)
+}
+
+// passthroughProc relays unchanged (keeps the greylist test focused on RCPT).
+type passthroughProc struct{}
+
+func (passthroughProc) Process(_ context.Context, _ Envelope, raw []byte) ([]byte, error) {
+	return raw, nil
+}
+
+func TestGreylistDefersFirstAttempt(t *testing.T) {
+	addr := greylistHarness(t, deferAlways{})
+	c, err := smtp.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.Mail("sender@ext.org", nil); err != nil {
+		t.Fatalf("MAIL: %v", err)
+	}
+	err = c.Rcpt("user@example.com", nil)
+	if err == nil {
+		t.Fatal("greylisted recipient should be deferred")
+	}
+	var se *smtp.SMTPError
+	if !errors.As(err, &se) || se.Code != 451 {
+		t.Fatalf("want 451, got %v", err)
+	}
+}
+
+func TestGreylistAllowsRelays(t *testing.T) {
+	addr := greylistHarness(t, allowAlways{})
+	c, err := smtp.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.SendMail("sender@ext.org", []string{"user@example.com"},
+		strings.NewReader("From: s@ext.org\r\nTo: user@example.com\r\n\r\nhi\r\n")); err != nil {
+		t.Fatalf("allowed mail should relay: %v", err)
+	}
+}
+
+// denyAll / allowAllRL implement RateLimiter for the gate test.
+type denyAllRL struct{}
+
+func (denyAllRL) Allow(string) bool { return false }
+
+func TestRateLimitTempfailsMail(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	up := &upstream{}
+	upAddr := serve(t, up)
+	be := NewBackend(passthroughProc{}, BackendOptions{
+		RecipientDomains: []string{"example.com"},
+		Upstream:         UpstreamOptions{Addr: upAddr, Timeout: 5 * time.Second},
+		RateLimit:        denyAllRL{},
+	}, log)
+	addr := serve(t, be)
+	c, err := smtp.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	err = c.Mail("sender@ext.org", nil)
+	if err == nil {
+		t.Fatal("rate-limited MAIL should be tempfailed")
+	}
+	var se *smtp.SMTPError
+	if !errors.As(err, &se) || se.Code != 451 {
+		t.Fatalf("want 451, got %v", err)
+	}
+}
+
+func TestProcessorArcSeals(t *testing.T) {
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	proc := NewProcessor(stubQ{}, ProcessorOptions{
+		Hostname: "gw.example.com", GatewayID: "test-gw", LinkTTL: time.Hour,
+		ArcSealer: arc.New("gw.example.com", "arc1", "gw.example.com", key),
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	raw := "From: sender@ext.org\r\nTo: user@example.com\r\nSubject: hi\r\n\r\nbody\r\n"
+	out, err := proc.Process(context.Background(), Envelope{
+		MailFrom: "sender@ext.org", RcptTo: []string{"user@example.com"}, RemoteAddr: "203.0.113.9:2500",
+	}, []byte(raw))
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	s := string(out)
+	for _, h := range []string{"ARC-Seal:", "ARC-Message-Signature:", "ARC-Authentication-Results:"} {
+		if !strings.Contains(s, h) {
+			t.Fatalf("output missing %s:\n%s", h, s)
 		}
 	}
 }
